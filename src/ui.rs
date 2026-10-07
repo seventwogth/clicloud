@@ -27,7 +27,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     io::{self, IsTerminal, Write},
     path::PathBuf,
@@ -258,6 +258,10 @@ struct App {
     library: Library,
     view: View,
     results: Vec<Track>,
+    // What a search has already answered this run, and the question the list answers.
+    // Asking it again is how a search is repeated, so that is never served from here.
+    searched: HashMap<(String, u8), Vec<Track>>,
+    shown: Option<(String, u8)>,
     queue: VecDeque<Track>,
     previous: Vec<Track>,
     current: Option<Track>,
@@ -312,6 +316,8 @@ impl App {
             library,
             view: View::Search,
             results: vec![],
+            searched: HashMap::new(),
+            shown: None,
             queue: VecDeque::new(),
             previous: vec![],
             current: None,
@@ -641,6 +647,19 @@ impl App {
             return;
         }
         self.last_error = None;
+        let limit = self.settings.search_limit;
+        let asked = (self.query.trim().to_owned(), limit);
+        if self.shown.as_ref() != Some(&asked)
+            && let Some(tracks) = self.searched.get(&asked)
+        {
+            let found = t!("Найдено треков: {}", tracks.len());
+            self.results = tracks.clone();
+            self.shown = Some(asked);
+            self.select_view(View::Search);
+            self.message = found;
+            return;
+        }
+        self.shown = Some(asked);
         let (sender, receiver) = mpsc::channel();
         let (binary, proxy, direct, query) = (
             self.yt_dlp.clone(),
@@ -648,7 +667,6 @@ impl App {
             self.direct,
             self.query.clone(),
         );
-        let limit = self.settings.search_limit;
         let cache = self
             .cache
             .as_ref()
@@ -949,6 +967,14 @@ impl App {
                     match result {
                         Ok(tracks) => {
                             self.message = t!("Найдено треков: {}", tracks.len());
+                            if let Some(asked) = self.shown.clone() {
+                                // A run asks few questions; a list that somehow grows
+                                // long is dropped whole rather than kept in order.
+                                if self.searched.len() >= 64 {
+                                    self.searched.clear();
+                                }
+                                self.searched.insert(asked, tracks.clone());
+                            }
                             self.results = tracks;
                             self.table.select(Some(0));
                         }
@@ -2485,6 +2511,50 @@ mod tests {
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn a_question_asked_before_is_answered_without_a_search() {
+        let mut app = app(PathBuf::new());
+        // No search of this test may reach the network, whatever is installed here.
+        app.yt_dlp = "clicloud-no-such-program".into();
+        let limit = app.settings.search_limit;
+        let kept = vec![
+            Track {
+                title: "One".into(),
+                ..track()
+            },
+            Track {
+                title: "Two".into(),
+                ..track()
+            },
+        ];
+        app.searched.insert(("ambient".into(), limit), kept);
+        app.shown = Some(("night".into(), limit));
+
+        app.query = "  ambient  ".into();
+        app.search();
+        let titles: Vec<&str> = app.results.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["One", "Two"]);
+        assert_eq!(app.message, "Найдено треков: 2");
+        assert!(app.view == View::Search);
+        assert_eq!(app.shown, Some(("ambient".into(), limit)));
+        // Nothing was started: no worker, and the interface is not waiting.
+        assert!(!app.searching && app.worker.is_none());
+
+        // Asking what the list already answers is how a search is repeated.
+        app.search();
+        assert!(app.searching && app.worker.is_some());
+        app.cancel_search();
+        app.worker.take().unwrap().join().unwrap();
+
+        // A question with another limit is another question.
+        app.shown = None;
+        app.settings.search_limit = limit + 1;
+        app.search();
+        assert!(app.searching);
+        app.cancel_search();
+        app.worker.take().unwrap().join().unwrap();
     }
 
     #[test]
