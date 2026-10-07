@@ -6,6 +6,7 @@ use crate::{
     lang, megabytes,
     playback::{self, Origin, Playback},
     player::{self, Download},
+    setup,
     soundcloud::{Extractor, SoundCloud, Track},
     theme::{self, Theme},
 };
@@ -44,6 +45,9 @@ const TAGLINES: [&str; 4] = [
     "stay hydrated",
 ];
 
+// The mark that turns while something runs, ASCII like every other mark here.
+const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+
 // Frames, buttons and marks are ASCII in every color scheme.
 const BORDER: symbols::border::Set = symbols::border::Set {
     top_left: "+",
@@ -55,6 +59,34 @@ const BORDER: symbols::border::Set = symbols::border::Set {
     horizontal_top: "-",
     horizontal_bottom: "-",
 };
+
+/// The programs the client cannot work without and did not find, and what it offers
+/// to do about each: fetch yt-dlp, which is one file, and name the command for mpv.
+struct Setup {
+    yt_dlp: bool,
+    mpv: bool,
+    /// What the dialog says about the last attempt.
+    message: String,
+    /// The download that runs now; while it does, the dialog waits for it.
+    receiver: Option<mpsc::Receiver<std::result::Result<PathBuf, String>>>,
+}
+
+impl Setup {
+    /// What is missing of the two, or None when both can be started.
+    fn needed(yt_dlp: &str, mpv: &str) -> Option<Self> {
+        let (yt_dlp, mpv) = (!crate::present(yt_dlp), !crate::present(mpv));
+        (yt_dlp || mpv).then(|| Self {
+            yt_dlp,
+            mpv,
+            message: String::new(),
+            receiver: None,
+        })
+    }
+
+    fn busy(&self) -> bool {
+        self.receiver.is_some()
+    }
+}
 
 // What a search sends back: the tracks as they are found, and how it ended.
 enum Found {
@@ -243,6 +275,9 @@ struct App {
     address: Option<String>,
     theme: Theme,
     tagline: &'static str,
+    // When the interface started, which is what the turning mark is timed by.
+    since: Instant,
+    setup: Option<Setup>,
     themes: Vec<String>,
     picker: Option<Picker>,
     // The settings window: whether it is open, its current line and where its lines are.
@@ -305,6 +340,8 @@ impl App {
             cache_dir: session.cache_dir,
             theme: Theme::load(&session.settings.theme),
             tagline: tagline(),
+            since: Instant::now(),
+            setup: None,
             themes: vec![],
             picker: None,
             options: false,
@@ -681,6 +718,31 @@ impl App {
         });
     }
 
+    /// Fetches yt-dlp into the directory of the client, when that is what is missing.
+    fn install(&mut self) {
+        let Some(setup) = &mut self.setup else {
+            return;
+        };
+        if setup.busy() || !setup.yt_dlp {
+            return;
+        }
+        let Some(directory) = setup::directory() else {
+            setup.message = t!("Непонятно, куда положить программу").into();
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let proxy = self.proxy.clone();
+        let language = lang::current();
+        std::thread::spawn(move || {
+            // The errors of the download are worded in this thread.
+            lang::set(language);
+            let fetched = setup::install(proxy.as_deref(), &directory).map_err(|e| e.to_string());
+            let _ = sender.send(fetched);
+        });
+        setup.receiver = Some(receiver);
+        setup.message = t!("Скачиваю и проверяю...").into();
+    }
+
     fn search(&mut self) {
         if self.searching {
             self.message = t!("Поиск уже выполняется...").into();
@@ -1006,6 +1068,29 @@ impl App {
         }
     }
     fn tick(&mut self) {
+        // Taken out whole: what arrives is written back into the interface.
+        if let Some(mut setup) = self.setup.take() {
+            if let Some(receiver) = &setup.receiver {
+                match receiver.try_recv() {
+                    Ok(Ok(path)) => {
+                        setup.receiver = None;
+                        setup.yt_dlp = false;
+                        setup.message = t!("yt-dlp на месте: {}", path.display());
+                        self.yt_dlp = path.to_string_lossy().into_owned();
+                    }
+                    Ok(Err(error)) => {
+                        setup.receiver = None;
+                        setup.message = t!("Не вышло: {}", clean_lines(&error));
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        setup.receiver = None;
+                        setup.message = t!("Загрузка прервалась").into();
+                    }
+                    Err(mpsc::TryRecvError::Empty) => (),
+                }
+            }
+            self.setup = Some(setup);
+        }
         if let Some(receiver) = self.receiver.take() {
             let (mut over, mut keep) = (None, true);
             loop {
@@ -1167,6 +1252,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
         signal_hook::flag::register(signal, terminate.clone())?;
     }
     let mut app = App::new(session, path, library);
+    app.setup = Setup::needed(&app.yt_dlp, &app.mpv);
     app.warm();
     terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -1192,6 +1278,15 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     break;
+                }
+                if app.setup.is_some() {
+                    let busy = app.setup.as_ref().is_some_and(Setup::busy);
+                    match key.code {
+                        KeyCode::Enter if !busy => app.install(),
+                        KeyCode::Esc | KeyCode::Char('q') if !busy => app.setup = None,
+                        _ => (),
+                    }
+                    continue;
                 }
                 if app.help {
                     app.help = false;
@@ -1361,29 +1456,32 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                 MouseEventKind::ScrollUp => app.move_setting(-1),
                 _ => (),
             },
-            Event::Mouse(mouse) if !app.help && !app.details && app.input.is_none() => match mouse
-                .kind
+            Event::Mouse(mouse)
+                if !app.help && !app.details && app.input.is_none() && app.setup.is_none() =>
             {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let pos = Position::new(mouse.column, mouse.row);
-                    if let Some((_, action)) = app.hits.iter().find(|(rect, _)| rect.contains(pos))
-                    {
-                        let action = *action;
-                        app.focus = None;
-                        app.action(action);
-                    } else if app.rows.contains(pos) {
-                        let index = usize::from(mouse.row - app.rows.y) + app.table.offset();
-                        if index < app.tracks().len() {
-                            app.table.select(Some(index));
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let pos = Position::new(mouse.column, mouse.row);
+                        if let Some((_, action)) =
+                            app.hits.iter().find(|(rect, _)| rect.contains(pos))
+                        {
+                            let action = *action;
                             app.focus = None;
-                            app.editing = false;
+                            app.action(action);
+                        } else if app.rows.contains(pos) {
+                            let index = usize::from(mouse.row - app.rows.y) + app.table.offset();
+                            if index < app.tracks().len() {
+                                app.table.select(Some(index));
+                                app.focus = None;
+                                app.editing = false;
+                            }
                         }
                     }
+                    MouseEventKind::ScrollDown => app.navigate(1),
+                    MouseEventKind::ScrollUp => app.navigate(-1),
+                    _ => (),
                 }
-                MouseEventKind::ScrollDown => app.navigate(1),
-                MouseEventKind::ScrollUp => app.navigate(-1),
-                _ => (),
-            },
+            }
             _ => (),
         }
     }
@@ -1400,6 +1498,12 @@ fn block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
         ]))
 }
 // A window over the interface; `Clear` alone would drop the background of the scheme.
+// The mark turns on a clock of its own, not on the rate at which events arrive.
+fn spinner(app: &App) -> &'static str {
+    let step = app.since.elapsed().as_millis() / 120;
+    SPINNER[step as usize % SPINNER.len()]
+}
+
 fn modal<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
     block(title, theme)
         .border_style(theme.accent)
@@ -1533,6 +1637,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if app.details {
         draw_details(frame, app, &theme, size);
     }
+    if app.setup.is_some() {
+        draw_setup(frame, app, &theme, size);
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
@@ -1571,18 +1678,15 @@ fn draw_search(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         .spacing(1)
         .split(area);
     app.hits.push((search[0], Action::Search));
+    let title = if app.searching {
+        t!(" ПОИСК {} Esc - отмена ", spinner(app))
+    } else {
+        t!(" / ПОИСК   Enter - найти ").to_owned()
+    };
     frame.render_widget(
         Paragraph::new(query)
             .block(
-                block(
-                    if app.searching {
-                        t!(" ПОИСК: загрузка... Esc - отмена ")
-                    } else {
-                        t!(" / ПОИСК   Enter - найти ")
-                    },
-                    theme,
-                )
-                .border_style(if app.editing || app.focus == Some(0) {
+                block(&title, theme).border_style(if app.editing || app.focus == Some(0) {
                     theme.accent
                 } else {
                     theme.border
@@ -2050,6 +2154,72 @@ fn draw_help(frame: &mut Frame, theme: &Theme, size: Rect) {
     frame.render_widget(
         Paragraph::new(lines).block(modal(t!(" УПРАВЛЕНИЕ "), theme)),
         modal_area,
+    );
+}
+
+fn draw_setup(frame: &mut Frame, app: &App, theme: &Theme, size: Rect) {
+    let Some(setup) = &app.setup else {
+        return;
+    };
+    let mut lines = vec![
+        Line::raw(""),
+        Line::styled(
+            t!(" Нет программ, без которых клиент не работает:"),
+            theme.text,
+        ),
+        Line::raw(""),
+    ];
+    if setup.yt_dlp {
+        lines.push(Line::from(vec![
+            Span::styled(" yt-dlp", theme.accent),
+            Span::styled(t!(" - поиск и загрузка аудио"), theme.muted),
+        ]));
+        lines.push(Line::styled(format!("   {}", setup::url()), theme.text));
+        lines.push(Line::styled(
+            t!("   Сумма SHA-256 из релиза сверяется до запуска файла."),
+            theme.muted,
+        ));
+        lines.push(Line::styled(t!("   Enter - скачать"), theme.accent));
+        lines.push(Line::raw(""));
+    }
+    if setup.mpv {
+        lines.push(Line::from(vec![
+            Span::styled(" mpv", theme.accent),
+            Span::styled(t!(" - воспроизведение"), theme.muted),
+        ]));
+        lines.push(Line::styled(
+            t!("   Системный пакет; поставьте сами:"),
+            theme.muted,
+        ));
+        lines.push(Line::styled(format!("   {}", setup::mpv()), theme.text));
+        lines.push(Line::raw(""));
+    }
+    if !setup.message.is_empty() {
+        let mark = if setup.busy() {
+            format!("{} ", spinner(app))
+        } else {
+            String::new()
+        };
+        lines.push(Line::styled(
+            format!(" {mark}{}", clean(&setup.message)),
+            theme.text,
+        ));
+    }
+    // The window is as tall as what it has to say, and no taller.
+    let width = size.width.clamp(24, 76);
+    let height = (lines.len() as u16 + 2).clamp(5, size.height);
+    let area = Rect::new(
+        (size.width - width) / 2,
+        (size.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(modal(t!(" ПРОГРАММЫ | Esc - продолжить без них "), theme)),
+        area,
     );
 }
 
@@ -2582,6 +2752,63 @@ mod tests {
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn the_programs_that_are_missing_are_offered_or_named() {
+        // One that is certainly there wherever the tests run, and one that is not.
+        let there = if cfg!(windows) { "cmd" } else { "sh" };
+        let absent = "clicloud-no-such-program";
+        assert!(Setup::needed(there, there).is_none());
+        let only_player = Setup::needed(there, absent).unwrap();
+        assert!(!only_player.yt_dlp && only_player.mpv && !only_player.busy());
+        let only_extractor = Setup::needed(absent, there).unwrap();
+        assert!(only_extractor.yt_dlp && !only_extractor.mpv);
+
+        let mut app = app(PathBuf::new());
+        app.setup = Setup::needed(absent, absent);
+        let (url, mpv) = (setup::url(), setup::mpv());
+        let text = screen(&mut app, 80, 24);
+        for part in [
+            t!(" ПРОГРАММЫ | Esc - продолжить без них "),
+            t!("   Enter - скачать"),
+            t!("   Системный пакет; поставьте сами:"),
+            url.as_str(),
+            mpv.as_str(),
+        ] {
+            assert!(text.contains(part), "{part:?}\n{text}");
+        }
+
+        // Nothing is fetched for a program that is not ours to fetch.
+        app.setup = Setup::needed(there, absent);
+        app.install();
+        let setup = app.setup.as_ref().unwrap();
+        assert!(!setup.busy() && setup.message.is_empty());
+    }
+
+    #[test]
+    fn the_mark_of_a_search_turns_through_its_frames() {
+        let mut app = app(PathBuf::new());
+        let mut seen = Vec::new();
+        for step in 0..SPINNER.len() * 2 {
+            let Some(since) = Instant::now().checked_sub(Duration::from_millis(120 * step as u64))
+            else {
+                return;
+            };
+            app.since = since;
+            seen.push(spinner(&app));
+        }
+        // Every frame is used, and the turn comes back round.
+        for frame in SPINNER {
+            assert!(seen.contains(&frame), "{frame:?} {seen:?}");
+        }
+        assert_eq!(seen[..SPINNER.len()], seen[SPINNER.len()..]);
+        // It is drawn where the search is, and only while one runs.
+        app.since = Instant::now();
+        app.searching = true;
+        assert!(screen(&mut app, 80, 24).contains(&format!(" ПОИСК {} Esc", SPINNER[0])));
+        app.searching = false;
+        assert!(screen(&mut app, 80, 24).contains("/ ПОИСК"));
     }
 
     #[test]

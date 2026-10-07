@@ -6,6 +6,7 @@ mod config;
 #[cfg(unix)]
 mod playback;
 mod player;
+mod setup;
 mod soundcloud;
 mod theme;
 #[cfg(unix)]
@@ -105,13 +106,41 @@ fn main() -> ExitCode {
 }
 
 fn default_yt_dlp() -> String {
-    let installed = std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|path| executable(&path.join("yt-dlp")))
-    });
-    if !installed && let Some(local) = local_yt_dlp() {
+    if present("yt-dlp") {
+        return "yt-dlp".into();
+    }
+    if let Some(local) = local_yt_dlp() {
         return local.to_string_lossy().into_owned();
     }
+    // One that the interface fetched before, where it keeps what it fetches.
+    if let Some(fetched) = setup::directory().map(|directory| directory.join(setup::name()))
+        && executable(&fetched)
+    {
+        return fetched.to_string_lossy().into_owned();
+    }
     "yt-dlp".into()
+}
+
+/// Whether `program` can be started: a path that names a file we may run, or a bare
+/// name that one of the directories of PATH holds. Windows wants the extension spelled.
+fn present(program: &str) -> bool {
+    let path = std::path::Path::new(program);
+    if path.components().count() > 1 {
+        return executable(path) || cfg!(windows) && executable(&path.with_extension("exe"));
+    }
+    let named = |directory: std::path::PathBuf| {
+        #[cfg(windows)]
+        let names = [
+            program.to_owned(),
+            format!("{program}.exe"),
+            format!("{program}.cmd"),
+            format!("{program}.bat"),
+        ];
+        #[cfg(not(windows))]
+        let names = [program.to_owned()];
+        names.iter().any(|name| executable(&directory.join(name)))
+    };
+    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(named))
 }
 
 // yt-dlp of the project whose Cargo target directory holds this binary. The

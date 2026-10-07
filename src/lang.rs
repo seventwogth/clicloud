@@ -367,9 +367,81 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "アーティスト、曲、新しい音を探す...",
     ),
     (
-        " ПОИСК: загрузка... Esc - отмена ",
-        " SEARCH: loading... Esc - cancel ",
-        " 検索: 読み込み中... Esc - 中止 ",
+        " ПОИСК {} Esc - отмена ",
+        " SEARCH {} Esc - cancel ",
+        " 検索 {} Esc - 中止 ",
+    ),
+    (
+        " ПРОГРАММЫ | Esc - продолжить без них ",
+        " PROGRAMS | Esc - go on without them ",
+        " プログラム | Esc - なしで続行 ",
+    ),
+    (
+        " Нет программ, без которых клиент не работает:",
+        " The programs the client cannot work without are missing:",
+        " このクライアントに必要なプログラムがありません:",
+    ),
+    (
+        " - поиск и загрузка аудио",
+        " - search and audio download",
+        " - 検索と音声のダウンロード",
+    ),
+    (" - воспроизведение", " - playback", " - 再生"),
+    (
+        "   Сумма SHA-256 из релиза сверяется до запуска файла.",
+        "   The SHA-256 of the release is checked before the file is run.",
+        "   リリースの SHA-256 を実行前に照合します。",
+    ),
+    (
+        "   Enter - скачать",
+        "   Enter - download",
+        "   Enter - ダウンロード",
+    ),
+    (
+        "   Системный пакет; поставьте сами:",
+        "   A system package; install it yourself:",
+        "   システムのパッケージです。ご自身で入れてください:",
+    ),
+    (
+        "Непонятно, куда положить программу",
+        "There is nowhere to put the program",
+        "プログラムを置く場所が不明です",
+    ),
+    (
+        "Скачиваю и проверяю...",
+        "Downloading and checking...",
+        "ダウンロードして確認中...",
+    ),
+    (
+        "yt-dlp на месте: {}",
+        "yt-dlp is in place: {}",
+        "yt-dlp を配置しました: {}",
+    ),
+    ("Не вышло: {}", "It did not work: {}", "失敗しました: {}"),
+    (
+        "Загрузка прервалась",
+        "The download broke off",
+        "ダウンロードが中断しました",
+    ),
+    (
+        "В релизе yt-dlp нет суммы для {}",
+        "The yt-dlp release holds no sum for {}",
+        "yt-dlp のリリースに {} のサムがありません",
+    ),
+    (
+        "Сумма не совпала: {} вместо {}",
+        "The sum does not match: {} instead of {}",
+        "サムが一致しません: {} ではなく {}",
+    ),
+    (
+        "Не удалось запустить curl: {}",
+        "Could not start curl: {}",
+        "curl を起動できませんでした: {}",
+    ),
+    (
+        "curl завершился с {}: {}",
+        "curl exited with {}: {}",
+        "curl が {} で終了しました: {}",
     ),
     (
         " / ПОИСК   Enter - найти ",
@@ -809,6 +881,7 @@ mod tests {
             include_str!("main.rs"),
             include_str!("playback.rs"),
             include_str!("player.rs"),
+            include_str!("setup.rs"),
             include_str!("soundcloud.rs"),
             include_str!("ui.rs"),
         ];
