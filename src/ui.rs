@@ -38,10 +38,10 @@ use std::{
 // What the header says after the name. One of them is picked for a run; add as many
 // as you like, but keep them short: the header clips what does not fit beside the name.
 const TAGLINES: [&str; 4] = [
-    "your terminal, your music",
-    "sound without a browser",
-    "endless scroll, now with sound",
-    "all of SoundCloud, none of the chrome",
+    "not sponsored by shadow wizard money gang",
+    "punks not dead",
+    "save that shit",
+    "stay hydrated",
 ];
 
 // Frames, buttons and marks are ASCII in every color scheme.
