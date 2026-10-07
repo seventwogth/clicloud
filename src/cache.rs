@@ -1,0 +1,455 @@
+//! Audio kept on disk: a track that was played starts at once the next time and
+//! needs no network. yt-dlp keeps what it learns about SoundCloud next to it.
+use crate::Result;
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, SystemTime},
+};
+use url::Url;
+
+const TAG: &str = "CACHEDIR.TAG";
+// The signature makes backup tools skip the directory; the comment marks it as ours.
+const TAG_CONTENT: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+    # This directory is a cache of clicloud. It can be removed at any time.\n";
+// An unfinished download this old was left behind by a killed process.
+const STALE: Duration = Duration::from_secs(24 * 60 * 60);
+// Profile pages and site sections: links that look like `artist/track` but are lists.
+const LISTS: [&str; 11] = [
+    "sets",
+    "tracks",
+    "albums",
+    "likes",
+    "reposts",
+    "popular-tracks",
+    "toptracks",
+    "spotlight",
+    "followers",
+    "following",
+    "comments",
+];
+const SECTIONS: [&str; 10] = [
+    "discover", "search", "you", "stream", "charts", "stations", "tags", "people", "pages",
+    "upload",
+];
+
+pub struct Cache {
+    root: PathBuf,
+    extractor: PathBuf,
+    limit: u64,
+}
+
+impl Cache {
+    /// Uses `root`, which must be empty or a cache of ours: files in it get removed.
+    /// `limit` is the size in bytes the audio is kept under; 0 means no limit.
+    pub fn open(root: PathBuf, limit: u64) -> Result<Self> {
+        let claim = || -> io::Result<bool> {
+            private_directory(&root)?;
+            let tag = root.join(TAG);
+            match fs::read(&tag) {
+                Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).contains("clicloud")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if fs::read_dir(&root)?.next().is_some() {
+                        return Ok(false);
+                    }
+                    fs::write(tag, TAG_CONTENT)?;
+                    Ok(true)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match claim() {
+            Ok(true) => Ok(Self {
+                extractor: root.join("yt-dlp"),
+                root,
+                limit,
+            }),
+            Ok(false) => Err(format!(
+                "Каталог {} не пуст и не является кешем clicloud. Укажите другой --cache-dir или --no-cache.",
+                root.display()
+            )
+            .into()),
+            Err(error) => Err(format!(
+                "Не удалось подготовить кеш {}: {error}. Укажите --cache-dir или --no-cache.",
+                root.display()
+            )
+            .into()),
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// The directory for yt-dlp's own cache, apart from the one in the user's home.
+    pub fn extractor(&self) -> &Path {
+        &self.extractor
+    }
+
+    fn audio(&self) -> PathBuf {
+        self.root.join("audio")
+    }
+
+    fn path(&self, url: &str) -> Option<PathBuf> {
+        key(url).map(|key| self.audio().join(key))
+    }
+
+    /// Whether `url` names a single track, the only kind of link that is stored.
+    pub fn accepts(&self, url: &str) -> bool {
+        key(url).is_some()
+    }
+
+    pub fn contains(&self, url: &str) -> bool {
+        self.path(url).is_some_and(|path| path.is_file())
+    }
+
+    /// The stored audio of `url`, noted as used just now.
+    pub fn find(&self, url: &str) -> Option<PathBuf> {
+        let path = self.path(url).filter(|path| path.is_file())?;
+        // The time of the last use decides what is evicted first.
+        if let Ok(file) = fs::OpenOptions::new().write(true).open(&path) {
+            let _ = file.set_modified(SystemTime::now());
+        }
+        Some(path)
+    }
+
+    /// A place to download `url` into; None when the link is not a single track.
+    pub fn store(&self, url: &str) -> Result<Option<Partial>> {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let Some(target) = self.path(url) else {
+            return Ok(None);
+        };
+        let partial = self.root.join("partial");
+        sweep(&partial);
+        let directory = partial.join(format!(
+            "{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A killed process with the same id may have left one behind.
+        let _ = fs::remove_dir_all(&directory);
+        private_directory(&directory)?;
+        Ok(Some(Partial {
+            directory,
+            target,
+            limit: self.limit,
+        }))
+    }
+
+    /// The number of stored tracks and their size in bytes.
+    pub fn usage(&self) -> (usize, u64) {
+        let files = files(&self.audio());
+        (files.len(), files.iter().map(|file| file.1).sum())
+    }
+
+    /// Removes the audio, unfinished downloads and what yt-dlp has stored.
+    pub fn clear(&self) -> io::Result<()> {
+        for name in ["audio", "partial", "yt-dlp"] {
+            match fs::remove_dir_all(self.root.join(name)) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => (),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A download in progress: a directory of its own, where yt-dlp also keeps its fragments.
+pub struct Partial {
+    directory: PathBuf,
+    target: PathBuf,
+    limit: u64,
+}
+
+impl Partial {
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// The file that receives the audio.
+    pub fn path(&self) -> PathBuf {
+        self.directory.join("audio")
+    }
+
+    /// Makes the finished download a part of the cache, evicting what was used longest ago.
+    pub fn commit(self) -> io::Result<()> {
+        let path = self.path();
+        if fs::metadata(&path)?.len() == 0 {
+            return Err(io::Error::other("empty download"));
+        }
+        let audio = self.target.parent().expect("file in the audio directory");
+        private_directory(audio)?;
+        fs::rename(path, &self.target)?;
+        if self.limit > 0 {
+            let mut files = files(audio);
+            let mut total: u64 = files.iter().map(|file| file.1).sum();
+            files.sort();
+            for (_, size, path) in files {
+                if total <= self.limit {
+                    break;
+                }
+                if path != self.target && fs::remove_file(path).is_ok() {
+                    total -= size;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn private_directory(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    // What was listened to is nobody else's business.
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)
+}
+
+// Files of a directory with the time of their last use and their size.
+fn files(directory: &Path) -> Vec<(SystemTime, u64, PathBuf)> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let metadata = entry
+                .metadata()
+                .ok()
+                .filter(|metadata| metadata.is_file())?;
+            Some((metadata.modified().ok()?, metadata.len(), entry.path()))
+        })
+        .collect()
+}
+
+fn sweep(partial: &Path) {
+    let Ok(entries) = fs::read_dir(partial) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let age = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok());
+        if age.is_some_and(|age| age > STALE) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+// A file name for the track at `url`; None unless the link names exactly one track.
+// Distinct tracks get distinct names: the parts are escaped and joined by a dot.
+fn key(url: &str) -> Option<String> {
+    let url = Url::parse(url).ok()?;
+    let host = url.host_str()?;
+    let host = ["www.", "m."]
+        .iter()
+        .find_map(|prefix| host.strip_prefix(prefix))
+        .unwrap_or(host);
+    if host != "soundcloud.com" {
+        return None;
+    }
+    let parts: Vec<_> = url
+        .path_segments()?
+        .filter(|part| !part.is_empty())
+        .collect();
+    match parts[..] {
+        [artist, track] if !SECTIONS.contains(&artist) && !LISTS.contains(&track) => (),
+        // A private track carries its secret token after the name.
+        [artist, track, secret]
+            if !SECTIONS.contains(&artist)
+                && !LISTS.contains(&track)
+                && secret.starts_with("s-") => {}
+        _ => return None,
+    }
+    let mut key = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            key.push('.');
+        }
+        for byte in part.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                key.push(char::from(byte));
+            } else {
+                key.push_str(&format!("~{byte:02x}"));
+            }
+        }
+    }
+    // File names are limited to 255 bytes; such a link is merely not stored.
+    (key.len() <= 200).then_some(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn directory(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("clicloud-cache-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        path
+    }
+
+    fn download(cache: &Cache, url: &str, bytes: &[u8]) {
+        let partial = cache.store(url).unwrap().unwrap();
+        fs::write(partial.path(), bytes).unwrap();
+        partial.commit().unwrap();
+    }
+
+    #[test]
+    fn only_links_to_a_single_track_get_a_name() {
+        for (url, expected) in [
+            ("https://soundcloud.com/artist/night", Some("artist.night")),
+            (
+                "http://www.soundcloud.com/artist/night/?si=1&utm_source=x#t=10",
+                Some("artist.night"),
+            ),
+            (
+                "https://m.soundcloud.com/Artist_1/a-b",
+                Some("Artist_1.a-b"),
+            ),
+            (
+                "https://soundcloud.com/artist/night/s-AbC12",
+                Some("artist.night.s-AbC12"),
+            ),
+            // No two links share a name, whatever their characters.
+            ("https://soundcloud.com/a.b/c", Some("a~2eb.c")),
+            ("https://soundcloud.com/a/b.c", Some("a.b~2ec")),
+            ("https://soundcloud.com/a/%D0%B0", Some("a.~25D0~25B0")),
+            ("https://soundcloud.com/artist", None),
+            ("https://soundcloud.com/artist/sets/album", None),
+            ("https://soundcloud.com/artist/sets", None),
+            ("https://soundcloud.com/artist/likes", None),
+            ("https://soundcloud.com/discover/sets", None),
+            ("https://soundcloud.com/artist/night/recommended", None),
+            ("https://on.soundcloud.com/abc", None),
+            ("https://api.soundcloud.com/tracks/123", None),
+            ("not a link", None),
+        ] {
+            assert_eq!(key(url).as_deref(), expected, "{url}");
+        }
+        let long = format!("https://soundcloud.com/a/{}", "b".repeat(250));
+        assert!(key(&long).is_none());
+    }
+
+    #[test]
+    fn finished_downloads_are_kept_and_unfinished_ones_removed() {
+        let root = directory("store");
+        let cache = Cache::open(root.clone(), 0).unwrap();
+        let url = "https://soundcloud.com/artist/night";
+        assert!(cache.accepts(url) && !cache.contains(url) && cache.find(url).is_none());
+        assert!(
+            cache
+                .store("https://soundcloud.com/artist/sets/a")
+                .unwrap()
+                .is_none()
+        );
+
+        let abandoned = cache.store(url).unwrap().unwrap();
+        fs::write(abandoned.path(), b"half").unwrap();
+        let left = abandoned.directory().to_owned();
+        drop(abandoned);
+        assert!(!left.exists() && !cache.contains(url));
+
+        let empty = cache.store(url).unwrap().unwrap();
+        fs::write(empty.path(), b"").unwrap();
+        assert!(empty.commit().is_err() && !cache.contains(url));
+
+        download(&cache, url, b"audio");
+        assert_eq!(fs::read(cache.find(url).unwrap()).unwrap(), b"audio");
+        // The same track under another spelling of its link.
+        assert!(cache.contains("https://www.soundcloud.com/artist/night?si=1"));
+        assert_eq!(cache.usage(), (1, 5));
+        assert_eq!(fs::read_dir(root.join("partial")).unwrap().count(), 0);
+
+        // Reopening finds the same cache; clearing leaves the directory usable.
+        let cache = Cache::open(root.clone(), 0).unwrap();
+        assert!(cache.contains(url));
+        fs::create_dir(cache.extractor()).unwrap();
+        cache.clear().unwrap();
+        assert_eq!(cache.usage(), (0, 0));
+        assert!(!cache.extractor().exists() && root.join(TAG).exists());
+        download(&cache, url, b"again");
+        assert!(cache.contains(url));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tracks_used_longest_ago_are_evicted_first() {
+        let root = directory("evict");
+        let cache = Cache::open(root.clone(), 25).unwrap();
+        let url = |name: &str| format!("https://soundcloud.com/artist/{name}");
+        let age = |name: &str, seconds: u64| {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(root.join("audio").join(format!("artist.{name}")))
+                .unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(seconds))
+                .unwrap();
+        };
+        download(&cache, &url("old"), &[0; 10]);
+        age("old", 300);
+        download(&cache, &url("older"), &[0; 10]);
+        age("older", 600);
+        // Playing a track makes it the most recent one.
+        assert!(cache.find(&url("older")).is_some());
+        download(&cache, &url("new"), &[0; 10]);
+        assert!(!cache.contains(&url("old")));
+        assert!(cache.contains(&url("older")) && cache.contains(&url("new")));
+        // A track larger than the whole limit still plays from the cache once.
+        download(&cache, &url("huge"), &[0; 40]);
+        assert_eq!(cache.usage(), (1, 40));
+        assert!(cache.contains(&url("huge")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn foreign_directories_are_left_alone() {
+        let root = directory("foreign");
+        fs::create_dir_all(root.join("audio")).unwrap();
+        fs::write(root.join("audio/song.mp3"), b"mine").unwrap();
+        let error = Cache::open(root.clone(), 1).err().unwrap().to_string();
+        assert!(error.contains("не является кешем"), "{error}");
+        assert!(root.join("audio/song.mp3").exists() && !root.join(TAG).exists());
+        // Someone else's cache is not ours either.
+        fs::write(
+            root.join(TAG),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        assert!(Cache::open(root.clone(), 1).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn downloads_abandoned_long_ago_are_swept() {
+        let root = directory("sweep");
+        let cache = Cache::open(root.clone(), 0).unwrap();
+        let stale = root.join("partial/1-0");
+        let fresh = root.join("partial/1-1");
+        for path in [&stale, &fresh] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::File::open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE * 2)
+            .unwrap();
+        let partial = cache.store("https://soundcloud.com/a/b").unwrap().unwrap();
+        assert!(!stale.exists() && fresh.exists() && partial.directory().exists());
+        drop(partial);
+        fs::remove_dir_all(root).unwrap();
+    }
+}

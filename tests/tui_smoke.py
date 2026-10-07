@@ -43,6 +43,8 @@ else:
         player.write_text('''#!/usr/bin/env python3
 import json, os, socket, sys, time
 open(os.environ["MPV_PID"], "w").write(str(os.getpid()))
+with open(os.environ["MPV_ARGS"], "a") as log:
+    log.write(sys.argv[-1]+"\\n")
 path = next(arg.split("=",1)[1] for arg in sys.argv if arg.startswith("--input-ipc-server="))
 with socket.socket(socket.AF_UNIX) as server:
     server.bind(path)
@@ -81,11 +83,16 @@ if os.environ.get("MPV_LINGER"):
                    CLICLOUD_MPV=str(player), CLICLOUD_CONFIG=str(root / "config.json"),
                    IPC_LOG=str(root / "ipc.jsonl"), MPV_PID=str(root / "mpv.pid"),
                    TMPDIR=str(temporary), SLOW_SEARCH=str(root / "slow"),
-                   SEARCH_PID=str(root / "search.pid"))
+                   SEARCH_PID=str(root / "search.pid"), MPV_ARGS=str(root / "mpv.args"),
+                   XDG_CACHE_HOME=str(root / "home-cache"))
+        for name in ("CLICLOUD_CACHE_DIR", "CLICLOUD_NO_CACHE"):
+            env.pop(name, None)
+        cache = root / "cache"
         if terminate:
             env["MPV_LINGER"] = "1"
         env.pop("CLICLOUD_PROXY", None)
         process = subprocess.Popen(["target/debug/clicloud", "--tor" if proxy else "--no-proxy",
+                                    "--cache-dir", str(cache),
                                     "ui", "--library", str(root / "library.json")],
                                    stdin=slave, stdout=slave, stderr=slave, env=env)
         output = bytearray()
@@ -125,13 +132,19 @@ if os.environ.get("MPV_LINGER"):
                 assert termios.tcgetattr(slave) == before, "Terminal mode was not restored"
                 assert not alive(player_pid), "mpv outlived the client"
                 assert not list(temporary.iterdir()), "IPC directory was not removed"
+                assert not list((cache / "partial").iterdir()), "Download was left behind"
                 print("PASS: SIGTERM stops mpv, removes the IPC directory, restores the terminal")
                 return
             os.write(master, b" ++\x1b[C")
             read_until(lambda: ["cycle", "pause"] in log() and ["seek", 10, "relative"] in log()
                        and log().count(["add", "volume", 5]) == 2)
+            # The track was stored while it played; the next start needs no downloader.
+            stored = cache / "audio" / "test.night"
+            read_until(stored.exists)
+            assert stored.read_bytes() == b"mock-audio"
             os.write(master, b"n")
             read_until(lambda: sum(c[0] == "observe_property" for c in log()) >= 8)
+            assert (root / "mpv.args").read_text().split() == ["-", str(stored)]
             os.write(master, b"q")
             process.wait(timeout=5)
             assert process.returncode == 0
@@ -139,8 +152,9 @@ if os.environ.get("MPV_LINGER"):
             saved = json.loads((root / "library.json").read_text())
             assert len(saved["favorites"]) == 1 and len(saved["recent"]) == 1
             assert not list(temporary.iterdir()), "IPC directory was not removed"
-            print("PASS: TUI search and its cancel, favorites, queue, IPC controls, terminal cleanup; proxy=",
-                  proxy)
+            assert not (root / "home-cache").exists(), "The cache directory flag was ignored"
+            print("PASS: TUI search and its cancel, favorites, queue, IPC controls, cache, terminal cleanup;",
+                  "proxy=", proxy)
         finally:
             if process.poll() is None:
                 process.kill()

@@ -1,3 +1,4 @@
+mod cache;
 mod config;
 #[cfg(unix)]
 mod playback;
@@ -6,8 +7,9 @@ mod soundcloud;
 #[cfg(unix)]
 mod ui;
 
+use cache::Cache;
 use clap::{Parser, Subcommand};
-use soundcloud::{SoundCloud, Track};
+use soundcloud::{Extractor, SoundCloud, Track};
 use std::io::{self, IsTerminal, Write};
 use std::process::{Command, ExitCode};
 
@@ -34,6 +36,17 @@ struct Cli {
     /// Отключить прокси, включая настройки окружения
     #[arg(long, global = true)]
     no_proxy: bool,
+    /// Каталог кеша (по умолчанию ~/.cache/clicloud)
+    #[arg(long, global = true, env = "CLICLOUD_CACHE_DIR")]
+    cache_dir: Option<std::path::PathBuf>,
+    /// Ничего не хранить на диске: ни аудио, ни данные yt-dlp
+    #[arg(
+        long,
+        global = true,
+        env = "CLICLOUD_NO_CACHE",
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    no_cache: bool,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -63,6 +76,12 @@ enum Action {
         /// Воспроизвести первый результат без выбора
         #[arg(long)]
         first: bool,
+    },
+    /// Показать, сколько занимает кеш, или очистить его
+    Cache {
+        /// Удалить сохранённое аудио и данные yt-dlp
+        #[arg(long)]
+        clear: bool,
     },
     /// Проверить наличие внешних программ
     Doctor,
@@ -121,18 +140,61 @@ fn executable(path: &std::path::Path) -> bool {
     }
 }
 
+// The flags outrank the settings file; without a home directory there is no cache.
+fn open_cache(cli: &Cli, settings: &config::Settings) -> Result<Option<Cache>> {
+    if cli.no_cache || (cli.cache_dir.is_none() && !settings.cache_enabled) {
+        return Ok(None);
+    }
+    let Some(root) = cli
+        .cache_dir
+        .clone()
+        .or_else(|| settings.cache_dir.clone())
+        .or_else(|| {
+            config::directory("XDG_CACHE_HOME", ".cache").map(|path| path.join("clicloud"))
+        })
+    else {
+        return Ok(None);
+    };
+    // yt-dlp runs in a directory of its own, so the path must not depend on ours.
+    let limit = settings.cache_limit_mb.saturating_mul(1024 * 1024);
+    Cache::open(std::path::absolute(root)?, limit).map(Some)
+}
+
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} МБ", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn describe(cache: Option<&Cache>) -> String {
+    let Some(cache) = cache else {
+        return "Кеш: отключён".into();
+    };
+    let (tracks, size) = cache.usage();
+    let limit = match cache.limit() {
+        0 => "без ограничения".into(),
+        limit => format!("из {}", megabytes(limit)),
+    };
+    format!(
+        "Кеш: {}\nТреков в кеше: {tracks}, {} {limit}",
+        cache.root().display(),
+        megabytes(size)
+    )
+}
+
 fn run(cli: Cli) -> Result<()> {
-    let proxy = config::load_proxy(
-        cli.config.as_ref(),
-        cli.proxy.as_deref(),
-        cli.tor,
-        cli.no_proxy,
-    )?;
-    let provider = SoundCloud::new(&cli.yt_dlp, proxy.as_deref(), cli.no_proxy);
+    let settings = config::load(cli.config.as_ref())?;
+    let proxy = settings.proxy(cli.proxy.as_deref(), cli.tor, cli.no_proxy)?;
+    let cache = open_cache(&cli, &settings)?;
+    let extractor = Extractor {
+        program: &cli.yt_dlp,
+        proxy: proxy.as_deref(),
+        no_proxy: cli.no_proxy,
+        cache: cache.as_ref().map(Cache::extractor),
+    };
+    let provider = SoundCloud::new(extractor);
     match cli.command.unwrap_or(Action::Ui { library: None }) {
         Action::Ui { library } => {
             #[cfg(unix)]
-            ui::run(cli.yt_dlp, cli.mpv, proxy, cli.no_proxy, library)?;
+            ui::run(cli.yt_dlp, cli.mpv, proxy, cli.no_proxy, library, cache)?;
             #[cfg(not(unix))]
             {
                 let _ = library;
@@ -191,7 +253,13 @@ fn run(cli: Cli) -> Result<()> {
                 "{}\nПробел: пауза; ←/→: перемотка; 9/0: громкость; q: выход.",
                 clean(&url)
             );
-            player::play(&cli.mpv, &cli.yt_dlp, &url, proxy.as_deref(), cli.no_proxy)?;
+            player::play(&cli.mpv, extractor, &url, cache.as_ref())?;
+        }
+        Action::Cache { clear } => {
+            if let Some(cache) = cache.as_ref().filter(|_| clear) {
+                cache.clear()?;
+            }
+            println!("{}", describe(cache.as_ref()));
         }
         Action::Doctor => {
             println!(
@@ -204,6 +272,7 @@ fn run(cli: Cli) -> Result<()> {
                     "не задан в clicloud"
                 }
             );
+            println!("{}", describe(cache.as_ref()));
             let mut missing = false;
             for binary in [&cli.yt_dlp, &cli.mpv] {
                 match version(binary) {
