@@ -1,0 +1,137 @@
+"""PTY/IPC smoke test; no network, audio device or installed mpv needed.
+
+Run after cargo build: python3 tests/tui_smoke.py
+"""
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import select
+import signal
+import struct
+import subprocess
+import tempfile
+import termios
+import time
+
+
+def run(proxy=False, terminate=False):
+    with tempfile.TemporaryDirectory(prefix="clicloud-tui-") as directory:
+        root = Path(directory)
+        extractor = root / "yt-dlp"
+        extractor.write_text('''#!/usr/bin/env python3
+import json, sys
+if "--output" in sys.argv:
+    sys.stdout.buffer.write(b"mock-audio")
+else:
+    print(json.dumps({"entries":[{"title":"Night radio","uploader":"Test artist","duration":235,"webpage_url":"https://soundcloud.com/test/night"}]}))
+''')
+        player = root / "mpv"
+        player.write_text('''#!/usr/bin/env python3
+import json, os, socket, sys, time
+open(os.environ["MPV_PID"], "w").write(str(os.getpid()))
+path = next(arg.split("=",1)[1] for arg in sys.argv if arg.startswith("--input-ipc-server="))
+with socket.socket(socket.AF_UNIX) as server:
+    server.bind(path)
+    server.listen(1)
+    conn, _ = server.accept()
+    volume = 70
+    with conn, conn.makefile("rb") as stream:
+        conn.sendall(b'{"event":"file-loaded"}\\n')
+        for line in stream:
+            command = json.loads(line)["command"]
+            with open(os.environ["IPC_LOG"], "a") as log:
+                log.write(json.dumps(command)+"\\n")
+            if command[0] == "observe_property":
+                name = command[2]
+                data = {"time-pos":12,"duration":235,"pause":False,"volume":volume}[name]
+            elif command[:2] == ["cycle","pause"]:
+                name, data = "pause", True
+            elif command[:2] == ["add","volume"]:
+                volume += command[2]
+                name, data = "volume", volume
+            else:
+                continue
+            conn.sendall((json.dumps({"event":"property-change","name":name,"data":data})+"\\n").encode())
+if os.environ.get("MPV_LINGER"):
+    time.sleep(30)
+''')
+        extractor.chmod(0o755)
+        player.chmod(0o755)
+        (root / "config.json").write_text("{}")
+        temporary = root / "tmp"
+        temporary.mkdir()
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
+        before = termios.tcgetattr(slave)
+        env = dict(os.environ, TERM="xterm-256color", CLICLOUD_YT_DLP=str(extractor),
+                   CLICLOUD_MPV=str(player), CLICLOUD_CONFIG=str(root / "config.json"),
+                   IPC_LOG=str(root / "ipc.jsonl"), MPV_PID=str(root / "mpv.pid"),
+                   TMPDIR=str(temporary))
+        if terminate:
+            env["MPV_LINGER"] = "1"
+        env.pop("CLICLOUD_PROXY", None)
+        process = subprocess.Popen(["target/debug/clicloud", "--tor" if proxy else "--no-proxy",
+                                    "ui", "--library", str(root / "library.json")],
+                                   stdin=slave, stdout=slave, stderr=slave, env=env)
+        output = bytearray()
+
+        def read_until(check, seconds=5):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    output.extend(os.read(master, 65536))
+                if check():
+                    return
+            raise AssertionError(output.decode(errors="replace")[-4000:])
+
+        def log():
+            path = root / "ipc.jsonl"
+            return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+        try:
+            read_until(lambda: b"CLICLOUD" in output)
+            os.write(master, b"/ambient\r")
+            read_until(lambda: b"Night radio" in output)
+            os.write(master, b"fa\r")
+            read_until(lambda: len(log()) >= 4)
+            if terminate:
+                player_pid = int((root / "mpv.pid").read_text())
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=5)
+                assert process.returncode == 0, process.returncode
+                assert termios.tcgetattr(slave) == before, "Terminal mode was not restored"
+                try:
+                    os.kill(player_pid, 0)
+                    raise AssertionError("mpv outlived the client")
+                except ProcessLookupError:
+                    pass
+                assert not list(temporary.iterdir()), "IPC directory was not removed"
+                print("PASS: SIGTERM stops mpv, removes the IPC directory, restores the terminal")
+                return
+            os.write(master, b" ++\x1b[C")
+            read_until(lambda: ["cycle", "pause"] in log() and ["seek", 10, "relative"] in log()
+                       and log().count(["add", "volume", 5]) == 2)
+            os.write(master, b"n")
+            read_until(lambda: sum(c[0] == "observe_property" for c in log()) >= 8)
+            os.write(master, b"q")
+            process.wait(timeout=5)
+            assert process.returncode == 0
+            assert termios.tcgetattr(slave) == before, "Terminal mode was not restored"
+            saved = json.loads((root / "library.json").read_text())
+            assert len(saved["favorites"]) == 1 and len(saved["recent"]) == 1
+            assert not list(temporary.iterdir()), "IPC directory was not removed"
+            print("PASS: TUI search, favorites, queue, IPC controls, terminal cleanup; proxy=", proxy)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+
+
+if __name__ == "__main__":
+    run()
+    run(proxy=True)
+    run(terminate=True)
