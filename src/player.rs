@@ -1,6 +1,15 @@
-use crate::{Result, soundcloud};
+use crate::{
+    Result,
+    cache::{Cache, Partial},
+    soundcloud::{self, Extractor},
+};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROXY_VARIABLES: [&str; 6] = [
@@ -33,22 +42,34 @@ pub fn mpv(executable: &str) -> Command {
 }
 
 /// Lets mpv fetch `url` itself; must be the last arguments of `command`.
-pub fn from_url(command: &mut Command, yt_dlp: &str, url: &str, no_proxy: bool) {
+pub fn from_url(command: &mut Command, extractor: Extractor, url: &str) {
     // mpv's built-in hook resolves streams and forwards their HTTP headers.
-    // append passes one option without splitting commas in the executable path.
+    // append passes one option without splitting commas in a path.
+    let mut cache = std::ffi::OsString::from("--ytdl-raw-options-append=");
+    match extractor.cache {
+        Some(directory) => {
+            cache.push("cache-dir=");
+            cache.push(directory);
+        }
+        None => cache.push("no-cache-dir="),
+    }
     command
         .args([
             "--ytdl=yes",
             "--ytdl-format=bestaudio/best",
             // Same limit as yt-dlp below; mpv's default stalls for a minute.
             "--network-timeout=15",
-            "--ytdl-raw-options=ignore-config=,no-cache-dir=,socket-timeout=15,retries=2",
+            "--ytdl-raw-options=ignore-config=,socket-timeout=15,retries=2",
         ])
-        .arg(format!("--script-opts-append=ytdl_hook-ytdl_path={yt_dlp}"))
+        .arg(cache)
+        .arg(format!(
+            "--script-opts-append=ytdl_hook-ytdl_path={}",
+            extractor.program
+        ))
         // Otherwise mpv first opens the track page itself and only then asks yt-dlp;
         // where soundcloud.com is unreachable that attempt hangs for a minute.
         .arg("--script-opts-append=ytdl_hook-try_ytdl_first=yes");
-    if no_proxy {
+    if extractor.no_proxy {
         for name in PROXY_VARIABLES {
             command.env_remove(name);
         }
@@ -62,8 +83,13 @@ pub fn from_url(command: &mut Command, yt_dlp: &str, url: &str, no_proxy: bool) 
 }
 
 /// Feeds mpv the bytes of a `downloader`; must be the last arguments of `command`.
-pub fn from_pipe(command: &mut Command, source: ChildStdout) {
+pub fn from_pipe(command: &mut Command, source: impl Into<Stdio>) {
     command.args(["--ytdl=no", "--", "-"]).stdin(source);
+}
+
+/// Plays audio stored in the cache; must be the last arguments of `command`.
+pub fn from_file(command: &mut Command, file: &Path) {
+    command.args(["--ytdl=no", "--"]).arg(file);
 }
 
 /// A private directory for a player's socket, log and downloader fragments.
@@ -88,35 +114,30 @@ impl Drop for Scratch {
     }
 }
 
-/// yt-dlp writing the audio of `url` to its stdout through `proxy`.
+/// yt-dlp writing the audio of `url` to its stdout.
 ///
 /// It keeps the fragment being downloaded in a file in its working directory and
 /// leaves it behind when stopped, so it runs in `directory`, which the caller removes.
+/// `whole` is for audio that is kept: a lost fragment is then an error, not a gap.
 pub fn downloader(
-    yt_dlp: &str,
+    extractor: Extractor,
     url: &str,
-    proxy: &str,
     directory: &Path,
     progress: bool,
+    whole: bool,
 ) -> Command {
-    // A relative path to the executable must keep pointing at the same file.
-    let program = Path::new(yt_dlp);
-    let mut command = if program.components().count() > 1 {
-        Command::new(std::path::absolute(program).unwrap_or_else(|_| program.into()))
-    } else {
-        Command::new(yt_dlp)
-    };
+    let mut command = extractor.command();
     command.current_dir(directory).args([
-        "--ignore-config",
-        "--no-cache-dir",
-        "--proxy",
-        proxy,
         "--socket-timeout",
-        "30",
+        if extractor.proxy.is_some() {
+            "30"
+        } else {
+            "15"
+        },
         "--retries",
         "2",
         "--fragment-retries",
-        "2",
+        if whole { "5" } else { "2" },
         "--no-playlist",
         "--playlist-items",
         "1",
@@ -125,6 +146,9 @@ pub fn downloader(
         "--fixup",
         "never",
     ]);
+    if whole {
+        command.arg("--abort-on-unavailable-fragments");
+    }
     if !progress {
         command.arg("--no-progress");
     }
@@ -133,6 +157,89 @@ pub fn downloader(
         .stdin(Stdio::null())
         .stdout(Stdio::piped());
     command
+}
+
+/// yt-dlp fetching a track into the cache. A player can be fed what has arrived so
+/// far, so the track is heard while it is stored and is downloaded only once.
+pub struct Download {
+    child: Child,
+    partial: Option<Partial>,
+    source: Option<std::fs::File>,
+    status: Option<ExitStatus>,
+    over: Arc<AtomicBool>,
+}
+
+impl Download {
+    /// Starts `command`, a `downloader` running in the directory of `partial`.
+    pub fn start(mut command: Command, partial: Partial) -> Result<Self> {
+        let file = std::fs::File::create(partial.path())?;
+        let source = std::fs::File::open(partial.path())?;
+        let child = command
+            .stdout(file)
+            .spawn()
+            .map_err(|error| format!("Не удалось запустить yt-dlp: {error}"))?;
+        Ok(Self {
+            child,
+            partial: Some(partial),
+            source: Some(source),
+            status: None,
+            over: Default::default(),
+        })
+    }
+
+    /// Copies the audio into `sink` as it arrives and closes it when the download is over.
+    ///
+    /// The download itself does not wait for the player, which reads at its own pace.
+    pub fn feed(&mut self, mut sink: ChildStdin) {
+        let Some(mut source) = self.source.take() else {
+            return;
+        };
+        let over = self.over.clone();
+        std::thread::spawn(move || {
+            let mut buffer = vec![0; 64 * 1024];
+            loop {
+                // Read before the file: what was written before the end is then not missed.
+                let last = over.load(Ordering::Acquire);
+                match source.read(&mut buffer) {
+                    Ok(0) if !last => std::thread::sleep(Duration::from_millis(50)),
+                    // A player that is gone closes its end, which fails the write.
+                    Ok(count) if count > 0 && sink.write_all(&buffer[..count]).is_ok() => (),
+                    _ => break,
+                }
+            }
+        });
+    }
+
+    /// The exit status of yt-dlp once it has one. A complete download joins the cache.
+    pub fn poll(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if self.status.is_none()
+            && let Some(status) = self.child.try_wait()?
+        {
+            self.status = Some(status);
+            if status.success()
+                && let Some(partial) = self.partial.take()
+            {
+                // The player goes on reading the open file even if it could not be kept.
+                let _ = partial.commit();
+            }
+            self.over.store(true, Ordering::Release);
+        }
+        Ok(self.status)
+    }
+
+    pub fn finished(&self) -> bool {
+        self.status.is_some()
+    }
+}
+
+impl Drop for Download {
+    fn drop(&mut self) {
+        if self.status.is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        self.over.store(true, Ordering::Release);
+    }
 }
 
 /// Playback was cut short by this signal; the exit code follows the shell convention.
@@ -203,21 +310,30 @@ impl Signals {
     }
 }
 
-fn run(player: &mut Command, signals: &Signals) -> Result<ExitStatus> {
-    let mut child = player
+fn spawn(player: &mut Command) -> Result<Child> {
+    Ok(player
         .spawn()
-        .map_err(|error| format!("Не удалось запустить mpv: {error}"))?;
+        .map_err(|error| format!("Не удалось запустить mpv: {error}"))?)
+}
+
+// `tick` runs about twenty times a second while the player does.
+fn wait(child: &mut Child, signals: &Signals, mut tick: impl FnMut()) -> Result<ExitStatus> {
     loop {
         // Checked first: an interrupted mpv exits with an error status of its own.
         if let Some(signal) = signals.received() {
-            stop(&mut child);
+            stop(child);
             return Err(Box::new(Interrupted(signal)));
         }
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
+        tick();
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn run(player: &mut Command, signals: &Signals) -> Result<ExitStatus> {
+    wait(&mut spawn(player)?, signals, || ())
 }
 
 // mpv owns the terminal and restores it on SIGTERM; SIGKILL is only the fallback.
@@ -243,18 +359,44 @@ fn stop(child: &mut Child) {
 
 pub fn play(
     executable: &str,
-    yt_dlp: &str,
+    extractor: Extractor,
     url: &str,
-    proxy: Option<&str>,
-    no_proxy: bool,
+    cache: Option<&Cache>,
 ) -> Result<()> {
     soundcloud::validate_url(url)?;
     let signals = Signals::new()?;
-    if let Some(proxy) = proxy {
-        return play_through_proxy(executable, yt_dlp, url, proxy, &signals);
-    }
     let mut command = mpv(executable);
-    from_url(&mut command, yt_dlp, url, no_proxy);
+    if let Some(cache) = cache {
+        if let Some(file) = cache.find(url) {
+            eprintln!("Трек из кеша.");
+            from_file(&mut command, &file);
+            let status = run(&mut command, &signals)?;
+            if !status.success() {
+                return Err(format!("mpv завершился с {status}.").into());
+            }
+            return Ok(());
+        }
+        if let Some(partial) = cache.store(url)? {
+            eprintln!("Трек загружается в кеш; перемотка - в пределах загруженного.");
+            let mut source = downloader(extractor, url, partial.directory(), true, true);
+            source.stderr(Stdio::inherit());
+            let mut download = Download::start(source, partial)?;
+            from_pipe(&mut command, Stdio::piped());
+            let mut child = spawn(&mut command)?;
+            download.feed(child.stdin.take().expect("piped stdin"));
+            let played = wait(&mut child, &signals, || {
+                let _ = download.poll();
+            });
+            // Dropping it then stops a download that the player did not wait for.
+            let finished = download.poll();
+            drop(download);
+            return outcome(played, finished);
+        }
+    }
+    if extractor.proxy.is_some() {
+        return play_through_proxy(executable, extractor, url, &signals);
+    }
+    from_url(&mut command, extractor, url);
     let status = run(&mut command, &signals)?;
     if !status.success() {
         return Err(format!(
@@ -267,14 +409,13 @@ pub fn play(
 
 fn play_through_proxy(
     executable: &str,
-    yt_dlp: &str,
+    extractor: Extractor,
     url: &str,
-    proxy: &str,
     signals: &Signals,
 ) -> Result<()> {
     eprintln!("Прокси: аудио через yt-dlp; перемотка ограничена, воспроизводится один трек.");
     let scratch = Scratch(scratch_directory()?);
-    let mut source = downloader(yt_dlp, url, proxy, &scratch.0, true)
+    let mut source = downloader(extractor, url, &scratch.0, true, false)
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| format!("Не удалось запустить yt-dlp: {error}"))?;
@@ -287,14 +428,23 @@ fn play_through_proxy(
         let _ = source.kill();
     }
     let _ = source.wait();
+    outcome(played, finished)
+}
+
+// `finished` is the status of a downloader that ended by itself.
+fn outcome(
+    played: Result<ExitStatus>,
+    finished: std::io::Result<Option<ExitStatus>>,
+) -> Result<()> {
     let status = played?;
     // A downloader that failed by itself is the cause; mpv then only ran out of input.
     if let Some(status) = finished?
         && !status.success()
     {
-        return Err(
-            format!("yt-dlp завершился с {status}; проверьте прокси и доступность трека.").into(),
-        );
+        return Err(format!(
+            "yt-dlp завершился с {status}; проверьте сеть, прокси и доступность трека."
+        )
+        .into());
     }
     if !status.success() {
         return Err(format!("mpv завершился с {status}.").into());

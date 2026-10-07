@@ -1,20 +1,40 @@
 //! Managed mpv process and its local JSON IPC connection (Unix).
-use crate::{Result, player, soundcloud};
+use crate::{
+    Result,
+    cache::Cache,
+    player::{self, Download},
+    soundcloud::{self, Extractor},
+};
 use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Stdio},
     time::{Duration, Instant},
 };
 
 const LOG_LINES: usize = 20;
 
+/// Where the audio of a playback comes from.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Origin {
+    /// A file stored earlier: no network involved.
+    Cache,
+    /// yt-dlp, which stores the track while it plays.
+    Download,
+    /// yt-dlp through a pipe, nothing is kept.
+    Pipe,
+    /// mpv fetches the stream by itself.
+    Url,
+}
+
 pub struct Playback {
     child: Option<Child>,
     source: Option<Child>,
+    download: Option<Download>,
+    pub origin: Origin,
     socket: Option<UnixStream>,
     directory: PathBuf,
     buffer: Vec<u8>,
@@ -34,6 +54,8 @@ impl Playback {
         Self {
             child: None,
             source: None,
+            download: None,
+            origin: Origin::Url,
             socket: None,
             directory,
             buffer: Vec::new(),
@@ -51,10 +73,9 @@ impl Playback {
 
     pub fn start(
         mpv: &str,
-        yt_dlp: &str,
+        extractor: Extractor,
         url: &str,
-        proxy: Option<&str>,
-        direct: bool,
+        cache: Option<&Cache>,
         volume: f64,
     ) -> Result<Self> {
         soundcloud::validate_url(url)?;
@@ -75,23 +96,44 @@ impl Playback {
             .arg(format!("--volume={volume}"))
             .stdout(Stdio::null())
             .stderr(log.try_clone()?);
-        if let Some(proxy) = proxy {
-            let mut source = player::downloader(yt_dlp, url, proxy, &player.directory, false)
+        if let Some(file) = cache.and_then(|cache| cache.find(url)) {
+            player.origin = Origin::Cache;
+            player::from_file(&mut command, &file);
+            command.stdin(Stdio::null());
+        } else if let Some(partial) = cache.map(|cache| cache.store(url)).transpose()?.flatten() {
+            player.origin = Origin::Download;
+            let mut source = player::downloader(extractor, url, partial.directory(), false, true);
+            source.stderr(log);
+            player.download = Some(Download::start(source, partial)?);
+            player::from_pipe(&mut command, Stdio::piped());
+        } else if extractor.proxy.is_some() {
+            player.origin = Origin::Pipe;
+            let mut source = player::downloader(extractor, url, &player.directory, false, false)
                 .stderr(log)
                 .spawn()
-                .map_err(|e| format!("yt-dlp: {e}"))?;
+                .map_err(|e| format!("Не удалось запустить yt-dlp: {e}"))?;
             player::from_pipe(&mut command, source.stdout.take().expect("piped stdout"));
             player.source = Some(source);
         } else {
-            player::from_url(&mut command, yt_dlp, url, direct);
+            player::from_url(&mut command, extractor, url);
             command.stdin(Stdio::null());
         }
-        player.child = Some(
-            command
-                .spawn()
-                .map_err(|e| format!("mpv: {e}. Установите mpv и проверьте clicloud doctor."))?,
-        );
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("mpv: {e}. Установите mpv и проверьте clicloud doctor."))?;
+        if let Some(download) = &mut player.download {
+            download.feed(child.stdin.take().expect("piped stdin"));
+        }
+        player.child = Some(child);
         Ok(player)
+    }
+
+    /// Audio is still arriving: mpv then only knows the length of what it has got.
+    pub fn receiving(&self) -> bool {
+        match &self.download {
+            Some(download) => !download.finished(),
+            None => self.source.is_some(),
+        }
     }
 
     pub fn send(&mut self, command: Value) -> Result<()> {
@@ -144,12 +186,15 @@ impl Playback {
         if let Some(error) = self.error.take() {
             return Err(error.into());
         }
-        if let Some(source) = &mut self.source
-            && let Some(status) = source.try_wait()?
-            && !status.success()
-        {
+        let downloaded = match (&mut self.source, &mut self.download) {
+            (Some(source), _) => source.try_wait()?,
+            (_, Some(download)) => download.poll()?,
+            _ => None,
+        };
+        if downloaded.is_some_and(|status| !status.success()) {
             return Err(
-                "yt-dlp не смог загрузить аудио. Проверьте прокси и доступность трека.".into(),
+                "yt-dlp не смог загрузить аудио. Проверьте сеть, прокси и доступность трека."
+                    .into(),
             );
         }
         if let Some(status) = exited {
@@ -187,7 +232,14 @@ impl Playback {
                 }
             }
             Some("property-change") => match event["name"].as_str() {
-                Some("time-pos") => self.position = event["data"].as_f64().unwrap_or(self.position),
+                Some("time-pos") => {
+                    if let Some(position) = event["data"].as_f64() {
+                        self.position = position;
+                        // A stored file is loaded before the connection is there to
+                        // receive file-loaded; a position says the same.
+                        self.loaded = true;
+                    }
+                }
                 Some("duration") => self.duration = event["data"].as_f64().unwrap_or(self.duration),
                 Some("pause") => self.paused = event["data"].as_bool().unwrap_or(false),
                 Some("volume") => self.volume = event["data"].as_f64().unwrap_or(self.volume),
@@ -201,22 +253,24 @@ impl Playback {
 impl Playback {
     /// Downloader output and mpv error messages behind a failed playback.
     pub fn details(&self) -> Option<String> {
-        let mut lines = Vec::new();
-        if let Ok(bytes) = fs::read(self.directory.join("error.log")) {
-            let text = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(8192)..]);
-            let tail: Vec<_> = text
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .collect();
-            lines.extend(
-                tail[tail.len().saturating_sub(LOG_LINES)..]
-                    .iter()
-                    .map(|line| line.trim_end().to_owned()),
-            );
-        }
+        let mut lines = tail(&self.directory.join("error.log"));
         lines.extend(self.log.iter().cloned());
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
+}
+
+/// The last lines that yt-dlp or mpv wrote to the log file at `path`.
+pub fn tail(path: &Path) -> Vec<String> {
+    let bytes = fs::read(path).unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(8192)..]);
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(LOG_LINES)..]
+        .iter()
+        .map(|line| line.trim_end().to_owned())
+        .collect()
 }
 
 impl Drop for Playback {
@@ -240,6 +294,10 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let mut player = Playback::idle(directory.clone(), 70.0);
         assert!(player.details().is_none());
+        player.event(json!({"event": "property-change", "name": "time-pos", "data": null}));
+        assert!(!player.loaded);
+        player.event(json!({"event": "property-change", "name": "time-pos", "data": 1.5}));
+        assert!(player.loaded && player.position == 1.5);
         fs::write(directory.join("error.log"), "ERROR: [soundcloud] 403\n\n").unwrap();
         player.event(json!({"event": "log-message", "prefix": "ytdl_hook", "level": "error", "text": "youtube-dl failed\n"}));
         player.event(json!({"event": "end-file", "reason": "error"}));

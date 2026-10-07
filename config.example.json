@@ -1,4 +1,6 @@
 {
   "proxy_enabled": true,
-  "proxy": "socks5h://127.0.0.1:9050"
+  "proxy": "socks5h://127.0.0.1:9050",
+  "cache_enabled": true,
+  "cache_limit_mb": 1024
 }

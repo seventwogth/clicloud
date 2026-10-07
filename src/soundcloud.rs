@@ -1,6 +1,7 @@
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use url::Url;
@@ -28,20 +29,50 @@ struct Entry {
     url: Option<String>,
 }
 
+/// How yt-dlp is run: the program, its route to SoundCloud and its own cache.
+#[derive(Clone, Copy)]
+pub struct Extractor<'a> {
+    pub program: &'a str,
+    pub proxy: Option<&'a str>,
+    pub no_proxy: bool,
+    /// Where yt-dlp keeps what it learns, such as the client id; None to keep nothing.
+    pub cache: Option<&'a Path>,
+}
+
+impl Extractor<'_> {
+    /// yt-dlp with the options shared by searching and downloading.
+    pub fn command(&self) -> Command {
+        // A relative path must keep pointing at the same file if the directory changes.
+        let program = Path::new(self.program);
+        let mut command = if program.components().count() > 1 {
+            Command::new(std::path::absolute(program).unwrap_or_else(|_| program.into()))
+        } else {
+            Command::new(self.program)
+        };
+        command.arg("--ignore-config");
+        match self.cache {
+            Some(directory) => command.arg("--cache-dir").arg(directory),
+            None => command.arg("--no-cache-dir"),
+        };
+        if let Some(proxy) = self.proxy {
+            command.args(["--proxy", proxy]);
+        } else if self.no_proxy {
+            command.args(["--proxy", ""]);
+        }
+        command
+    }
+}
+
 pub struct SoundCloud<'a> {
-    executable: &'a str,
-    proxy: Option<&'a str>,
-    no_proxy: bool,
+    extractor: Extractor<'a>,
     quiet: bool,
     cancel: Option<&'a AtomicBool>,
 }
 
 impl<'a> SoundCloud<'a> {
-    pub fn new(executable: &'a str, proxy: Option<&'a str>, no_proxy: bool) -> Self {
+    pub fn new(extractor: Extractor<'a>) -> Self {
         Self {
-            executable,
-            proxy,
-            no_proxy,
+            extractor,
             quiet: false,
             cancel: None,
         }
@@ -65,31 +96,28 @@ impl<'a> SoundCloud<'a> {
         if !self.quiet {
             eprintln!("Поиск в SoundCloud…");
         }
-        let mut command = Command::new(self.executable);
-        command.args([
-            "--ignore-config",
-            "--no-cache-dir",
-            "--flat-playlist",
-            "--dump-single-json",
-            "--skip-download",
-            "--socket-timeout",
-            if self.proxy.is_some() { "45" } else { "15" },
-            "--retries",
-            "2",
-        ]);
-        if let Some(proxy) = self.proxy {
-            command.args(["--proxy", proxy]);
-        } else if self.no_proxy {
-            command.args(["--proxy", ""]);
-        }
+        let mut command = self.extractor.command();
         command
+            .args([
+                "--flat-playlist",
+                "--dump-single-json",
+                "--skip-download",
+                "--socket-timeout",
+                if self.extractor.proxy.is_some() {
+                    "45"
+                } else {
+                    "15"
+                },
+                "--retries",
+                "2",
+            ])
             .arg("--")
             .arg(format!("scsearch{limit}:{query}"))
             .stdin(Stdio::null());
         let output = capture(&mut command, self.cancel).map_err(|error| {
             format!(
                 "Не удалось запустить yt-dlp ({}): {error}. Проверьте clicloud doctor.",
-                self.executable
+                self.extractor.program
             )
         })?;
         if !output.status.success() {

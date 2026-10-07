@@ -1,7 +1,10 @@
 use crate::{
-    Result, clean, clean_lines,
-    playback::Playback,
-    soundcloud::{SoundCloud, Track},
+    Result,
+    cache::Cache,
+    clean, clean_lines, config,
+    playback::{self, Origin, Playback},
+    player::{self, Download},
+    soundcloud::{Extractor, SoundCloud, Track},
 };
 use crossterm::{
     event::{
@@ -101,12 +104,20 @@ enum Action {
     Play,
     Favorite,
     Enqueue,
+    Download,
     Previous,
     Pause,
     Next,
     Stop,
     Quieter,
     Louder,
+}
+
+// A track being downloaded into the cache without being played.
+struct Fetch {
+    track: Track,
+    download: Download,
+    log: PathBuf,
 }
 
 struct App {
@@ -116,6 +127,10 @@ struct App {
     mpv: String,
     proxy: Option<String>,
     direct: bool,
+    cache: Option<Cache>,
+    // One download at a time: the connection is better spent on the track that plays.
+    fetch: Option<Fetch>,
+    pending: VecDeque<Track>,
     library_path: PathBuf,
     library: Library,
     view: View,
@@ -147,6 +162,7 @@ impl App {
         mpv: String,
         proxy: Option<String>,
         direct: bool,
+        cache: Option<Cache>,
         library_path: PathBuf,
         library: Library,
     ) -> Self {
@@ -157,6 +173,9 @@ impl App {
             mpv,
             proxy,
             direct,
+            cache,
+            fetch: None,
+            pending: VecDeque::new(),
             library_path,
             library,
             view: View::Search,
@@ -180,6 +199,14 @@ impl App {
             hits: vec![],
             focus: None,
             rows: Rect::default(),
+        }
+    }
+    fn extractor(&self) -> Extractor<'_> {
+        Extractor {
+            program: &self.yt_dlp,
+            proxy: self.proxy.as_deref(),
+            no_proxy: self.direct,
+            cache: self.cache.as_ref().map(Cache::extractor),
         }
     }
     fn tracks(&self) -> Vec<&Track> {
@@ -236,17 +263,26 @@ impl App {
             self.direct,
             self.query.clone(),
         );
+        let cache = self
+            .cache
+            .as_ref()
+            .map(|cache| cache.extractor().to_owned());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         self.worker = Some(std::thread::spawn(move || {
-            let result = SoundCloud::new(&binary, proxy.as_deref(), direct)
-                .quiet()
-                .cancellable(&cancel)
-                .search(&query, 30)
-                .map_err(|e| e.to_string());
+            let result = SoundCloud::new(Extractor {
+                program: &binary,
+                proxy: proxy.as_deref(),
+                no_proxy: direct,
+                cache: cache.as_deref(),
+            })
+            .quiet()
+            .cancellable(&cancel)
+            .search(&query, 30)
+            .map_err(|e| e.to_string());
             let _ = sender.send(result);
         }));
         self.receiver = Some(receiver);
@@ -267,17 +303,17 @@ impl App {
         self.last_error = None;
         match Playback::start(
             &self.mpv,
-            &self.yt_dlp,
+            self.extractor(),
             &track.url,
-            self.proxy.as_deref(),
-            self.direct,
+            self.cache.as_ref(),
             self.volume,
         ) {
             Ok(player) => {
-                self.message = if self.proxy.is_some() {
-                    "Загрузка через прокси, перемотка ограничена буфером"
-                } else {
-                    "Подключение к аудиопотоку..."
+                self.message = match player.origin {
+                    Origin::Cache => "Трек из кеша",
+                    Origin::Download => "Загрузка трека; перемотка - в пределах загруженного",
+                    Origin::Pipe => "Загрузка через прокси, перемотка ограничена буфером",
+                    Origin::Url => "Подключение к аудиопотоку...",
                 }
                 .into();
                 self.library.recent.retain(|t| t.url != track.url);
@@ -329,6 +365,79 @@ impl App {
                 "Очередь остановлена после нескольких ошибок подряд. e - подробности".into();
         }
         self.last_error = Some(report);
+    }
+    // Being downloaded or waiting for it, whether for playback or on request.
+    fn fetching(&self, url: &str) -> bool {
+        self.fetch.as_ref().is_some_and(|f| f.track.url == url)
+            || self.pending.iter().any(|t| t.url == url)
+            || (self.current.as_ref().is_some_and(|t| t.url == url)
+                && self
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| p.origin == Origin::Download && p.receiving()))
+    }
+    fn download(&mut self, tracks: Vec<Track>) {
+        let Some(cache) = &self.cache else {
+            self.message = "Кеш отключён: треки не сохраняются".into();
+            return;
+        };
+        let (mut added, mut lists) = (0, 0);
+        for track in tracks {
+            if !cache.accepts(&track.url) {
+                lists += 1;
+            } else if !cache.contains(&track.url) && !self.fetching(&track.url) {
+                self.pending.push_back(track);
+                added += 1;
+            }
+        }
+        self.message = match (added, lists) {
+            (0, 0) => "Уже в кеше или загружается".into(),
+            (0, _) => "В кеш сохраняются только отдельные треки".into(),
+            _ => format!(
+                "Загрузка в кеш, осталось треков: {}",
+                self.pending.len() + usize::from(self.fetch.is_some())
+            ),
+        };
+        self.fetch_next();
+    }
+    fn fetch_next(&mut self) {
+        while self.fetch.is_none()
+            && let Some(track) = self.pending.pop_front()
+        {
+            match self.fetch(&track) {
+                Ok(fetch) => {
+                    self.fetch = fetch.map(|(download, log)| Fetch {
+                        track,
+                        download,
+                        log,
+                    })
+                }
+                Err(error) => {
+                    // Neither the disk nor yt-dlp will do better for the rest.
+                    self.pending.clear();
+                    self.message = format!("Не удалось начать загрузку: {error}");
+                    self.last_error = Some(self.message.clone());
+                }
+            }
+        }
+    }
+    fn fetch(&self, track: &Track) -> Result<Option<(Download, PathBuf)>> {
+        let Some(cache) = self.cache.as_ref().filter(|c| !c.contains(&track.url)) else {
+            return Ok(None);
+        };
+        let Some(partial) = cache.store(&track.url)? else {
+            return Ok(None);
+        };
+        let log = partial.directory().join("log");
+        let mut command = player::downloader(
+            self.extractor(),
+            &track.url,
+            partial.directory(),
+            false,
+            true,
+        );
+        command.stderr(fs::File::create(&log)?);
+        Ok(Some((Download::start(command, partial)?, log)))
     }
     fn control(&mut self, command: serde_json::Value) {
         if let Some(player) = &mut self.player {
@@ -390,6 +499,11 @@ impl App {
                 if let Some(track) = self.selected() {
                     self.queue.push_back(track);
                     self.message = "Добавлено в конец очереди".into();
+                }
+            }
+            Action::Download => {
+                if let Some(track) = self.selected() {
+                    self.download(vec![track]);
                 }
             }
             Action::Pause => {
@@ -462,13 +576,39 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => (),
             }
         }
+        if let Some(fetch) = &mut self.fetch
+            && let Some(saved) = match fetch.download.poll() {
+                Ok(status) => status.map(|status| status.success()),
+                Err(_) => Some(false),
+            }
+        {
+            let name = format!("{} - {}", fetch.track.artist, fetch.track.title);
+            if saved {
+                self.message = format!("В кеше: {name}");
+            } else {
+                let mut report = format!("{name}\nyt-dlp не смог загрузить трек в кеш.");
+                let details = playback::tail(&fetch.log);
+                if !details.is_empty() {
+                    report = format!("{report}\n\n{}", details.join("\n"));
+                }
+                self.last_error = Some(report);
+                self.message = "Трек не загрузился в кеш. e - подробности".into();
+            }
+            self.fetch = None;
+            self.fetch_next();
+        }
         if let Some(player) = &mut self.player {
             let was_loaded = player.loaded;
             let result = player.tick();
             if !was_loaded && player.loaded {
                 // After a skip the notice about the failed track stays on screen.
                 if self.failures == 0 {
-                    self.message = "Воспроизведение. Space - пауза, n - следующий".into();
+                    self.message = if player.origin == Origin::Cache {
+                        "Воспроизведение из кеша. Space - пауза, n - следующий"
+                    } else {
+                        "Воспроизведение. Space - пауза, n - следующий"
+                    }
+                    .into();
                 }
                 self.failures = 0;
             }
@@ -513,16 +653,14 @@ pub fn run(
     proxy: Option<String>,
     direct: bool,
     library: Option<PathBuf>,
+    cache: Option<Cache>,
 ) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("Интерфейсу нужен интерактивный терминал. Для скриптов используйте search или play --first.".into());
     }
     let path = library
         .or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
+            config::directory("XDG_DATA_HOME", ".local/share")
                 .map(|p| p.join("clicloud/library.json"))
         })
         .ok_or("Не удалось определить путь библиотеки; укажите ui --library PATH")?;
@@ -531,7 +669,7 @@ pub fn run(
     for signal in [SIGTERM, SIGHUP, SIGINT] {
         signal_hook::flag::register(signal, terminate.clone())?;
     }
-    let mut app = App::new(yt_dlp, mpv, proxy, direct, path, library);
+    let mut app = App::new(yt_dlp, mpv, proxy, direct, cache, path, library);
     terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
@@ -629,6 +767,11 @@ pub fn run(
                     KeyCode::Char(' ') => app.action(Action::Pause),
                     KeyCode::Char('f') => app.action(Action::Favorite),
                     KeyCode::Char('a') => app.action(Action::Enqueue),
+                    KeyCode::Char('d') => app.action(Action::Download),
+                    KeyCode::Char('D') => {
+                        let tracks = app.tracks().into_iter().cloned().collect();
+                        app.download(tracks);
+                    }
                     KeyCode::Char('n') => app.action(Action::Next),
                     KeyCode::Char('p') => app.action(Action::Previous),
                     KeyCode::Char('s') => app.action(Action::Stop),
@@ -781,7 +924,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     label(
         frame,
         Rect::new(outer[4].x, outer[4].y + 1, outer[4].width, 1),
-        " / поиск  j/k выбор  Enter играть  f избранное  a очередь  ? помощь  q выход",
+        " / поиск  Enter играть  f избранное  a очередь  d в кеш  ? помощь  q выход",
         MUTED,
     );
     if app.help {
@@ -884,13 +1027,21 @@ fn draw_navigation(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     }
     if nav.height > 10 {
+        let loading = app.pending.len() + usize::from(app.fetch.is_some());
         label(
             frame,
             Rect::new(nav.x, nav.y + 9, nav.width, nav.height - 9),
             format!(
-                "{} избранных\n{} в очереди\n\nЛокальная\nбиблиотека",
+                "{} избранных\n{} в очереди\n{}",
                 app.library.favorites.len(),
-                app.queue.len()
+                app.queue.len(),
+                if loading > 0 {
+                    format!("{loading} качается\n\nv - в кеше")
+                } else if app.cache.is_some() {
+                    "\nv - в кеше,\nиграет и\nбез сети".into()
+                } else {
+                    "\nЛокальная\nбиблиотека".into()
+                }
             ),
             MUTED,
         );
@@ -940,6 +1091,13 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
                 let favorite = app.library.favorites.iter().any(|t| t.url == track.url);
                 let playing = app.current.as_ref().is_some_and(|t| t.url == track.url)
                     && app.player.is_some();
+                let stored = if app.cache.as_ref().is_some_and(|c| c.contains(&track.url)) {
+                    "v"
+                } else if app.fetching(&track.url) {
+                    "~"
+                } else {
+                    "."
+                };
                 Row::new(vec![
                     if playing {
                         "|>".into()
@@ -950,6 +1108,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
                     clean(&track.artist),
                     track.duration.map(time).unwrap_or_else(|| "-".into()),
                     if favorite { "*" } else { "." }.into(),
+                    stored.into(),
                 ])
                 .style(if playing { ACCENT } else { TEXT })
             })
@@ -961,11 +1120,12 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
                 Constraint::Min(12),
                 Constraint::Percentage(27),
                 Constraint::Length(6),
-                Constraint::Length(2),
+                Constraint::Length(1),
+                Constraint::Length(1),
             ],
         )
         .header(
-            Row::new(["#", "ТРЕК", "ИСПОЛНИТЕЛЬ", "ВРЕМЯ", "*"])
+            Row::new(["#", "ТРЕК", "ИСПОЛНИТЕЛЬ", "ВРЕМЯ", "*", "v"])
                 .style(MUTED)
                 .bottom_margin(1),
         )
@@ -982,11 +1142,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let buttons = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
+        .constraints([Constraint::Ratio(1, 4); 4])
         .spacing(1)
         .split(Rect::new(
             center[1].x + 1,
@@ -1011,6 +1167,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
         Action::Enqueue,
         false,
     );
+    button(frame, app, buttons[3], "v В кеш", Action::Download, false);
 }
 
 fn draw_upcoming(frame: &mut Frame, app: &App, area: Rect) {
@@ -1038,12 +1195,14 @@ fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
         vertical: 1,
     });
     let (position, duration, state) = if let Some(player) = &app.player {
+        let listed = app.current.as_ref().and_then(|t| t.duration).unwrap_or(0.0);
         (
             player.position,
-            if player.duration > 0.0 {
+            // While audio arrives, mpv reports the length of what it has got so far.
+            if player.duration > 0.0 && !(player.receiving() && listed > 0.0) {
                 player.duration
             } else {
-                app.current.as_ref().and_then(|t| t.duration).unwrap_or(0.0)
+                listed
             },
             if !player.loaded {
                 "ЗАГРУЗКА"
@@ -1113,7 +1272,7 @@ fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame, size: Rect) {
-    let modal = Rect::new(size.width / 2 - 32, size.height / 2 - 8, 64, 16);
+    let modal = Rect::new(size.width / 2 - 32, size.height / 2 - 9, 64, 17);
     frame.render_widget(Clear, modal);
     let keys = [
         ("/", "Поиск (Enter отправляет, Esc отменяет)"),
@@ -1122,6 +1281,7 @@ fn draw_help(frame: &mut Frame, size: Rect) {
         ("Tab", "Выбрать кнопку   Enter  Нажать"),
         ("f", "Добавить / удалить из избранного"),
         ("a", "Добавить в очередь   Del  Убрать из очереди"),
+        ("d / D", "Загрузить в кеш трек / весь список"),
         ("Space", "Пауза / продолжить"),
         ("p / n", "Предыдущий / следующий трек"),
         ("Left / Right", "Перемотка на 10 секунд"),
@@ -1179,6 +1339,7 @@ mod tests {
             "mpv".into(),
             None,
             false,
+            None,
             path,
             Library::default(),
         );
@@ -1359,6 +1520,65 @@ mod tests {
         drop(app);
         fs::remove_file(player).unwrap();
         fs::remove_file(library).unwrap();
+    }
+
+    #[test]
+    fn tracks_are_downloaded_into_the_cache_one_at_a_time() {
+        let root = std::env::temp_dir().join(format!("clicloud-ui-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let extractor = script(
+            "fetch",
+            r#"case "$*" in *broken*) echo 'ERROR: gone' >&2; exit 1;; esac; printf audio"#,
+        );
+        let mut app = app(PathBuf::new());
+        app.action(Action::Download);
+        assert!(app.message.contains("Кеш отключён") && app.fetch.is_none());
+
+        app.cache = Some(Cache::open(root.clone(), 0).unwrap());
+        app.yt_dlp = extractor.to_string_lossy().into_owned();
+        let named = |name: &str| Track {
+            url: format!("https://soundcloud.com/test/{name}"),
+            ..track()
+        };
+        let stored = |app: &App, name: &str| app.cache.as_ref().unwrap().contains(&named(name).url);
+        let screen = |app: &mut App| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = (0..30)
+                .flat_map(|y| (0..80).map(move |x| (x, y)))
+                .map(|at| buffer[at].symbol())
+                .collect();
+            text
+        };
+        app.results = vec![named("one"), named("broken"), named("two"), named("sets")];
+        app.download(app.results.clone());
+        // The playlist link is left out; the rest waits behind the first download.
+        assert!(app.fetch.is_some() && app.pending.len() == 2);
+        assert!(app.fetching(&named("two").url) && !app.fetching(&named("sets").url));
+        assert_eq!(screen(&mut app).matches(" . ~").count(), 3);
+        while app.fetch.is_some() {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stored(&app, "one") && stored(&app, "two") && !stored(&app, "broken"));
+        assert_eq!(app.message, "В кеше: Test artist - Ночной эфир");
+        let error = app.last_error.clone().unwrap();
+        assert!(error.starts_with("Test artist - Ночной эфир\n") && error.ends_with("ERROR: gone"));
+        assert_eq!(fs::read_dir(root.join("partial")).unwrap().count(), 0);
+        let text = screen(&mut app);
+        assert_eq!(
+            (text.matches(" . v").count(), text.matches(" . ~").count()),
+            (2, 0)
+        );
+
+        app.download(vec![named("one")]);
+        assert!(app.fetch.is_none() && app.message.contains("Уже в кеше"));
+        app.download(vec![named("sets")]);
+        assert!(app.message.contains("только отдельные треки"));
+        drop(app);
+        fs::remove_file(extractor).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
