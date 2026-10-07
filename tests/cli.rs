@@ -224,6 +224,67 @@ exit 0
     );
 }
 
+#[test]
+fn termination_signal_stops_player_and_downloader() {
+    let fixture = Fixture::new();
+    fixture.script(
+        "yt-dlp",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo mock; exit 0; fi
+echo $$ > "$SOURCE_PID"
+exec sleep 30
+"#,
+    );
+    // Like mpv, leaves on SIGTERM by itself; a SIGKILL would not write the marker.
+    fixture.script(
+        "mpv",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo mock; exit 0; fi
+trap 'echo restored > "$PLAYER_LOG"; exit 4' TERM
+echo $$ > "$PLAYER_PID"
+while :; do sleep 0.02; done
+"#,
+    );
+    let pid = |name: &str| loop {
+        match fs::read_to_string(fixture.0.join(name)) {
+            Ok(pid) if pid.ends_with('\n') => break pid.trim().to_owned(),
+            _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    };
+    let alive = |pid: &str| {
+        Command::new("kill")
+            .args(["-0", pid])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    let client = fixture
+        .command()
+        .env("SOURCE_PID", fixture.0.join("source.pid"))
+        .env("PLAYER_PID", fixture.0.join("player.pid"))
+        .args(["--tor", "play", "https://soundcloud.com/a/b"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (player, source) = (pid("player.pid"), pid("source.pid"));
+    let killed = Command::new("kill")
+        .args(["-TERM", &client.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let output = client.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(128 + 15), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Ошибка"));
+    assert!(!alive(&player) && !alive(&source));
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("player.log")).unwrap(),
+        "restored\n"
+    );
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);

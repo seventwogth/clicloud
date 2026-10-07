@@ -72,6 +72,9 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            if let Some(player::Interrupted(signal)) = error.downcast_ref() {
+                return ExitCode::from(128 + *signal as u8);
+            }
             eprintln!("Ошибка: {}", clean_lines(&error.to_string()));
             ExitCode::FAILURE
         }
