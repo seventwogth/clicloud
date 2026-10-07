@@ -2104,7 +2104,7 @@ mod tests {
             (Lang::Japanese, "Dracula"),
         ] {
             lang::set(language);
-            let scheme = Theme::load(name);
+            let scheme = Theme::with(name, true);
             assert_eq!(scheme.name, name);
             for (mut app, width, height) in screens() {
                 app.theme = scheme.clone();
