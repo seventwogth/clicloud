@@ -144,7 +144,51 @@ impl Rgb {
     fn color(self) -> Color {
         Color::Rgb(self.0, self.1, self.2)
     }
+
+    // The closest of the 240 colors that every 256-color terminal shows alike: a
+    // cube of six levels per channel and a ramp of grays. The first sixteen are
+    // left out, as they are whatever the scheme of the terminal makes them.
+    fn indexed(self) -> u8 {
+        let near = |value: u8| {
+            (0..6u8)
+                .min_by_key(|level| LEVELS[usize::from(*level)].abs_diff(value))
+                .unwrap_or(0)
+        };
+        let (red, green, blue) = (near(self.0), near(self.1), near(self.2));
+        let cube = 16 + 36 * red + 6 * green + blue;
+        let mean = (u16::from(self.0) + u16::from(self.1) + u16::from(self.2)) / 3;
+        let gray = 232 + ((mean.saturating_sub(3)) / 10).min(23) as u8;
+        let distance = |index: u8| {
+            let other = Self::of(index);
+            [(self.0, other.0), (self.1, other.1), (self.2, other.2)]
+                .iter()
+                .map(|(a, b)| u32::from(a.abs_diff(*b)).pow(2))
+                .sum::<u32>()
+        };
+        if distance(gray) < distance(cube) {
+            gray
+        } else {
+            cube
+        }
+    }
+
+    // The color behind an index of the cube or the ramp.
+    fn of(index: u8) -> Self {
+        match index {
+            232.. => {
+                let gray = 8 + 10 * (index - 232);
+                Self(gray, gray, gray)
+            }
+            _ => {
+                let at = index.saturating_sub(16);
+                let level = |step: u8| LEVELS[usize::from(step % 6)];
+                Self(level(at / 36), level(at / 6), level(at))
+            }
+        }
+    }
 }
+
+const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
 /// What a Ghostty theme or configuration file says about colors.
 #[derive(Clone, Default, PartialEq, Debug)]
@@ -331,8 +375,14 @@ impl Theme {
         })
     }
 
-    /// The scheme called `name`; an unknown one gives the scheme of the terminal.
+    /// The scheme called `name`, as the terminal at hand can show it; an unknown one
+    /// gives the scheme of the terminal.
     pub fn load(name: &str) -> Self {
+        Self::with(name, truecolor(|name| std::env::var(name).ok()))
+    }
+
+    /// `truecolor` tells whether colors may be given as red, green and blue.
+    pub fn with(name: &str, truecolor: bool) -> Self {
         match name {
             MONO => Self::mono(),
             TERMINAL => terminal(),
@@ -342,14 +392,84 @@ impl Theme {
                     colors.read(&text);
                     Self::colored(name, &colors, true)
                 })
+                .map(|theme| if truecolor { theme } else { theme.reduced() })
                 .unwrap_or_else(terminal),
         }
     }
+
+    // The same scheme in the 256 colors that terminals without true color have.
+    fn reduced(mut self) -> Self {
+        let index = |color: Option<Color>| match color {
+            Some(Color::Rgb(red, green, blue)) => {
+                Some(Color::Indexed(Rgb(red, green, blue).indexed()))
+            }
+            other => other,
+        };
+        let (text, background) = (index(self.base.fg), index(self.base.bg));
+        for style in [
+            &mut self.base,
+            &mut self.text,
+            &mut self.strong,
+            &mut self.muted,
+            &mut self.border,
+            &mut self.accent,
+            &mut self.bar,
+            &mut self.selected,
+            &mut self.focused,
+            &mut self.playing,
+            &mut self.waiting,
+            &mut self.favorite,
+            &mut self.stored,
+            &mut self.error,
+        ] {
+            (style.fg, style.bg) = (index(style.fg), index(style.bg));
+            // Close tones can land on one color, or too near to read: nothing may
+            // vanish into the background, and a marked row or button stays marked.
+            let apart = |a: Option<Color>, b: Option<Color>| match (a, b) {
+                (Some(Color::Indexed(a)), Some(Color::Indexed(b))) => {
+                    Rgb::of(a).contrast(Rgb::of(b))
+                }
+                _ => 21.0,
+            };
+            if style.bg.is_none() && style.fg == background {
+                style.fg = text;
+            } else if style.bg == background || apart(style.fg, style.bg) < 3.0 {
+                (style.fg, style.bg) = (background, text);
+            }
+        }
+        (self.base.fg, self.base.bg) = (text, background);
+        self
+    }
+}
+
+// Whether the terminal says that it takes colors as red, green and blue. One that does
+// not may read such a sequence as something else, bold or blinking, so without a sign
+// of it the colors are picked from the 256 that every color terminal has.
+fn truecolor(variable: impl Fn(&str) -> Option<String>) -> bool {
+    let among = |name: &str, values: &[&str]| {
+        variable(name).is_some_and(|value| values.iter().any(|known| value.contains(known)))
+    };
+    among("COLORTERM", &["truecolor", "24bit"])
+        // Windows Terminal, also around a Linux shell in WSL.
+        || variable("WT_SESSION").is_some()
+        || among("TERM_PROGRAM", &["ghostty", "iTerm", "WezTerm", "vscode"])
+        // tmux turns such colors into what the terminal around it can show.
+        || among(
+            "TERM",
+            &["direct", "ghostty", "kitty", "alacritty", "foot", "wezterm", "tmux"],
+        )
 }
 
 // Ghostty tells its theme in a file, so the exact colors are known and the fainter
 // tones can be mixed from them. Elsewhere the terminal's sixteen colors are used.
 fn terminal() -> Theme {
+    // The convention of no-color.org: the user wants programs without color.
+    if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+        return Theme {
+            name: TERMINAL.into(),
+            ..Theme::mono()
+        };
+    }
     let inside = std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
         || std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "ghostty")
         || std::env::var("TERM").is_ok_and(|term| term == "xterm-ghostty");
@@ -523,6 +643,96 @@ mod tests {
             }
         }
         assert!(faults.is_empty(), "{}", faults.join("\n"));
+    }
+
+    #[test]
+    fn schemes_survive_a_terminal_of_256_colors() {
+        // The corners of the cube and of the ramp are themselves.
+        for (color, index) in [
+            (Rgb(0, 0, 0), 16),
+            (Rgb(255, 255, 255), 231),
+            (Rgb(255, 0, 0), 196),
+            (Rgb(95, 135, 175), 67),
+            (Rgb(8, 8, 8), 232),
+            (Rgb(238, 238, 238), 255),
+            (Rgb(128, 128, 128), 244),
+        ] {
+            assert_eq!(color.indexed(), index, "{color:?}");
+            assert_eq!(Rgb::of(index), color);
+        }
+        let color = |color: Option<Color>| match color {
+            Some(Color::Indexed(index)) => Rgb::of(index),
+            other => panic!("{other:?}"),
+        };
+        for (name, _) in BUILT_IN {
+            let theme = Theme::with(name, false);
+            assert_eq!(theme.name, name);
+            let (text, background) = (color(theme.base.fg), color(theme.base.bg));
+            assert!(text.contrast(background) >= 3.5, "{name}: text");
+            for (part, style) in [
+                ("muted", theme.muted),
+                ("border", theme.border),
+                ("accent", theme.accent),
+                ("playing", theme.playing),
+                ("favorite", theme.favorite),
+                ("stored", theme.stored),
+                ("error", theme.error),
+            ] {
+                assert_eq!(style.bg, None, "{name}: {part}");
+                assert_ne!(color(style.fg), background, "{name}: {part}");
+            }
+            for (part, style) in [("selected", theme.selected), ("focused", theme.focused)] {
+                assert_ne!(color(style.bg), background, "{name}: {part}");
+                assert!(
+                    color(style.fg).contrast(color(style.bg)) >= 3.0,
+                    "{name}: {part}"
+                );
+            }
+        }
+        assert_eq!(
+            Theme::with("Dracula", true).base.bg,
+            Some(Color::Rgb(0x28, 0x2a, 0x36))
+        );
+    }
+
+    #[test]
+    fn true_color_is_used_only_where_the_terminal_announces_it() {
+        let environment = |pairs: &'static [(&str, &str)]| {
+            move |name: &str| {
+                (pairs.iter())
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        for (pairs, expected) in [
+            (&[("COLORTERM", "truecolor")][..], true),
+            (
+                &[("COLORTERM", "24bit"), ("TERM", "xterm-256color")][..],
+                true,
+            ),
+            (&[("TERM", "xterm-ghostty")][..], true),
+            (&[("TERM", "xterm-kitty")][..], true),
+            (&[("TERM", "tmux-256color")][..], true),
+            (&[("TERM", "xterm-direct")][..], true),
+            (
+                &[("WT_SESSION", "0f8c"), ("TERM", "xterm-256color")][..],
+                true,
+            ),
+            (&[("TERM_PROGRAM", "iTerm.app")][..], true),
+            (
+                &[
+                    ("TERM_PROGRAM", "Apple_Terminal"),
+                    ("TERM", "xterm-256color"),
+                ][..],
+                false,
+            ),
+            (&[("TERM", "screen-256color")][..], false),
+            (&[("TERM", "linux")][..], false),
+            (&[("COLORTERM", "")][..], false),
+            (&[][..], false),
+        ] {
+            assert_eq!(truecolor(environment(pairs)), expected, "{pairs:?}");
+        }
     }
 
     #[test]

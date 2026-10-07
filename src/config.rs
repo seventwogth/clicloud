@@ -50,12 +50,16 @@ impl Default for Settings {
     }
 }
 
-/// The user's directory of one kind: `$variable`, or `fallback` in the home directory.
+/// The user's directory of one kind: `$variable`, or `fallback` in the home directory,
+/// which Windows names differently.
 pub fn directory(variable: &str, fallback: &str) -> Option<PathBuf> {
-    env::var_os(variable)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|v| PathBuf::from(v).join(fallback)))
+    let set = |name: &str| env::var_os(name).filter(|v| !v.is_empty());
+    set(variable).map(PathBuf::from).or_else(|| {
+        ["HOME", "USERPROFILE"]
+            .into_iter()
+            .find_map(set)
+            .map(|home| PathBuf::from(home).join(fallback))
+    })
 }
 
 /// The settings file: the given one, or the default one in the user's directory.
