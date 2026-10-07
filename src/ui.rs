@@ -535,6 +535,8 @@ impl App {
                 let next = (at + count).saturating_add_signed(isize::from(delta)) % count;
                 lang::set(lang::ALL[next]);
                 self.settings.language = lang::ALL[next].code().into();
+                // The line at the bottom still reads in the language it was written in.
+                self.message = t!("Нажмите /, чтобы найти музыку. ? - все клавиши").into();
             }
             Setting::Proxy | Setting::Cache => return self.activate(),
             Setting::ProxyAddress => return,
@@ -2285,6 +2287,7 @@ mod tests {
         app.adjust(1);
         assert_eq!(app.value(Setting::Language), "English");
         assert_eq!(Setting::Language.name(), "Language");
+        assert_eq!(app.message, "Press / to find music. ? - all keys");
         app.adjust(1);
         assert_eq!(
             (lang::current(), app.settings.language.as_str()),
@@ -2294,6 +2297,18 @@ mod tests {
         assert_eq!(app.settings.language, "ru");
         app.adjust(-1);
         assert_eq!(app.value(Setting::Language), "日本語");
+        // Nothing on the screen is left in the language before.
+        app.options = false;
+        app.results.clear();
+        app.query.clear();
+        let text = screen(&mut app, 120, 35);
+        assert!(
+            !text
+                .chars()
+                .any(|c| ('а'..='я').contains(&c.to_lowercase().next().unwrap())),
+            "{text}"
+        );
+        assert!(text.contains(t!("Нажмите /, чтобы найти музыку. ? - все клавиши")));
         app.adjust(1);
         assert_eq!(app.value(Setting::Volume), "75");
         assert_eq!(config::load(Some(&file)).unwrap().language, "ru");
