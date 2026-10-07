@@ -35,6 +35,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+// What the header says after the name. One of them is picked for a run; add as many
+// as you like, but keep them short: the header clips what does not fit beside the name.
+const TAGLINES: [&str; 4] = [
+    "your terminal, your music",
+    "sound without a browser",
+    "endless scroll, now with sound",
+    "all of SoundCloud, none of the chrome",
+];
+
 // Frames, buttons and marks are ASCII in every color scheme.
 const BORDER: symbols::border::Set = symbols::border::Set {
     top_left: "+",
@@ -227,6 +236,7 @@ struct App {
     // The proxy that switching it on brings back, even if only a flag named it.
     address: Option<String>,
     theme: Theme,
+    tagline: &'static str,
     themes: Vec<String>,
     picker: Option<Picker>,
     // The settings window: whether it is open, its current line and where its lines are.
@@ -282,6 +292,7 @@ impl App {
             cache: session.cache,
             cache_dir: session.cache_dir,
             theme: Theme::load(&session.settings.theme),
+            tagline: tagline(),
             themes: vec![],
             picker: None,
             options: false,
@@ -667,7 +678,7 @@ impl App {
         self.searching = true;
         self.editing = false;
         self.select_view(View::Search);
-        self.message = t!("Ищем треки в SoundCloud... Esc - отмена").into();
+        self.message = t!("Ищем треки... Esc - отмена").into();
     }
     fn cancel_search(&mut self) {
         // The worker kills yt-dlp; its late result goes nowhere.
@@ -1031,6 +1042,15 @@ impl Drop for TerminalGuard {
             crossterm::cursor::Show
         );
     }
+}
+
+/// One of `TAGLINES`, drawn for as long as the interface runs. The standard library
+/// hands out no random numbers, but the hasher that hash maps seed from the system
+/// does, and one number per run is all this takes.
+fn tagline() -> &'static str {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+    let seed = RandomState::new().build_hasher().finish() as usize;
+    TAGLINES[seed % TAGLINES.len()]
 }
 
 pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
@@ -1426,18 +1446,14 @@ fn draw_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" CLICLOUD ", theme.accent),
-            Span::styled("/ your terminal, your music", theme.muted),
+            Span::styled(format!("/ {}", app.tagline), theme.muted),
         ])),
         header[0],
     );
     frame.render_widget(
-        Paragraph::new(if app.proxy.is_some() {
-            "PROXY ON / SOUNDCLOUD "
-        } else {
-            "SOUNDCLOUD / STREAMING "
-        })
-        .style(theme.muted)
-        .alignment(Alignment::Right),
+        Paragraph::new("CLICLOUD")
+            .style(theme.muted)
+            .alignment(Alignment::Right),
         header[1],
     );
 }

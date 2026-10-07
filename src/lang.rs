@@ -219,9 +219,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "アーティスト名か曲名を入力してください",
     ),
     (
-        "Ищем треки в SoundCloud... Esc - отмена",
-        "Searching SoundCloud... Esc - cancel",
-        "SoundCloud を検索中... Esc - 中止",
+        "Ищем треки... Esc - отмена",
+        "Searching... Esc - cancel",
+        "検索中... Esc - 中止",
     ),
     ("Поиск отменён", "Search cancelled", "検索を中止しました"),
     ("Трек из кеша", "Track from the cache", "キャッシュの曲"),
