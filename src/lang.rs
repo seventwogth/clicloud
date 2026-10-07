@@ -829,6 +829,15 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "キャッシュ {} を準備できません: {}  --cache-dir か --no-cache を指定してください。",
     ),
     ("Язык", "Language", "言語"),
+    ("Фоновый рисунок", "Backdrop", "背景の絵"),
+    ("нет", "none", "なし"),
+    ("жнец", "reaper", "死神"),
+    ("пентаграмма", "pentagram", "五芒星"),
+    (
+        "Enter или Left/Right - сменить рисунок за списком треков.\nнет - список без рисунка.",
+        "Enter or Left/Right - the drawing behind the list of tracks.\nnone - a list without a drawing.",
+        "Enter か Left/Right - 曲の一覧の後ろの絵を切り替えます。\nなし - 絵のない一覧。",
+    ),
     (
         "Enter или Left/Right - сменить язык интерфейса и сообщений.\nСправка командной строки (--help) остаётся на русском.",
         "Enter or Left/Right - the language of the interface and messages.\nThe command line help (--help) stays in Russian.",
