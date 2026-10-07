@@ -150,7 +150,7 @@ if os.environ.get("MPV_LINGER"):
             os.write(master, b"2x")
             read_until(lambda: not stored.exists())
             # A setting changed in the settings window lands in the settings file.
-            os.write(master, b"ojjjjj\x1b[C")
+            os.write(master, b"ojjjjjj\x1b[C")
             settings = root / "config.json"
             read_until(lambda: json.loads(settings.read_text() or "{}").get("search_limit") == 35)
             os.write(master, b"q")

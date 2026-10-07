@@ -173,7 +173,7 @@ impl Download {
         let child = command
             .stdout(file)
             .spawn()
-            .map_err(|error| format!("Не удалось запустить yt-dlp: {error}"))?;
+            .map_err(|error| t!("Не удалось запустить yt-dlp: {}", error))?;
         Ok(Self {
             child,
             partial: Some(partial),
@@ -244,7 +244,7 @@ pub struct Interrupted(pub i32);
 
 impl std::fmt::Display for Interrupted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Воспроизведение прервано сигналом {}.", self.0)
+        write!(f, "{}", t!("Воспроизведение прервано сигналом {}.", self.0))
     }
 }
 
@@ -309,7 +309,7 @@ impl Signals {
 fn spawn(player: &mut Command) -> Result<Child> {
     Ok(player
         .spawn()
-        .map_err(|error| format!("Не удалось запустить mpv: {error}"))?)
+        .map_err(|error| t!("Не удалось запустить mpv: {}", error))?)
 }
 
 // `tick` runs about twenty times a second while the player does.
@@ -369,11 +369,11 @@ pub fn play(
             if let Some(track) = track {
                 cache.describe(track);
             }
-            eprintln!("Трек из кеша.");
+            eprintln!("{}", t!("Трек из кеша."));
             from_file(&mut command, &file);
             let status = run(&mut command, &signals)?;
             if !status.success() {
-                return Err(format!("mpv завершился с {status}.").into());
+                return Err(t!("mpv завершился с {}.", status).into());
             }
             return Ok(());
         }
@@ -381,7 +381,10 @@ pub fn play(
             if let Some(track) = track {
                 partial.describe(track);
             }
-            eprintln!("Трек загружается в кеш; перемотка - в пределах загруженного.");
+            eprintln!(
+                "{}",
+                t!("Трек загружается в кеш; перемотка - в пределах загруженного.")
+            );
             let mut source = downloader(extractor, url, partial.directory(), true, true);
             source.stderr(Stdio::inherit());
             let mut download = Download::start(source, partial)?;
@@ -403,8 +406,9 @@ pub fn play(
     from_url(&mut command, extractor, url);
     let status = run(&mut command, &signals)?;
     if !status.success() {
-        return Err(format!(
-            "mpv завершился с {status}. Трек может быть недоступен; подробности выше."
+        return Err(t!(
+            "mpv завершился с {}. Трек может быть недоступен; подробности выше.",
+            status
         )
         .into());
     }
@@ -417,12 +421,15 @@ fn play_through_proxy(
     url: &str,
     signals: &Signals,
 ) -> Result<()> {
-    eprintln!("Прокси: аудио через yt-dlp; перемотка ограничена, воспроизводится один трек.");
+    eprintln!(
+        "{}",
+        t!("Прокси: аудио через yt-dlp; перемотка ограничена, воспроизводится один трек.")
+    );
     let scratch = Scratch(scratch_directory()?);
     let mut source = downloader(extractor, url, &scratch.0, true, false)
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|error| format!("Не удалось запустить yt-dlp: {error}"))?;
+        .map_err(|error| t!("Не удалось запустить yt-dlp: {}", error))?;
     let mut command = mpv(executable);
     from_pipe(&mut command, source.stdout.take().expect("piped stdout"));
     let played = run(&mut command, signals);
@@ -445,13 +452,14 @@ fn outcome(
     if let Some(status) = finished?
         && !status.success()
     {
-        return Err(format!(
-            "yt-dlp завершился с {status}; проверьте сеть, прокси и доступность трека."
+        return Err(t!(
+            "yt-dlp завершился с {}; проверьте сеть, прокси и доступность трека.",
+            status
         )
         .into());
     }
     if !status.success() {
-        return Err(format!("mpv завершился с {status}.").into());
+        return Err(t!("mpv завершился с {}.", status).into());
     }
     Ok(())
 }

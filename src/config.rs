@@ -23,6 +23,8 @@ pub struct Settings {
     pub cache_limit_mb: u64,
     /// A color scheme of the interface; see `theme`.
     pub theme: String,
+    /// The language of the interface and the messages: ru, en or ja.
+    pub language: String,
     /// How many tracks a search in the interface asks for.
     pub search_limit: u8,
     /// Seconds that the arrow keys seek by.
@@ -40,6 +42,7 @@ impl Default for Settings {
             cache_dir: None,
             cache_limit_mb: 1024,
             theme: crate::theme::TERMINAL.into(),
+            language: crate::lang::Lang::Russian.code().into(),
             search_limit: 30,
             seek_step: 10,
             volume: 70,
@@ -72,13 +75,16 @@ pub fn load(explicit: Option<&PathBuf>) -> Result<Settings> {
             return Ok(Settings::default());
         }
         Err(error) => {
-            return Err(
-                format!("Не удалось прочитать настройки {}: {error}", file.display()).into(),
-            );
+            return Err(t!(
+                "Не удалось прочитать настройки {}: {}",
+                file.display(),
+                error
+            )
+            .into());
         }
     };
     let mut settings: Settings = serde_json::from_slice(&data)
-        .map_err(|error| format!("Некорректные настройки {}: {error}", file.display()))?;
+        .map_err(|error| t!("Некорректные настройки {}: {}", file.display(), error))?;
     settings.search_limit = settings.search_limit.clamp(1, 50);
     settings.seek_step = settings.seek_step.clamp(1, 600);
     settings.volume = settings.volume.min(100);
@@ -129,7 +135,7 @@ impl Settings {
 }
 
 pub fn validate(value: &str) -> Result<String> {
-    let parsed = Url::parse(value).map_err(|_| "Некорректный URL прокси.")?;
+    let parsed = Url::parse(value).map_err(|_| t!("Некорректный URL прокси."))?;
     if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h")
         || parsed.host_str().is_none()
         || parsed.port_or_known_default().is_none()
@@ -137,7 +143,9 @@ pub fn validate(value: &str) -> Result<String> {
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        return Err("Прокси: используйте http(s)://host:port или socks5(h)://host:port.".into());
+        return Err(
+            t!("Прокси: используйте http(s)://host:port или socks5(h)://host:port.").into(),
+        );
     }
     Ok(value.to_owned())
 }

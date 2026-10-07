@@ -65,14 +65,15 @@ impl Cache {
                 root,
                 limit,
             }),
-            Ok(false) => Err(format!(
+            Ok(false) => Err(t!(
                 "Каталог {} не пуст и не является кешем clicloud. Укажите другой --cache-dir или --no-cache.",
                 root.display()
             )
             .into()),
-            Err(error) => Err(format!(
-                "Не удалось подготовить кеш {}: {error}. Укажите --cache-dir или --no-cache.",
-                root.display()
+            Err(error) => Err(t!(
+                "Не удалось подготовить кеш {}: {}. Укажите --cache-dir или --no-cache.",
+                root.display(),
+                error
             )
             .into()),
         }

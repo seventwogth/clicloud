@@ -116,7 +116,7 @@ impl Playback {
             let mut source = player::downloader(extractor, url, &player.directory, false, false)
                 .stderr(log)
                 .spawn()
-                .map_err(|e| format!("Не удалось запустить yt-dlp: {e}"))?;
+                .map_err(|e| t!("Не удалось запустить yt-dlp: {}", e))?;
             player::from_pipe(&mut command, source.stdout.take().expect("piped stdout"));
             player.source = Some(source);
         } else {
@@ -125,7 +125,7 @@ impl Playback {
         }
         let mut child = command
             .spawn()
-            .map_err(|e| format!("mpv: {e}. Установите mpv и проверьте clicloud doctor."))?;
+            .map_err(|e| t!("mpv: {}. Установите mpv и проверьте clicloud doctor.", e))?;
         if let Some(download) = &mut player.download {
             download.feed(child.stdin.take().expect("piped stdin"));
         }
@@ -142,7 +142,7 @@ impl Playback {
     }
 
     pub fn send(&mut self, command: Value) -> Result<()> {
-        let socket = self.socket.as_mut().ok_or("Плеер ещё подключается")?;
+        let socket = self.socket.as_mut().ok_or(t!("Плеер ещё подключается"))?;
         let mut bytes = serde_json::to_vec(&json!({"command": command}))?;
         bytes.push(b'\n');
         socket.write_all(&bytes)?;
@@ -168,7 +168,7 @@ impl Playback {
                 }
                 self.send(json!(["request_log_messages", "error"]))?;
             } else if self.started.elapsed() > Duration::from_secs(5) {
-                return Err("mpv не открыл IPC-соединение за 5 секунд".into());
+                return Err(t!("mpv не открыл IPC-соединение за 5 секунд").into());
             }
         }
         let mut bytes = [0; 8192];
@@ -197,17 +197,19 @@ impl Playback {
             _ => None,
         };
         if downloaded.is_some_and(|status| !status.success()) {
-            return Err(
+            return Err(t!(
                 "yt-dlp не смог загрузить аудио. Проверьте сеть, прокси и доступность трека."
-                    .into(),
-            );
+            )
+            .into());
         }
         if let Some(status) = exited {
             if !status.success() {
-                return Err("Ошибка mpv: поток недоступен или отсутствует аудиоустройство.".into());
+                return Err(
+                    t!("Ошибка mpv: поток недоступен или отсутствует аудиоустройство.").into(),
+                );
             }
             if !self.eof {
-                return Err("Плеер завершился до окончания трека.".into());
+                return Err(t!("Плеер завершился до окончания трека.").into());
             }
             return Ok(true);
         }
@@ -221,8 +223,10 @@ impl Playback {
                 self.eof = event["reason"] == "eof";
                 if event["reason"] == "error" {
                     self.error = Some(
-                        "Не удалось проиграть трек. Проверьте сеть, прокси или выберите другой."
-                            .into(),
+                        t!(
+                            "Не удалось проиграть трек. Проверьте сеть, прокси или выберите другой."
+                        )
+                        .into(),
                     );
                 }
             }

@@ -101,10 +101,10 @@ impl<'a> SoundCloud<'a> {
     pub fn search(&self, query: &str, limit: u8) -> Result<Vec<Track>> {
         let query = query.trim();
         if query.is_empty() {
-            return Err("Поисковый запрос не должен быть пустым.".into());
+            return Err(t!("Поисковый запрос не должен быть пустым.").into());
         }
         if !self.quiet {
-            eprintln!("Поиск в SoundCloud…");
+            eprintln!("{}", t!("Поиск в SoundCloud…"));
         }
         let mut command = self.extractor.command();
         command
@@ -121,13 +121,14 @@ impl<'a> SoundCloud<'a> {
             .arg(format!("scsearch{limit}:{query}"))
             .stdin(Stdio::null());
         let output = capture(&mut command, self.cancel).map_err(|error| {
-            format!(
-                "Не удалось запустить yt-dlp ({}): {error}. Проверьте clicloud doctor.",
-                self.extractor.program
+            t!(
+                "Не удалось запустить yt-dlp ({}): {}. Проверьте clicloud doctor.",
+                self.extractor.program,
+                error
             )
         })?;
         if !output.status.success() {
-            return Err(format!(
+            return Err(t!(
                 "Поиск yt-dlp завершился с {}:\n{}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -189,7 +190,7 @@ fn capture(
 
 fn parse_tracks(bytes: &[u8]) -> Result<Vec<Track>> {
     let response: SearchResponse = serde_json::from_slice(bytes)
-        .map_err(|error| format!("Некорректный ответ JSON от yt-dlp: {error}"))?;
+        .map_err(|error| t!("Некорректный ответ JSON от yt-dlp: {}", error))?;
     Ok(response
         .entries
         .into_iter()
@@ -200,11 +201,11 @@ fn parse_tracks(bytes: &[u8]) -> Result<Vec<Track>> {
                 .flatten()
                 .find(|url| validate_url(url).is_ok())?;
             Some(Track {
-                title: entry.title.unwrap_or_else(|| "Без названия".into()),
+                title: entry.title.unwrap_or_else(|| t!("Без названия").into()),
                 artist: entry
                     .artist
                     .or(entry.uploader)
-                    .unwrap_or_else(|| "Неизвестный исполнитель".into()),
+                    .unwrap_or_else(|| t!("Неизвестный исполнитель").into()),
                 duration: entry.duration,
                 url,
             })
@@ -220,7 +221,7 @@ pub fn validate_url(value: &str) -> Result<()> {
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        return Err("Ожидается HTTP(S)-ссылка SoundCloud.".into());
+        return Err(t!("Ожидается HTTP(S)-ссылка SoundCloud.").into());
     }
     Ok(())
 }
