@@ -43,10 +43,23 @@ exit "${PLAYER_EXIT:-0}"
         fixture
     }
 
+    // Written by a child process: a descriptor open for writing in this one would be
+    // inherited by whatever another test thread forks, and the script could not be run.
     fn script(&self, name: &str, source: &str) {
-        let path = self.0.join(name);
-        fs::write(&path, source).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        use std::io::Write;
+        let mut writer = Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(self.0.join(name))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
     }
 
     fn command(&self) -> Command {

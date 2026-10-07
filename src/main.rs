@@ -1,9 +1,13 @@
+#[macro_use]
+mod lang;
+
 mod cache;
 mod config;
 #[cfg(unix)]
 mod playback;
 mod player;
 mod soundcloud;
+mod theme;
 #[cfg(unix)]
 mod ui;
 
@@ -94,7 +98,7 @@ fn main() -> ExitCode {
             if let Some(player::Interrupted(signal)) = error.downcast_ref() {
                 return ExitCode::from(128 + *signal as u8);
             }
-            eprintln!("Ошибка: {}", clean_lines(&error.to_string()));
+            eprintln!("{}", t!("Ошибка: {}", clean_lines(&error.to_string())));
             ExitCode::FAILURE
         }
     }
@@ -140,50 +144,63 @@ fn executable(path: &std::path::Path) -> bool {
     }
 }
 
-// The flags outrank the settings file; without a home directory there is no cache.
-fn open_cache(cli: &Cli, settings: &config::Settings) -> Result<Option<Cache>> {
-    if cli.no_cache || (cli.cache_dir.is_none() && !settings.cache_enabled) {
-        return Ok(None);
-    }
-    let Some(root) = cli
+// Where the cache is, used or not. The flag outranks the settings file; without a
+// home directory there is nowhere to put it.
+fn cache_directory(cli: &Cli, settings: &config::Settings) -> Result<Option<std::path::PathBuf>> {
+    let root = cli
         .cache_dir
         .clone()
         .or_else(|| settings.cache_dir.clone())
         .or_else(|| {
             config::directory("XDG_CACHE_HOME", ".cache").map(|path| path.join("clicloud"))
-        })
-    else {
+        });
+    // yt-dlp runs in a directory of its own, so the path must not depend on ours.
+    Ok(root.map(std::path::absolute).transpose()?)
+}
+
+fn open_cache(
+    cli: &Cli,
+    settings: &config::Settings,
+    root: Option<&std::path::PathBuf>,
+) -> Result<Option<Cache>> {
+    let Some(root) = root else {
         return Ok(None);
     };
-    // yt-dlp runs in a directory of its own, so the path must not depend on ours.
+    if cli.no_cache || (cli.cache_dir.is_none() && !settings.cache_enabled) {
+        return Ok(None);
+    }
     let limit = settings.cache_limit_mb.saturating_mul(1024 * 1024);
-    Cache::open(std::path::absolute(root)?, limit).map(Some)
+    Cache::open(root.clone(), limit).map(Some)
 }
 
 fn megabytes(bytes: u64) -> String {
-    format!("{:.1} МБ", bytes as f64 / (1024.0 * 1024.0))
+    t!("{} МБ", format!("{:.1}", bytes as f64 / (1024.0 * 1024.0)))
 }
 
 fn describe(cache: Option<&Cache>) -> String {
     let Some(cache) = cache else {
-        return "Кеш: отключён".into();
+        return t!("Кеш: отключён").into();
     };
     let (tracks, size) = cache.usage();
     let limit = match cache.limit() {
-        0 => "без ограничения".into(),
-        limit => format!("из {}", megabytes(limit)),
+        0 => t!("без ограничения").into(),
+        limit => t!("из {}", megabytes(limit)),
     };
-    format!(
-        "Кеш: {}\nТреков в кеше: {tracks}, {} {limit}",
+    t!(
+        "Кеш: {}\nТреков в кеше: {}, {} {}",
         cache.root().display(),
-        megabytes(size)
+        tracks,
+        megabytes(size),
+        limit
     )
 }
 
 fn run(cli: Cli) -> Result<()> {
     let settings = config::load(cli.config.as_ref())?;
+    lang::set(lang::Lang::parse(&settings.language));
     let proxy = settings.proxy(cli.proxy.as_deref(), cli.tor, cli.no_proxy)?;
-    let cache = open_cache(&cli, &settings)?;
+    let cache_dir = cache_directory(&cli, &settings)?;
+    let cache = open_cache(&cli, &settings, cache_dir.as_ref())?;
     let extractor = Extractor {
         program: &cli.yt_dlp,
         proxy: proxy.as_deref(),
@@ -194,11 +211,23 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command.unwrap_or(Action::Ui { library: None }) {
         Action::Ui { library } => {
             #[cfg(unix)]
-            ui::run(cli.yt_dlp, cli.mpv, proxy, cli.no_proxy, library, cache)?;
+            ui::run(
+                ui::Session {
+                    yt_dlp: cli.yt_dlp,
+                    mpv: cli.mpv,
+                    proxy,
+                    direct: cli.no_proxy,
+                    cache,
+                    cache_dir,
+                    settings,
+                    config: config::path(cli.config.as_ref()),
+                },
+                library,
+            )?;
             #[cfg(not(unix))]
             {
                 let _ = library;
-                return Err("TUI пока поддерживается на Unix.".into());
+                return Err(t!("TUI пока поддерживается на Unix.").into());
             }
         }
         Action::Search { query, limit, json } => {
@@ -218,19 +247,20 @@ fn run(cli: Cli) -> Result<()> {
             version(&cli.mpv)?;
             version(&cli.yt_dlp)?;
             let target = query_or_url.trim();
+            let mut found = None;
             let url = if target.contains("://") {
                 soundcloud::validate_url(target)?;
                 target.to_owned()
             } else {
                 if !first && !io::stdin().is_terminal() {
-                    return Err(
+                    return Err(t!(
                         "Для выбора нужен терминал. Используйте --first или ссылку SoundCloud."
-                            .into(),
-                    );
+                    )
+                    .into());
                 }
                 let tracks = provider.search(target, limit)?;
                 if tracks.is_empty() {
-                    return Err("Треки не найдены. Попробуйте другой запрос.".into());
+                    return Err(t!("Треки не найдены. Попробуйте другой запрос.").into());
                 }
                 let index = if first {
                     0
@@ -241,19 +271,28 @@ fn run(cli: Cli) -> Result<()> {
                         None => return Ok(()),
                     }
                 };
-                let track = &tracks[index];
+                let track = tracks
+                    .into_iter()
+                    .nth(index)
+                    .expect("index within the results");
                 println!(
-                    "Сейчас играет: {} — {}",
-                    clean(&track.artist),
-                    clean(&track.title)
+                    "{}",
+                    t!(
+                        "Сейчас играет: {} — {}",
+                        clean(&track.artist),
+                        clean(&track.title)
+                    )
                 );
-                track.url.clone()
+                let url = track.url.clone();
+                found = Some(track);
+                url
             };
             println!(
-                "{}\nПробел: пауза; ←/→: перемотка; 9/0: громкость; q: выход.",
-                clean(&url)
+                "{}\n{}",
+                clean(&url),
+                t!("Пробел: пауза; ←/→: перемотка; 9/0: громкость; q: выход.")
             );
-            player::play(&cli.mpv, extractor, &url, cache.as_ref())?;
+            player::play(&cli.mpv, extractor, &url, found.as_ref(), cache.as_ref())?;
         }
         Action::Cache { clear } => {
             if let Some(cache) = cache.as_ref().filter(|_| clear) {
@@ -263,14 +302,17 @@ fn run(cli: Cli) -> Result<()> {
         }
         Action::Doctor => {
             println!(
-                "Прокси: {}",
-                if proxy.is_some() {
-                    "включён (аудио через yt-dlp)"
-                } else if cli.no_proxy {
-                    "принудительно отключён"
-                } else {
-                    "не задан в clicloud"
-                }
+                "{}",
+                t!(
+                    "Прокси: {}",
+                    if proxy.is_some() {
+                        t!("включён (аудио через yt-dlp)")
+                    } else if cli.no_proxy {
+                        t!("принудительно отключён")
+                    } else {
+                        t!("не задан в clicloud")
+                    }
+                )
             );
             println!("{}", describe(cache.as_ref()));
             let mut missing = false;
@@ -284,7 +326,9 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             if missing {
-                return Err("Установите отсутствующие программы; инструкции в README.md.".into());
+                return Err(
+                    t!("Установите отсутствующие программы; инструкции в README.md.").into(),
+                );
             }
         }
     }
@@ -295,9 +339,9 @@ fn version(binary: &str) -> Result<String> {
     let output = Command::new(binary)
         .arg("--version")
         .output()
-        .map_err(|error| format!("Не удалось запустить {binary}: {error}"))?;
+        .map_err(|error| t!("Не удалось запустить {}: {}", binary, error))?;
     if !output.status.success() {
-        return Err(format!("{binary} --version завершился с {}", output.status).into());
+        return Err(t!("{} --version завершился с {}", binary, output.status).into());
     }
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -308,7 +352,7 @@ fn version(binary: &str) -> Result<String> {
 
 fn print_tracks(tracks: &[Track]) {
     if tracks.is_empty() {
-        println!("Ничего не найдено.");
+        println!("{}", t!("Ничего не найдено."));
     }
     for (index, track) in tracks.iter().enumerate() {
         let duration = track
@@ -332,7 +376,7 @@ fn print_tracks(tracks: &[Track]) {
 
 fn choose(count: usize) -> Result<Option<usize>> {
     loop {
-        print!("Номер трека (1–{count}, q — выход): ");
+        print!("{}", t!("Номер трека (1–{}, q — выход): ", count));
         io::stdout().flush()?;
         let mut input = String::new();
         if io::stdin().read_line(&mut input)? == 0 || input.trim().eq_ignore_ascii_case("q") {
@@ -343,7 +387,7 @@ fn choose(count: usize) -> Result<Option<usize>> {
         {
             return Ok(Some(number - 1));
         }
-        println!("Введите число от 1 до {count} или q.");
+        println!("{}", t!("Введите число от 1 до {} или q.", count));
     }
 }
 

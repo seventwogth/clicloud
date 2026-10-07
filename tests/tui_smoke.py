@@ -145,6 +145,14 @@ if os.environ.get("MPV_LINGER"):
             os.write(master, b"n")
             read_until(lambda: sum(c[0] == "observe_property" for c in log()) >= 8)
             assert (root / "mpv.args").read_text().split() == ["-", str(stored)]
+            # The stored track is listed in the library and can be removed from the cache there.
+            assert json.loads((cache / "tracks" / "test.night").read_text())["title"] == "Night radio"
+            os.write(master, b"2x")
+            read_until(lambda: not stored.exists())
+            # A setting changed in the settings window lands in the settings file.
+            os.write(master, b"ojjjjjj\x1b[C")
+            settings = root / "config.json"
+            read_until(lambda: json.loads(settings.read_text() or "{}").get("search_limit") == 35)
             os.write(master, b"q")
             process.wait(timeout=5)
             assert process.returncode == 0
@@ -153,8 +161,8 @@ if os.environ.get("MPV_LINGER"):
             assert len(saved["favorites"]) == 1 and len(saved["recent"]) == 1
             assert not list(temporary.iterdir()), "IPC directory was not removed"
             assert not (root / "home-cache").exists(), "The cache directory flag was ignored"
-            print("PASS: TUI search and its cancel, favorites, queue, IPC controls, cache, terminal cleanup;",
-                  "proxy=", proxy)
+            print("PASS: TUI search and its cancel, favorites, queue, IPC controls, cache, settings,",
+                  "terminal cleanup; proxy=", proxy)
         finally:
             if process.poll() is None:
                 process.kill()

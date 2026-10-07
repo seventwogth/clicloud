@@ -1,17 +1,36 @@
 use crate::Result;
-use serde::Deserialize;
-use std::{env, fs, path::PathBuf};
+use serde::{Deserialize, Serialize};
+use std::{
+    env, fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 use url::Url;
 
-#[derive(Deserialize)]
+pub const TOR: &str = "socks5h://127.0.0.1:9050";
+
+/// What the settings file holds. The interface changes it too, so it is written back.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
-    proxy: Option<String>,
-    proxy_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    pub proxy_enabled: bool,
     pub cache_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
     /// 0 lifts the limit.
     pub cache_limit_mb: u64,
+    /// A color scheme of the interface; see `theme`.
+    pub theme: String,
+    /// The language of the interface and the messages: ru, en or ja.
+    pub language: String,
+    /// How many tracks a search in the interface asks for.
+    pub search_limit: u8,
+    /// Seconds that the arrow keys seek by.
+    pub seek_step: u16,
+    /// The volume the interface starts with.
+    pub volume: u8,
 }
 
 impl Default for Settings {
@@ -22,6 +41,11 @@ impl Default for Settings {
             cache_enabled: true,
             cache_dir: None,
             cache_limit_mb: 1024,
+            theme: crate::theme::TERMINAL.into(),
+            language: crate::lang::Lang::Russian.code().into(),
+            search_limit: 30,
+            seek_step: 10,
+            volume: 70,
         }
     }
 }
@@ -34,25 +58,37 @@ pub fn directory(variable: &str, fallback: &str) -> Option<PathBuf> {
         .or_else(|| env::var_os("HOME").map(|v| PathBuf::from(v).join(fallback)))
 }
 
-pub fn load(path: Option<&PathBuf>) -> Result<Settings> {
-    let default = directory("XDG_CONFIG_HOME", ".config").map(|v| v.join("clicloud/config.json"));
-    let Some(file) = path.or(default.as_ref()) else {
+/// The settings file: the given one, or the default one in the user's directory.
+pub fn path(explicit: Option<&PathBuf>) -> Option<PathBuf> {
+    explicit
+        .cloned()
+        .or_else(|| directory("XDG_CONFIG_HOME", ".config").map(|v| v.join("clicloud/config.json")))
+}
+
+pub fn load(explicit: Option<&PathBuf>) -> Result<Settings> {
+    let Some(file) = path(explicit) else {
         return Ok(Settings::default());
     };
-    let data = match fs::read(file) {
+    let data = match fs::read(&file) {
         Ok(data) => data,
-        Err(error) if path.is_none() && error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if explicit.is_none() && error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Settings::default());
         }
         Err(error) => {
-            return Err(
-                format!("Не удалось прочитать настройки {}: {error}", file.display()).into(),
-            );
+            return Err(t!(
+                "Не удалось прочитать настройки {}: {}",
+                file.display(),
+                error
+            )
+            .into());
         }
     };
-    Ok(serde_json::from_slice(&data).map_err(|_| {
-        "Некорректные настройки: ожидается JSON с proxy, proxy_enabled, cache_enabled, cache_dir и cache_limit_mb."
-    })?)
+    let mut settings: Settings = serde_json::from_slice(&data)
+        .map_err(|error| t!("Некорректные настройки {}: {}", file.display(), error))?;
+    settings.search_limit = settings.search_limit.clamp(1, 50);
+    settings.seek_step = settings.seek_step.clamp(1, 600);
+    settings.volume = settings.volume.min(100);
+    Ok(settings)
 }
 
 impl Settings {
@@ -66,7 +102,7 @@ impl Settings {
             return Ok(None);
         }
         if tor {
-            return Ok(Some("socks5h://127.0.0.1:9050".into()));
+            return Ok(Some(TOR.into()));
         }
         if let Some(value) = override_proxy {
             return validate(value).map(Some);
@@ -76,10 +112,30 @@ impl Settings {
         }
         self.proxy.as_deref().map(validate).transpose()
     }
+
+    /// Writes the settings to `file`, replacing it in one step.
+    pub fn save(&self, file: &Path) -> Result<()> {
+        if let Some(parent) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = file.with_extension(format!("{}.tmp", std::process::id()));
+        let written = (|| -> Result<()> {
+            let mut output = fs::File::create(&temporary)?;
+            output.write_all(&serde_json::to_vec_pretty(self)?)?;
+            output.write_all(b"\n")?;
+            output.sync_all()?;
+            fs::rename(&temporary, file)?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        written
+    }
 }
 
-fn validate(value: &str) -> Result<String> {
-    let parsed = Url::parse(value).map_err(|_| "Некорректный URL прокси.")?;
+pub fn validate(value: &str) -> Result<String> {
+    let parsed = Url::parse(value).map_err(|_| t!("Некорректный URL прокси."))?;
     if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h")
         || parsed.host_str().is_none()
         || parsed.port_or_known_default().is_none()
@@ -87,7 +143,9 @@ fn validate(value: &str) -> Result<String> {
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        return Err("Прокси: используйте http(s)://host:port или socks5(h)://host:port.".into());
+        return Err(
+            t!("Прокси: используйте http(s)://host:port или socks5(h)://host:port.").into(),
+        );
     }
     Ok(value.to_owned())
 }

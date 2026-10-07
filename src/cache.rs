@@ -1,6 +1,6 @@
 //! Audio kept on disk: a track that was played starts at once the next time and
 //! needs no network. yt-dlp keeps what it learns about SoundCloud next to it.
-use crate::Result;
+use crate::{Result, soundcloud::Track};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -65,14 +65,15 @@ impl Cache {
                 root,
                 limit,
             }),
-            Ok(false) => Err(format!(
+            Ok(false) => Err(t!(
                 "Каталог {} не пуст и не является кешем clicloud. Укажите другой --cache-dir или --no-cache.",
                 root.display()
             )
             .into()),
-            Err(error) => Err(format!(
-                "Не удалось подготовить кеш {}: {error}. Укажите --cache-dir или --no-cache.",
-                root.display()
+            Err(error) => Err(t!(
+                "Не удалось подготовить кеш {}: {}. Укажите --cache-dir или --no-cache.",
+                root.display(),
+                error
             )
             .into()),
         }
@@ -95,8 +96,17 @@ impl Cache {
         self.root.join("audio")
     }
 
+    // What is known about each track, in a file named like its audio.
+    fn details(&self) -> PathBuf {
+        self.root.join("tracks")
+    }
+
     fn path(&self, url: &str) -> Option<PathBuf> {
         key(url).map(|key| self.audio().join(key))
+    }
+
+    pub fn set_limit(&mut self, limit: u64) {
+        self.limit = limit;
     }
 
     /// Whether `url` names a single track, the only kind of link that is stored.
@@ -137,8 +147,50 @@ impl Cache {
         Ok(Some(Partial {
             directory,
             target,
+            details: self.details(),
+            track: None,
             limit: self.limit,
         }))
+    }
+
+    /// Records the title and artist of a stored track that was known by its link only.
+    pub fn describe(&self, track: &Track) {
+        if let Some(key) = key(&track.url).filter(|_| self.contains(&track.url))
+            && !self.details().join(&key).exists()
+        {
+            let _ = write_details(&self.details(), &key, track);
+        }
+    }
+
+    /// The stored tracks by artist and title. One stored by its link alone is named after it.
+    pub fn tracks(&self) -> Vec<Track> {
+        let mut tracks: Vec<Track> = files(&self.audio())
+            .into_iter()
+            .filter_map(|(_, _, path)| {
+                let name = path.file_name()?.to_str()?;
+                fs::read(self.details().join(name))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Track>(&bytes).ok())
+                    .filter(|track| key(&track.url).as_deref() == Some(name))
+                    .or_else(|| named_after(name))
+            })
+            .collect();
+        tracks
+            .sort_by_cached_key(|track| (track.artist.to_lowercase(), track.title.to_lowercase()));
+        tracks
+    }
+
+    /// Removes the stored audio of `url`; false if there was none.
+    pub fn remove(&self, url: &str) -> io::Result<bool> {
+        let Some(key) = key(url) else {
+            return Ok(false);
+        };
+        let _ = fs::remove_file(self.details().join(&key));
+        match fs::remove_file(self.audio().join(key)) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// The number of stored tracks and their size in bytes.
@@ -149,7 +201,7 @@ impl Cache {
 
     /// Removes the audio, unfinished downloads and what yt-dlp has stored.
     pub fn clear(&self) -> io::Result<()> {
-        for name in ["audio", "partial", "yt-dlp"] {
+        for name in ["audio", "tracks", "partial", "yt-dlp"] {
             match fs::remove_dir_all(self.root.join(name)) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
                 _ => (),
@@ -163,12 +215,19 @@ impl Cache {
 pub struct Partial {
     directory: PathBuf,
     target: PathBuf,
+    details: PathBuf,
+    track: Option<Track>,
     limit: u64,
 }
 
 impl Partial {
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    /// The title and artist to keep with the audio, for the list of stored tracks.
+    pub fn describe(&mut self, track: &Track) {
+        self.track = Some(track.clone());
     }
 
     /// The file that receives the audio.
@@ -185,6 +244,11 @@ impl Partial {
         let audio = self.target.parent().expect("file in the audio directory");
         private_directory(audio)?;
         fs::rename(path, &self.target)?;
+        if let Some(track) = &self.track
+            && let Some(key) = self.target.file_name().and_then(|name| name.to_str())
+        {
+            let _ = write_details(&self.details, key, track);
+        }
         if self.limit > 0 {
             let mut files = files(audio);
             let mut total: u64 = files.iter().map(|file| file.1).sum();
@@ -193,8 +257,11 @@ impl Partial {
                 if total <= self.limit {
                     break;
                 }
-                if path != self.target && fs::remove_file(path).is_ok() {
+                if path != self.target && fs::remove_file(&path).is_ok() {
                     total -= size;
+                    if let Some(name) = path.file_name() {
+                        let _ = fs::remove_file(self.details.join(name));
+                    }
                 }
             }
         }
@@ -234,6 +301,36 @@ fn files(directory: &Path) -> Vec<(SystemTime, u64, PathBuf)> {
         .collect()
 }
 
+fn write_details(directory: &Path, key: &str, track: &Track) -> io::Result<()> {
+    private_directory(directory)?;
+    fs::write(directory.join(key), serde_json::to_vec(track)?)
+}
+
+// The track behind a file name made by `key`, as far as the link tells.
+fn named_after(key: &str) -> Option<Track> {
+    let mut parts = Vec::new();
+    for part in key.split('.') {
+        let mut bytes = Vec::new();
+        let mut rest = part.bytes();
+        while let Some(byte) = rest.next() {
+            if byte == b'~' {
+                let code = [rest.next()?, rest.next()?];
+                bytes.push(u8::from_str_radix(std::str::from_utf8(&code).ok()?, 16).ok()?);
+            } else {
+                bytes.push(byte);
+            }
+        }
+        parts.push(String::from_utf8(bytes).ok()?);
+    }
+    let words = |part: &String| part.replace(['-', '_'], " ");
+    Some(Track {
+        title: words(parts.get(1)?),
+        artist: words(&parts[0]),
+        duration: None,
+        url: format!("https://soundcloud.com/{}", parts.join("/")),
+    })
+}
+
 fn sweep(partial: &Path) {
     let Ok(entries) = fs::read_dir(partial) else {
         return;
@@ -250,9 +347,10 @@ fn sweep(partial: &Path) {
     }
 }
 
-// A file name for the track at `url`; None unless the link names exactly one track.
-// Distinct tracks get distinct names: the parts are escaped and joined by a dot.
-fn key(url: &str) -> Option<String> {
+/// A file name for the track at `url`; None unless the link names exactly one track.
+/// Distinct tracks get distinct names: the parts are escaped and joined by a dot.
+/// Two spellings of a link to the same track give the same name.
+pub fn key(url: &str) -> Option<String> {
     let url = Url::parse(url).ok()?;
     let host = url.host_str()?;
     let host = ["www.", "m."]
@@ -307,6 +405,74 @@ mod tests {
         let partial = cache.store(url).unwrap().unwrap();
         fs::write(partial.path(), bytes).unwrap();
         partial.commit().unwrap();
+    }
+
+    #[test]
+    fn stored_tracks_are_listed_with_what_is_known_about_them() {
+        let root = directory("list");
+        let cache = Cache::open(root.clone(), 15).unwrap();
+        let known = Track {
+            title: "Zebra".into(),
+            artist: "beta".into(),
+            duration: Some(61.5),
+            url: "https://soundcloud.com/b/zebra?si=1".into(),
+        };
+        let mut partial = cache.store(&known.url).unwrap().unwrap();
+        partial.describe(&known);
+        fs::write(partial.path(), [0; 5]).unwrap();
+        partial.commit().unwrap();
+        // Stored by its link alone, as `play` with a link does.
+        download(
+            &cache,
+            "https://soundcloud.com/Alpha_x/night-drive%20a",
+            &[0; 5],
+        );
+
+        let tracks = cache.tracks();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(
+            (
+                tracks[0].artist.as_str(),
+                tracks[0].title.as_str(),
+                tracks[0].duration
+            ),
+            ("Alpha x", "night drive%20a", None)
+        );
+        assert_eq!(
+            tracks[0].url,
+            "https://soundcloud.com/Alpha_x/night-drive%20a"
+        );
+        assert!(cache.contains(&tracks[0].url));
+        assert_eq!(
+            (tracks[1].title.as_str(), tracks[1].duration),
+            ("Zebra", Some(61.5))
+        );
+
+        // What becomes known later is kept, but never overwrites.
+        let learned = Track {
+            title: "Night Drive".into(),
+            ..tracks[0].clone()
+        };
+        cache.describe(&learned);
+        cache.describe(&tracks[0]);
+        assert_eq!(cache.tracks()[0].title, "Night Drive");
+        // Details of some other track do not pass for this one.
+        fs::write(
+            root.join("tracks/b.zebra"),
+            serde_json::to_vec(&learned).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache.tracks()[1].title, "zebra");
+
+        assert!(cache.remove(&learned.url).unwrap() && !cache.remove(&learned.url).unwrap());
+        assert!(!cache.remove("https://soundcloud.com/a/sets/b").unwrap());
+        assert!(!root.join("tracks/Alpha_x.night-drive~2520a").exists());
+        assert_eq!(cache.tracks().len(), 1);
+        // Eviction takes the details along.
+        download(&cache, "https://soundcloud.com/c/big", &[0; 12]);
+        assert_eq!(cache.tracks().len(), 1);
+        assert!(!root.join("tracks/b.zebra").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
