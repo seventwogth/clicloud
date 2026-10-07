@@ -17,7 +17,8 @@ import time
 
 
 def run(proxy=False, terminate=False):
-    with tempfile.TemporaryDirectory(prefix="clicloud-tui-") as directory:
+    # Short path: the IPC socket below it must fit the Unix socket path limit on macOS.
+    with tempfile.TemporaryDirectory(prefix="cc-", dir="/tmp") as directory:
         root = Path(directory)
         extractor = root / "yt-dlp"
         extractor.write_text('''#!/usr/bin/env python3
@@ -60,7 +61,7 @@ if os.environ.get("MPV_LINGER"):
         extractor.chmod(0o755)
         player.chmod(0o755)
         (root / "config.json").write_text("{}")
-        temporary = root / "tmp"
+        temporary = root / "t"
         temporary.mkdir()
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
