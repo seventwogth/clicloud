@@ -47,6 +47,8 @@ const TAGLINES: [&str; 4] = [
 
 // The mark that turns while something runs, ASCII like every other mark here.
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+// The drawing behind the list of tracks.
+const BACKDROP: &str = include_str!("backdrop.txt");
 
 // Frames, buttons and marks are ASCII in every color scheme.
 const BORDER: symbols::border::Set = symbols::border::Set {
@@ -1781,7 +1783,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let selected = tracks.get(app.table.selected().unwrap_or(0)).copied();
     let evict =
         selected.is_some_and(|track| app.cache.as_ref().is_some_and(|c| c.contains(&track.url)));
-    if tracks.is_empty() {
+    let taken = if tracks.is_empty() {
         let message = match app.view {
             View::Search => {
                 t!(
@@ -1812,7 +1814,9 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 .block(block(title, theme)),
             center[0],
         );
+        0
     } else {
+        let count = tracks.len();
         let rows: Vec<Row> = tracks
             .iter()
             .enumerate()
@@ -1874,7 +1878,14 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             center[0].width.saturating_sub(2),
             center[0].height.saturating_sub(4),
         );
-    }
+        2 + (count.saturating_sub(app.table.offset()) as u16).min(app.rows.height)
+    };
+    draw_backdrop(
+        frame.buffer_mut(),
+        center[0].inner(Margin::new(1, 1)),
+        taken,
+        theme.border,
+    );
     let buttons = buttons(center[1]);
     button(frame, app, buttons[0], t!("|> Играть"), Action::Play, false);
     button(
@@ -1911,6 +1922,36 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             Action::Download,
             false,
         );
+    }
+}
+
+// The drawing in the middle of the panel, in the cells nothing else has taken: the first
+// `taken` lines are the list's own, and a text below them keeps a margin on both sides.
+fn draw_backdrop(buffer: &mut Buffer, area: Rect, taken: u16, style: Style) {
+    let lines: Vec<&str> = BACKDROP.lines().collect();
+    let width = lines.iter().map(|line| line.len()).max().unwrap_or(0);
+    let left = i32::from(area.x) + (i32::from(area.width) - width as i32) / 2;
+    let top = i32::from(area.y) + (i32::from(area.height) - lines.len() as i32) / 2;
+    for y in area.y.saturating_add(taken)..area.bottom() {
+        let line = usize::try_from(i32::from(y) - top)
+            .ok()
+            .and_then(|line| lines.get(line));
+        let Some(line) = line else { continue };
+        let mut written = (area.x..area.right()).filter(|&x| buffer[(x, y)].symbol() != " ");
+        let first = written.next();
+        let text = first.map(|first| {
+            let last = written.next_back().unwrap_or(first);
+            i32::from(first) - 2..=i32::from(last) + 2
+        });
+        for (cell, symbol) in line.bytes().enumerate() {
+            let x = left + cell as i32;
+            let free = text.as_ref().is_none_or(|text| !text.contains(&x));
+            if symbol != b' ' && free && x >= i32::from(area.x) && x < i32::from(area.right()) {
+                buffer[(x as u16, y)]
+                    .set_char(char::from(symbol))
+                    .set_style(style);
+            }
+        }
     }
 }
 
