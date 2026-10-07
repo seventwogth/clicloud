@@ -56,6 +56,12 @@ const BORDER: symbols::border::Set = symbols::border::Set {
     horizontal_bottom: "-",
 };
 
+// What a search sends back: the tracks as they are found, and how it ended.
+enum Found {
+    Track(Track),
+    Over(std::result::Result<(), String>),
+}
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Library {
@@ -271,7 +277,9 @@ struct App {
     query: String,
     editing: bool,
     searching: bool,
-    receiver: Option<mpsc::Receiver<std::result::Result<Vec<Track>, String>>>,
+    // Whether the list is already being filled by the search that runs.
+    filling: bool,
+    receiver: Option<mpsc::Receiver<Found>>,
     table: TableState,
     message: String,
     help: bool,
@@ -326,6 +334,7 @@ impl App {
             query: String::new(),
             editing: false,
             searching: false,
+            filling: false,
             receiver: None,
             table: TableState::default().with_selected(0),
             message: t!("Нажмите /, чтобы найти музыку. ? - все клавиши").into(),
@@ -688,12 +697,15 @@ impl App {
             })
             .quiet()
             .cancellable(&cancel)
-            .search(&query, limit)
+            .stream(&query, limit, |track| {
+                let _ = sender.send(Found::Track(track));
+            })
             .map_err(|e| e.to_string());
-            let _ = sender.send(result);
+            let _ = sender.send(Found::Over(result));
         }));
         self.receiver = Some(receiver);
         self.searching = true;
+        self.filling = false;
         self.editing = false;
         self.select_view(View::Search);
         self.message = t!("Ищем треки... Esc - отмена").into();
@@ -959,40 +971,63 @@ impl App {
         }
     }
     fn tick(&mut self) {
-        if let Some(receiver) = &self.receiver {
-            match receiver.try_recv() {
-                Ok(result) => {
-                    self.searching = false;
-                    self.receiver = None;
-                    match result {
-                        Ok(tracks) => {
-                            self.message = t!("Найдено треков: {}", tracks.len());
-                            if let Some(asked) = self.shown.clone() {
-                                // A run asks few questions; a list that somehow grows
-                                // long is dropped whole rather than kept in order.
-                                if self.searched.len() >= 64 {
-                                    self.searched.clear();
-                                }
-                                self.searched.insert(asked, tracks.clone());
-                            }
-                            self.results = tracks;
+        if let Some(receiver) = self.receiver.take() {
+            let (mut over, mut keep) = (None, true);
+            loop {
+                match receiver.try_recv() {
+                    Ok(Found::Track(track)) => {
+                        // The tracks of the search before are shown until this one has any.
+                        if !self.filling {
+                            self.filling = true;
+                            self.results.clear();
                             self.table.select(Some(0));
                         }
-                        Err(error) => {
-                            self.last_error = Some(error);
-                            self.message =
-                                t!("Ошибка поиска. e - подробности, Esc - закрыть окно").into();
-                            self.details = true;
-                            self.detail_scroll = 0;
+                        self.results.push(track);
+                    }
+                    Ok(Found::Over(result)) => {
+                        over = Some(result);
+                        keep = false;
+                        break;
+                    }
+                    // The worker is gone without a word; nothing more will come.
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.searching = false;
+                        self.message = t!("Поиск прерван").into();
+                        keep = false;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                }
+            }
+            if keep {
+                self.receiver = Some(receiver);
+            }
+            match over {
+                None => (),
+                Some(Ok(())) => {
+                    self.searching = false;
+                    // A search that found nothing leaves no list of the one before.
+                    if !self.filling {
+                        self.results.clear();
+                        self.table.select(Some(0));
+                    }
+                    self.message = t!("Найдено треков: {}", self.results.len());
+                    if let Some(asked) = self.shown.clone() {
+                        // A run asks few questions; a list that somehow grows long is
+                        // dropped whole rather than kept in order.
+                        if self.searched.len() >= 64 {
+                            self.searched.clear();
                         }
+                        self.searched.insert(asked, self.results.clone());
                     }
                 }
-                Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err(error)) => {
                     self.searching = false;
-                    self.receiver = None;
-                    self.message = t!("Поиск прерван").into();
+                    self.last_error = Some(error);
+                    self.message = t!("Ошибка поиска. e - подробности, Esc - закрыть окно").into();
+                    self.details = true;
+                    self.detail_scroll = 0;
                 }
-                Err(mpsc::TryRecvError::Empty) => (),
             }
         }
         if let Some(fetch) = &mut self.fetch
@@ -2511,6 +2546,53 @@ mod tests {
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn the_list_fills_while_the_search_is_still_running() {
+        let mut app = app(PathBuf::new());
+        let limit = app.settings.search_limit;
+        let found = |title: &str| {
+            Found::Track(Track {
+                title: title.into(),
+                ..track()
+            })
+        };
+        let (sender, receiver) = mpsc::channel();
+        app.receiver = Some(receiver);
+        app.searching = true;
+        app.filling = false;
+        app.shown = Some(("ambient".into(), limit));
+
+        // The list of the search before stays until this one has a track of its own.
+        app.tick();
+        let titles: Vec<&str> = app.results.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["Ночной эфир"]);
+        assert!(app.searching);
+
+        sender.send(found("One")).unwrap();
+        app.tick();
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.results[0].title, "One");
+        // Still running: the rest is on its way.
+        assert!(app.searching && app.receiver.is_some());
+
+        sender.send(found("Two")).unwrap();
+        sender.send(Found::Over(Ok(()))).unwrap();
+        app.tick();
+        assert!(!app.searching && app.receiver.is_none());
+        assert_eq!(app.message, "Найдено треков: 2");
+        assert_eq!(app.searched[&("ambient".to_owned(), limit)].len(), 2);
+
+        // A search that finds nothing leaves no list of the one before.
+        let (sender, receiver) = mpsc::channel();
+        app.receiver = Some(receiver);
+        app.searching = true;
+        app.filling = false;
+        app.shown = Some(("nothing".into(), limit));
+        sender.send(Found::Over(Ok(()))).unwrap();
+        app.tick();
+        assert!(app.results.is_empty() && app.message == "Найдено треков: 0");
     }
 
     #[test]
