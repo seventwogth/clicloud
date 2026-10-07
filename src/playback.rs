@@ -4,10 +4,10 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::{fs::DirBuilderExt, net::UnixStream},
+    os::unix::net::UnixStream,
     path::PathBuf,
     process::{Child, Stdio},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 const LOG_LINES: usize = 20;
@@ -58,13 +58,7 @@ impl Playback {
         volume: f64,
     ) -> Result<Self> {
         soundcloud::validate_url(url)?;
-        let directory = std::env::temp_dir().join(format!(
-            "clicloud-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        fs::DirBuilder::new().mode(0o700).create(&directory)?;
-        let mut player = Self::idle(directory, volume);
+        let mut player = Self::idle(player::scratch_directory()?, volume);
         let log = fs::File::create(player.directory.join("error.log"))?;
         let mut command = player::mpv(mpv);
         command
@@ -82,7 +76,7 @@ impl Playback {
             .stdout(Stdio::null())
             .stderr(log.try_clone()?);
         if let Some(proxy) = proxy {
-            let mut source = player::downloader(yt_dlp, url, proxy, false)
+            let mut source = player::downloader(yt_dlp, url, proxy, &player.directory, false)
                 .stderr(log)
                 .spawn()
                 .map_err(|e| format!("yt-dlp: {e}"))?;
