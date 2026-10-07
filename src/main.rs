@@ -4,6 +4,7 @@ mod config;
 mod playback;
 mod player;
 mod soundcloud;
+mod theme;
 #[cfg(unix)]
 mod ui;
 
@@ -140,24 +141,33 @@ fn executable(path: &std::path::Path) -> bool {
     }
 }
 
-// The flags outrank the settings file; without a home directory there is no cache.
-fn open_cache(cli: &Cli, settings: &config::Settings) -> Result<Option<Cache>> {
-    if cli.no_cache || (cli.cache_dir.is_none() && !settings.cache_enabled) {
-        return Ok(None);
-    }
-    let Some(root) = cli
+// Where the cache is, used or not. The flag outranks the settings file; without a
+// home directory there is nowhere to put it.
+fn cache_directory(cli: &Cli, settings: &config::Settings) -> Result<Option<std::path::PathBuf>> {
+    let root = cli
         .cache_dir
         .clone()
         .or_else(|| settings.cache_dir.clone())
         .or_else(|| {
             config::directory("XDG_CACHE_HOME", ".cache").map(|path| path.join("clicloud"))
-        })
-    else {
+        });
+    // yt-dlp runs in a directory of its own, so the path must not depend on ours.
+    Ok(root.map(std::path::absolute).transpose()?)
+}
+
+fn open_cache(
+    cli: &Cli,
+    settings: &config::Settings,
+    root: Option<&std::path::PathBuf>,
+) -> Result<Option<Cache>> {
+    let Some(root) = root else {
         return Ok(None);
     };
-    // yt-dlp runs in a directory of its own, so the path must not depend on ours.
+    if cli.no_cache || (cli.cache_dir.is_none() && !settings.cache_enabled) {
+        return Ok(None);
+    }
     let limit = settings.cache_limit_mb.saturating_mul(1024 * 1024);
-    Cache::open(std::path::absolute(root)?, limit).map(Some)
+    Cache::open(root.clone(), limit).map(Some)
 }
 
 fn megabytes(bytes: u64) -> String {
@@ -183,7 +193,8 @@ fn describe(cache: Option<&Cache>) -> String {
 fn run(cli: Cli) -> Result<()> {
     let settings = config::load(cli.config.as_ref())?;
     let proxy = settings.proxy(cli.proxy.as_deref(), cli.tor, cli.no_proxy)?;
-    let cache = open_cache(&cli, &settings)?;
+    let cache_dir = cache_directory(&cli, &settings)?;
+    let cache = open_cache(&cli, &settings, cache_dir.as_ref())?;
     let extractor = Extractor {
         program: &cli.yt_dlp,
         proxy: proxy.as_deref(),
@@ -194,7 +205,19 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command.unwrap_or(Action::Ui { library: None }) {
         Action::Ui { library } => {
             #[cfg(unix)]
-            ui::run(cli.yt_dlp, cli.mpv, proxy, cli.no_proxy, library, cache)?;
+            ui::run(
+                ui::Session {
+                    yt_dlp: cli.yt_dlp,
+                    mpv: cli.mpv,
+                    proxy,
+                    direct: cli.no_proxy,
+                    cache,
+                    cache_dir,
+                    settings,
+                    config: config::path(cli.config.as_ref()),
+                },
+                library,
+            )?;
             #[cfg(not(unix))]
             {
                 let _ = library;
@@ -218,6 +241,7 @@ fn run(cli: Cli) -> Result<()> {
             version(&cli.mpv)?;
             version(&cli.yt_dlp)?;
             let target = query_or_url.trim();
+            let mut found = None;
             let url = if target.contains("://") {
                 soundcloud::validate_url(target)?;
                 target.to_owned()
@@ -241,19 +265,24 @@ fn run(cli: Cli) -> Result<()> {
                         None => return Ok(()),
                     }
                 };
-                let track = &tracks[index];
+                let track = tracks
+                    .into_iter()
+                    .nth(index)
+                    .expect("index within the results");
                 println!(
                     "Сейчас играет: {} — {}",
                     clean(&track.artist),
                     clean(&track.title)
                 );
-                track.url.clone()
+                let url = track.url.clone();
+                found = Some(track);
+                url
             };
             println!(
                 "{}\nПробел: пауза; ←/→: перемотка; 9/0: громкость; q: выход.",
                 clean(&url)
             );
-            player::play(&cli.mpv, extractor, &url, cache.as_ref())?;
+            player::play(&cli.mpv, extractor, &url, found.as_ref(), cache.as_ref())?;
         }
         Action::Cache { clear } => {
             if let Some(cache) = cache.as_ref().filter(|_| clear) {

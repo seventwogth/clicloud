@@ -1,10 +1,13 @@
 use crate::{
     Result,
-    cache::Cache,
-    clean, clean_lines, config,
+    cache::{self, Cache},
+    clean, clean_lines,
+    config::{self, Settings},
+    megabytes,
     playback::{self, Origin, Playback},
     player::{self, Download},
     soundcloud::{Extractor, SoundCloud, Track},
+    theme::{self, Theme},
 };
 use crossterm::{
     event::{
@@ -29,18 +32,10 @@ use std::{
     io::{self, IsTerminal, Write},
     path::PathBuf,
     sync::mpsc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-// Monochrome: the terminal's own colors, told apart by bold, dim and reverse video.
-const TEXT: Style = Style::new();
-const MUTED: Style = Style::new().add_modifier(Modifier::DIM);
-const ACCENT: Style = Style::new()
-    .add_modifier(Modifier::BOLD)
-    .remove_modifier(Modifier::DIM);
-const INVERSE: Style = Style::new()
-    .add_modifier(Modifier::REVERSED)
-    .remove_modifier(Modifier::DIM);
+// Frames, buttons and marks are ASCII in every color scheme.
 const BORDER: symbols::border::Set = symbols::border::Set {
     top_left: "+",
     top_right: "+",
@@ -94,6 +89,87 @@ enum View {
     Recent,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Setting {
+    Theme,
+    Proxy,
+    ProxyAddress,
+    Cache,
+    CacheLimit,
+    SearchLimit,
+    SeekStep,
+    Volume,
+}
+
+const SETTINGS: [Setting; 8] = [
+    Setting::Theme,
+    Setting::Proxy,
+    Setting::ProxyAddress,
+    Setting::Cache,
+    Setting::CacheLimit,
+    Setting::SearchLimit,
+    Setting::SeekStep,
+    Setting::Volume,
+];
+const SEEK_STEPS: [u16; 5] = [5, 10, 15, 30, 60];
+
+impl Setting {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Theme => "Цветовая схема",
+            Self::Proxy => "Прокси",
+            Self::ProxyAddress => "Адрес прокси",
+            Self::Cache => "Кеш треков",
+            Self::CacheLimit => "Размер кеша",
+            Self::SearchLimit => "Результатов поиска",
+            Self::SeekStep => "Шаг перемотки",
+            Self::Volume => "Громкость при запуске",
+        }
+    }
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Theme => {
+                "Enter - список схем с предпросмотром, Left/Right - соседняя.\nterminal повторяет цвета терминала, mono обходится без цвета,\nостальные - темы Ghostty."
+            }
+            Self::Proxy => {
+                "Enter - включить или выключить.\nДействует со следующего поиска и трека."
+            }
+            Self::ProxyAddress => {
+                "Enter - изменить: http, https, socks5 или socks5h с портом.\nTor: socks5h://127.0.0.1:9050. Пустая строка убирает адрес."
+            }
+            Self::Cache => {
+                "Enter - включить или выключить сохранение треков на диск.\nУже сохранённое остаётся на месте."
+            }
+            Self::CacheLimit => {
+                "Left/Right - по 256 МБ, ноль снимает ограничение.\nЛишнее удаляется, начиная с давно не игравших треков."
+            }
+            Self::SearchLimit => "Left/Right - по 5, от 5 до 50 треков на один поиск.",
+            Self::SeekStep => "Left/Right - 5, 10, 15, 30 или 60 секунд на одно нажатие.",
+            Self::Volume => "Left/Right - по 5. Применяется при следующем запуске.",
+        }
+    }
+}
+
+/// What the interface starts with: the outcome of the flags and the settings file.
+pub struct Session {
+    pub yt_dlp: String,
+    pub mpv: String,
+    pub proxy: Option<String>,
+    pub direct: bool,
+    pub cache: Option<Cache>,
+    /// Where the cache is, also while it is switched off.
+    pub cache_dir: Option<PathBuf>,
+    pub settings: Settings,
+    /// The file that changes to the settings are written to.
+    pub config: Option<PathBuf>,
+}
+
+// The list of color schemes; the one under the cursor is shown at once.
+struct Picker {
+    state: ListState,
+    original: Theme,
+}
+
 // A failed track must not stop the queue, but a dead network must not drain it either.
 const SKIP_LIMIT: u8 = 3;
 #[derive(Clone, Copy)]
@@ -105,6 +181,7 @@ enum Action {
     Favorite,
     Enqueue,
     Download,
+    Evict,
     Previous,
     Pause,
     Next,
@@ -128,6 +205,26 @@ struct App {
     proxy: Option<String>,
     direct: bool,
     cache: Option<Cache>,
+    cache_dir: Option<PathBuf>,
+    settings: Settings,
+    config: Option<PathBuf>,
+    // The proxy that switching it on brings back, even if only a flag named it.
+    address: Option<String>,
+    theme: Theme,
+    themes: Vec<String>,
+    picker: Option<Picker>,
+    // The settings window: whether it is open, its current line and where its lines are.
+    options: bool,
+    setting: usize,
+    setting_rows: Rect,
+    // The proxy address being typed.
+    input: Option<String>,
+    // As of `listed`: the tracks in the cache that are not among the favorites, which
+    // the library shows after them, and the number and size of all that is in the cache.
+    stored: Vec<Track>,
+    stored_count: usize,
+    stored_size: u64,
+    listed: Instant,
     // One download at a time: the connection is better spent on the track that plays.
     fetch: Option<Fetch>,
     pending: VecDeque<Track>,
@@ -157,23 +254,31 @@ struct App {
 }
 
 impl App {
-    fn new(
-        yt_dlp: String,
-        mpv: String,
-        proxy: Option<String>,
-        direct: bool,
-        cache: Option<Cache>,
-        library_path: PathBuf,
-        library: Library,
-    ) -> Self {
+    fn new(session: Session, library_path: PathBuf, library: Library) -> Self {
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
             worker: None,
-            yt_dlp,
-            mpv,
-            proxy,
-            direct,
-            cache,
+            yt_dlp: session.yt_dlp,
+            mpv: session.mpv,
+            address: session.settings.proxy.clone().or(session.proxy.clone()),
+            proxy: session.proxy,
+            direct: session.direct,
+            cache: session.cache,
+            cache_dir: session.cache_dir,
+            theme: Theme::load(&session.settings.theme),
+            themes: vec![],
+            picker: None,
+            options: false,
+            setting: 0,
+            setting_rows: Rect::default(),
+            input: None,
+            stored: vec![],
+            stored_count: 0,
+            stored_size: 0,
+            listed: Instant::now(),
+            volume: f64::from(session.settings.volume),
+            settings: session.settings,
+            config: session.config,
             fetch: None,
             pending: VecDeque::new(),
             library_path,
@@ -185,7 +290,6 @@ impl App {
             current: None,
             player: None,
             failures: 0,
-            volume: 70.0,
             query: String::new(),
             editing: false,
             searching: false,
@@ -212,7 +316,10 @@ impl App {
     fn tracks(&self) -> Vec<&Track> {
         match self.view {
             View::Search => self.results.iter().collect(),
-            View::Library => self.library.favorites.iter().collect(),
+            // What the user keeps: the favorites, then the rest of what is stored.
+            View::Library => (self.library.favorites.iter())
+                .chain(&self.stored)
+                .collect(),
             View::Queue => self.queue.iter().collect(),
             View::Recent => self.library.recent.iter().collect(),
         }
@@ -226,6 +333,43 @@ impl App {
         self.view = view;
         self.table = TableState::default().with_selected(0);
         self.editing = false;
+        if view == View::Library {
+            self.list_stored();
+        }
+    }
+    fn list_stored(&mut self) {
+        let (tracks, size) = match &self.cache {
+            Some(cache) => (cache.tracks(), cache.usage().1),
+            None => (vec![], 0),
+        };
+        // A favorite may spell the link to a stored track differently.
+        let favorites: std::collections::HashSet<String> = (self.library.favorites.iter())
+            .filter_map(|track| cache::key(&track.url))
+            .collect();
+        (self.stored_count, self.stored_size) = (tracks.len(), size);
+        self.stored = tracks
+            .into_iter()
+            .filter(|track| cache::key(&track.url).is_none_or(|key| !favorites.contains(&key)))
+            .collect();
+        self.listed = Instant::now();
+        if self.view == View::Library {
+            self.navigate(0);
+        }
+    }
+    fn evict(&mut self) {
+        let Some(track) = self.selected() else {
+            return;
+        };
+        let Some(cache) = &self.cache else {
+            self.message = "Кеш отключён".into();
+            return;
+        };
+        self.message = match cache.remove(&track.url) {
+            Ok(true) => format!("Удалено из кеша: {} - {}", track.artist, track.title),
+            Ok(false) => "Этого трека нет в кеше".into(),
+            Err(error) => format!("Не удалось удалить из кеша: {error}"),
+        };
+        self.list_stored();
     }
     fn navigate(&mut self, delta: isize) {
         let len = self.tracks().len();
@@ -246,6 +390,208 @@ impl App {
             self.message = format!("Не удалось сохранить библиотеку: {error}");
         }
     }
+    fn persist(&mut self) {
+        let Some(file) = &self.config else {
+            self.message = "Файл настроек не определён: изменение действует до выхода".into();
+            return;
+        };
+        if let Err(error) = self.settings.save(file) {
+            self.message = format!("Не удалось сохранить настройки: {error}");
+        }
+    }
+    fn value(&self, setting: Setting) -> String {
+        let switch = |on: bool| if on { "вкл" } else { "выкл" }.to_owned();
+        match setting {
+            Setting::Theme => self.theme.name.clone(),
+            Setting::Proxy if self.proxy.is_none() && self.extractor().proxied() => {
+                "выкл, действует прокси из окружения".into()
+            }
+            Setting::Proxy => switch(self.proxy.is_some()),
+            Setting::ProxyAddress => match (&self.input, &self.address) {
+                (Some(input), _) => format!("{input}_"),
+                (None, Some(address)) => address.clone(),
+                (None, None) => "не задан".into(),
+            },
+            Setting::Cache => switch(self.cache.is_some()),
+            Setting::CacheLimit => match self.settings.cache_limit_mb {
+                0 => "без ограничения".into(),
+                limit => format!("{limit} МБ"),
+            },
+            Setting::SearchLimit => self.settings.search_limit.to_string(),
+            Setting::SeekStep => format!("{} с", self.settings.seek_step),
+            Setting::Volume => self.settings.volume.to_string(),
+        }
+    }
+    fn set_theme(&mut self, name: &str) {
+        self.theme = Theme::load(name);
+        self.settings.theme = name.into();
+        self.persist();
+    }
+    fn themes(&mut self) -> usize {
+        if self.themes.is_empty() {
+            self.themes = theme::names();
+        }
+        self.themes
+            .iter()
+            .position(|name| *name == self.settings.theme)
+            .unwrap_or(0)
+    }
+    fn move_setting(&mut self, delta: isize) {
+        self.setting = self
+            .setting
+            .saturating_add_signed(delta)
+            .min(SETTINGS.len() - 1);
+    }
+    // Enter on a setting.
+    fn activate(&mut self) {
+        match SETTINGS[self.setting] {
+            Setting::Theme => {
+                let current = self.themes();
+                self.picker = Some(Picker {
+                    state: ListState::default().with_selected(Some(current)),
+                    original: self.theme.clone(),
+                });
+            }
+            Setting::Proxy => {
+                if self.proxy.is_some() {
+                    self.proxy = None;
+                } else if let Some(address) = &self.address {
+                    self.proxy = Some(address.clone());
+                } else {
+                    self.message = "Сначала задайте адрес прокси строкой ниже".into();
+                    return;
+                }
+                self.settings.proxy_enabled = self.proxy.is_some();
+                self.persist();
+            }
+            Setting::ProxyAddress => {
+                self.input = Some(self.address.clone().unwrap_or_else(|| config::TOR.into()));
+            }
+            Setting::Cache => {
+                if self.cache.take().is_some() {
+                    self.fetch = None;
+                    self.pending.clear();
+                } else {
+                    let limit = self.settings.cache_limit_mb.saturating_mul(1024 * 1024);
+                    let opened = self
+                        .cache_dir
+                        .clone()
+                        .ok_or_else(|| "Каталог кеша не определён; задайте --cache-dir.".into())
+                        .and_then(|root| Cache::open(root, limit));
+                    match opened {
+                        Ok(cache) => self.cache = Some(cache),
+                        Err(error) => {
+                            self.message = error.to_string();
+                            return;
+                        }
+                    }
+                }
+                self.settings.cache_enabled = self.cache.is_some();
+                self.list_stored();
+                self.persist();
+            }
+            _ => self.adjust(1),
+        }
+    }
+    // Left and right on a setting.
+    fn adjust(&mut self, delta: i8) {
+        let step = |value: u64, by: u64, most: u64| {
+            if delta < 0 {
+                value.saturating_sub(by)
+            } else {
+                (value + by).min(most)
+            }
+        };
+        match SETTINGS[self.setting] {
+            Setting::Theme => {
+                let (current, count) = (self.themes(), self.themes.len());
+                let next = (current + count).saturating_add_signed(isize::from(delta)) % count;
+                let name = self.themes[next].clone();
+                self.set_theme(&name);
+                return;
+            }
+            Setting::Proxy | Setting::Cache => return self.activate(),
+            Setting::ProxyAddress => return,
+            Setting::CacheLimit => {
+                self.settings.cache_limit_mb = step(self.settings.cache_limit_mb, 256, 1024 * 1024);
+                if let Some(cache) = &mut self.cache {
+                    cache.set_limit(self.settings.cache_limit_mb.saturating_mul(1024 * 1024));
+                }
+            }
+            Setting::SearchLimit => {
+                self.settings.search_limit =
+                    step(u64::from(self.settings.search_limit), 5, 50).max(5) as u8;
+            }
+            Setting::SeekStep => {
+                let at = SEEK_STEPS
+                    .iter()
+                    .position(|step| *step >= self.settings.seek_step)
+                    .unwrap_or(SEEK_STEPS.len() - 1);
+                let next = at.saturating_add_signed(isize::from(delta));
+                self.settings.seek_step = SEEK_STEPS[next.min(SEEK_STEPS.len() - 1)];
+            }
+            Setting::Volume => {
+                self.settings.volume = step(u64::from(self.settings.volume), 5, 100) as u8;
+            }
+        }
+        self.persist();
+    }
+    // Enter on the proxy address that was typed.
+    fn submit_address(&mut self) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        let input = input.trim();
+        if input.is_empty() {
+            self.address = None;
+            self.proxy = None;
+            self.settings.proxy = None;
+            self.settings.proxy_enabled = false;
+        } else {
+            match config::validate(input) {
+                Ok(address) => {
+                    if self.proxy.is_some() {
+                        self.proxy = Some(address.clone());
+                    }
+                    self.settings.proxy = Some(address.clone());
+                    self.address = Some(address);
+                }
+                Err(error) => {
+                    self.message = error.to_string();
+                    self.input = Some(input.to_owned());
+                    return;
+                }
+            }
+        }
+        self.persist();
+    }
+    // The scheme under the cursor of the list replaces the current one for a look.
+    fn pick(&mut self, delta: isize) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let last = self.themes.len().saturating_sub(1);
+        let at = picker
+            .state
+            .selected()
+            .unwrap_or(0)
+            .saturating_add_signed(delta)
+            .min(last);
+        picker.state.select(Some(at));
+        self.theme = Theme::load(&self.themes[at]);
+    }
+    fn close_picker(&mut self, keep: bool) {
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        match picker.state.selected().filter(|_| keep) {
+            Some(at) => {
+                let name = self.themes[at].clone();
+                self.set_theme(&name);
+            }
+            None => self.theme = picker.original,
+        }
+    }
     fn search(&mut self) {
         if self.searching {
             self.message = "Поиск уже выполняется...".into();
@@ -263,6 +609,7 @@ impl App {
             self.direct,
             self.query.clone(),
         );
+        let limit = self.settings.search_limit;
         let cache = self
             .cache
             .as_ref()
@@ -281,7 +628,7 @@ impl App {
             })
             .quiet()
             .cancellable(&cancel)
-            .search(&query, 30)
+            .search(&query, limit)
             .map_err(|e| e.to_string());
             let _ = sender.send(result);
         }));
@@ -304,7 +651,7 @@ impl App {
         match Playback::start(
             &self.mpv,
             self.extractor(),
-            &track.url,
+            &track,
             self.cache.as_ref(),
             self.volume,
         ) {
@@ -425,9 +772,10 @@ impl App {
         let Some(cache) = self.cache.as_ref().filter(|c| !c.contains(&track.url)) else {
             return Ok(None);
         };
-        let Some(partial) = cache.store(&track.url)? else {
+        let Some(mut partial) = cache.store(&track.url)? else {
             return Ok(None);
         };
+        partial.describe(track);
         let log = partial.directory().join("log");
         let mut command = player::downloader(
             self.extractor(),
@@ -492,6 +840,8 @@ impl App {
                         self.message = "Трек добавлен в библиотеку".into();
                     }
                     self.save();
+                    // A stored track moves between the two parts of the library.
+                    self.list_stored();
                     self.navigate(0);
                 }
             }
@@ -506,6 +856,7 @@ impl App {
                     self.download(vec![track]);
                 }
             }
+            Action::Evict => self.evict(),
             Action::Pause => {
                 if self.player.is_some() {
                     self.control(json!(["cycle", "pause"]));
@@ -597,6 +948,10 @@ impl App {
             self.fetch = None;
             self.fetch_next();
         }
+        // Tracks get there from playback and other instances too.
+        if self.view == View::Library && self.listed.elapsed() > Duration::from_secs(1) {
+            self.list_stored();
+        }
         if let Some(player) = &mut self.player {
             let was_loaded = player.loaded;
             let result = player.tick();
@@ -647,14 +1002,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(
-    yt_dlp: String,
-    mpv: String,
-    proxy: Option<String>,
-    direct: bool,
-    library: Option<PathBuf>,
-    cache: Option<Cache>,
-) -> Result<()> {
+pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("Интерфейсу нужен интерактивный терминал. Для скриптов используйте search или play --first.".into());
     }
@@ -669,7 +1017,7 @@ pub fn run(
     for signal in [SIGTERM, SIGHUP, SIGINT] {
         signal_hook::flag::register(signal, terminate.clone())?;
     }
-    let mut app = App::new(yt_dlp, mpv, proxy, direct, cache, path, library);
+    let mut app = App::new(session, path, library);
     terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
@@ -726,9 +1074,57 @@ pub fn run(
                     }
                     continue;
                 }
+                if app.picker.is_some() {
+                    match key.code {
+                        KeyCode::Down | KeyCode::Char('j') => app.pick(1),
+                        KeyCode::Up | KeyCode::Char('k') => app.pick(-1),
+                        KeyCode::PageDown => app.pick(10),
+                        KeyCode::PageUp => app.pick(-10),
+                        KeyCode::Home => app.pick(isize::MIN),
+                        KeyCode::End => app.pick(isize::MAX),
+                        KeyCode::Enter => app.close_picker(true),
+                        KeyCode::Esc | KeyCode::Char('q') => app.close_picker(false),
+                        _ => (),
+                    }
+                    continue;
+                }
+                if let Some(input) = &mut app.input {
+                    match key.code {
+                        KeyCode::Esc => app.input = None,
+                        KeyCode::Enter => app.submit_address(),
+                        KeyCode::Backspace => {
+                            input.pop();
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            input.clear()
+                        }
+                        KeyCode::Char(c) if !c.is_control() && input.chars().count() < 200 => {
+                            input.push(c)
+                        }
+                        _ => (),
+                    }
+                    continue;
+                }
+                if app.options {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('o') => app.options = false,
+                        KeyCode::Char('q') => break,
+                        KeyCode::Down | KeyCode::Char('j') => app.move_setting(1),
+                        KeyCode::Up | KeyCode::Char('k') => app.move_setting(-1),
+                        KeyCode::Left | KeyCode::Char('h') => app.adjust(-1),
+                        KeyCode::Right | KeyCode::Char('l') => app.adjust(1),
+                        KeyCode::Enter | KeyCode::Char(' ') => app.activate(),
+                        _ => (),
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('?') => app.help = true,
+                    KeyCode::Char('o') => {
+                        app.options = true;
+                        app.focus = None;
+                    }
                     KeyCode::Char('e') => {
                         app.details = true;
                         app.detail_scroll = 0;
@@ -777,8 +1173,14 @@ pub fn run(
                     KeyCode::Char('s') => app.action(Action::Stop),
                     KeyCode::Char('+') | KeyCode::Char('=') => app.action(Action::Louder),
                     KeyCode::Char('-') => app.action(Action::Quieter),
-                    KeyCode::Left => app.control(json!(["seek", -10, "relative"])),
-                    KeyCode::Right => app.control(json!(["seek", 10, "relative"])),
+                    KeyCode::Char('x') => app.action(Action::Evict),
+                    KeyCode::Left => {
+                        let step = -i32::from(app.settings.seek_step);
+                        app.control(json!(["seek", step, "relative"]))
+                    }
+                    KeyCode::Right => {
+                        app.control(json!(["seek", app.settings.seek_step, "relative"]))
+                    }
                     KeyCode::Delete if app.view == View::Queue => {
                         app.queue.remove(app.table.selected().unwrap_or(0));
                         app.navigate(0);
@@ -786,7 +1188,32 @@ pub fn run(
                     _ => (),
                 }
             }
-            Event::Mouse(mouse) if !app.help && !app.details => match mouse.kind {
+            Event::Mouse(mouse) if app.picker.is_some() => match mouse.kind {
+                MouseEventKind::ScrollDown => app.pick(1),
+                MouseEventKind::ScrollUp => app.pick(-1),
+                _ => (),
+            },
+            // In the settings window a click picks a line; on the current one it is Enter.
+            Event::Mouse(mouse) if app.options && app.input.is_none() => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if app
+                        .setting_rows
+                        .contains(Position::new(mouse.column, mouse.row)) =>
+                {
+                    let line = usize::from(mouse.row - app.setting_rows.y);
+                    if line == app.setting {
+                        app.activate();
+                    } else {
+                        app.setting = line.min(SETTINGS.len() - 1);
+                    }
+                }
+                MouseEventKind::ScrollDown => app.move_setting(1),
+                MouseEventKind::ScrollUp => app.move_setting(-1),
+                _ => (),
+            },
+            Event::Mouse(mouse) if !app.help && !app.details && app.input.is_none() => match mouse
+                .kind
+            {
                 MouseEventKind::Down(MouseButton::Left) => {
                     let pos = Position::new(mouse.column, mouse.row);
                     if let Some((_, action)) = app.hits.iter().find(|(rect, _)| rect.contains(pos))
@@ -813,14 +1240,20 @@ pub fn run(
     Ok(())
 }
 
-fn block(title: &str) -> Block<'_> {
+fn block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
     Block::bordered()
         .border_set(BORDER)
-        .border_style(MUTED)
+        .border_style(theme.border)
         .title(Line::from(vec![
-            Span::raw("-"),
-            Span::styled(title, ACCENT),
+            Span::styled("-", theme.border),
+            Span::styled(title, theme.accent),
         ]))
+}
+// A window over the interface; `Clear` alone would drop the background of the scheme.
+fn modal<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
+    block(title, theme)
+        .border_style(theme.accent)
+        .style(theme.base)
 }
 fn label(frame: &mut Frame, area: Rect, text: impl Into<Text<'static>>, style: Style) {
     frame.render_widget(Paragraph::new(text).style(style), area);
@@ -829,11 +1262,11 @@ fn button(frame: &mut Frame, app: &mut App, area: Rect, text: &str, action: Acti
     let focused = app.focus == Some(app.hits.len());
     app.hits.push((area, action));
     let (style, edges) = if focused {
-        (INVERSE.patch(ACCENT), [">", "<"])
+        (app.theme.focused, [">", "<"])
     } else if active {
-        (INVERSE, ["[", "]"])
+        (app.theme.selected, ["[", "]"])
     } else {
-        (TEXT, ["[", "]"])
+        (app.theme.text, ["[", "]"])
     };
     frame.render_widget(
         Paragraph::new(text)
@@ -853,7 +1286,8 @@ fn time(value: f64) -> String {
     let seconds = value.max(0.0) as u64;
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
-fn progress(position: f64, duration: f64, width: u16) -> String {
+// The played and the remaining part of the bar and the times after it.
+fn progress(position: f64, duration: f64, width: u16) -> (String, String, String) {
     let times = format!(" {} / {}", time(position), time(duration));
     let cells = usize::from(width).saturating_sub(times.len() + 2);
     let filled = if duration > 0.0 {
@@ -862,23 +1296,25 @@ fn progress(position: f64, duration: f64, width: u16) -> String {
         0
     };
     let head = if filled > 0 { ">" } else { "" };
-    format!(
-        "[{}{head}{}]{times}",
-        "=".repeat(filled.saturating_sub(1)),
-        "-".repeat(cells - filled)
+    (
+        format!("{}{head}", "=".repeat(filled.saturating_sub(1))),
+        "-".repeat(cells - filled),
+        times,
     )
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
+    let theme = app.theme.clone();
     app.hits.clear();
     app.rows = Rect::default();
+    frame.render_widget(Block::new().style(theme.base), size);
     if size.width < 80 || size.height < 24 {
         label(
             frame,
             size,
             "\n  CLICLOUD\n\n  Увеличьте терминал до 80x24.\n  q - выход",
-            ACCENT,
+            theme.accent,
         );
         return;
     }
@@ -907,43 +1343,49 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .spacing(1)
         .split(outer[2]);
     // Buttons register in app.hits in drawing order, which is also the Tab order.
-    draw_header(frame, app, outer[0]);
-    draw_search(frame, app, outer[1]);
-    draw_navigation(frame, app, body[0]);
-    draw_tracks(frame, app, body[1]);
+    draw_header(frame, app, &theme, outer[0]);
+    draw_search(frame, app, &theme, outer[1]);
+    draw_navigation(frame, app, &theme, body[0]);
+    draw_tracks(frame, app, &theme, body[1]);
     if let Some(area) = body.get(2) {
-        draw_upcoming(frame, app, *area);
+        draw_upcoming(frame, app, &theme, *area);
     }
-    draw_player(frame, app, outer[3]);
+    draw_player(frame, app, &theme, outer[3]);
     label(
         frame,
         Rect::new(outer[4].x, outer[4].y, outer[4].width, 1),
         clean(&app.message),
-        ACCENT,
+        theme.strong,
     );
     label(
         frame,
         Rect::new(outer[4].x, outer[4].y + 1, outer[4].width, 1),
-        " / поиск  Enter играть  f избранное  a очередь  d в кеш  ? помощь  q выход",
-        MUTED,
+        " / поиск  f избранное  a очередь  d в кеш  o настройки  ? помощь  q выход",
+        theme.muted,
     );
+    if app.options {
+        draw_settings(frame, app, &theme, size);
+    }
+    if app.picker.is_some() {
+        draw_picker(frame, app, &theme, size);
+    }
     if app.help {
-        draw_help(frame, size);
+        draw_help(frame, &theme, size);
     }
     if app.details {
-        draw_details(frame, app, size);
+        draw_details(frame, app, &theme, size);
     }
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let header = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(28)])
         .split(area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" CLICLOUD ", ACCENT),
-            Span::styled("/ your terminal, your music", MUTED),
+            Span::styled(" CLICLOUD ", theme.accent),
+            Span::styled("/ your terminal, your music", theme.muted),
         ])),
         header[0],
     );
@@ -953,12 +1395,13 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             "SOUNDCLOUD / STREAMING "
         })
+        .style(theme.muted)
         .alignment(Alignment::Right),
         header[1],
     );
 }
 
-fn draw_search(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_search(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let query = if app.query.is_empty() && !app.editing {
         "Найти исполнителя, трек, новый звук...".into()
     } else {
@@ -977,18 +1420,21 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(
         Paragraph::new(query)
             .block(
-                block(if app.searching {
-                    " ПОИСК: загрузка... Esc - отмена "
-                } else {
-                    " / ПОИСК   Enter - найти "
-                })
+                block(
+                    if app.searching {
+                        " ПОИСК: загрузка... Esc - отмена "
+                    } else {
+                        " / ПОИСК   Enter - найти "
+                    },
+                    theme,
+                )
                 .border_style(if app.editing || app.focus == Some(0) {
-                    ACCENT
+                    theme.accent
                 } else {
-                    MUTED
+                    theme.border
                 }),
             )
-            .style(if app.editing { TEXT } else { MUTED }),
+            .style(if app.editing { theme.text } else { theme.muted }),
         search[0],
     );
     button(
@@ -1001,22 +1447,24 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn draw_navigation(frame: &mut Frame, app: &mut App, area: Rect) {
-    frame.render_widget(block(" ОБЗОР "), area);
+fn draw_navigation(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    frame.render_widget(block(" ОБЗОР ", theme), area);
     let nav = area.inner(Margin {
         horizontal: 2,
         vertical: 1,
     });
-    let step = if nav.height >= 7 { 2 } else { 1 };
-    for (i, (name, view)) in [
+    let views = [
         ("1  Поиск", View::Search),
         ("2  Библиотека", View::Library),
         ("3  Очередь", View::Queue),
         ("4  Недавние", View::Recent),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ];
+    let step = if nav.height >= 2 * views.len() as u16 - 1 {
+        2
+    } else {
+        1
+    };
+    for (i, (name, view)) in views.into_iter().enumerate() {
         button(
             frame,
             app,
@@ -1026,47 +1474,62 @@ fn draw_navigation(frame: &mut Frame, app: &mut App, area: Rect) {
             app.view == view,
         );
     }
-    if nav.height > 10 {
-        let loading = app.pending.len() + usize::from(app.fetch.is_some());
+    // As much of the summary as fits below the buttons, in whole lines of thought.
+    let below = (views.len() as u16 - 1) * step + 2;
+    let room = usize::from(nav.height.saturating_sub(below));
+    let loading = app.pending.len() + usize::from(app.fetch.is_some());
+    let mut lines = vec![
+        format!("{} избранных", app.library.favorites.len()),
+        format!("{} в очереди", app.queue.len()),
+    ];
+    if loading > 0 {
+        lines.push(format!("{loading} качается"));
+    }
+    if app.cache.is_some() && room >= lines.len() + 4 {
+        lines.extend(["", "v - в кеше,", "играет и", "без сети"].map(String::from));
+    }
+    if room >= lines.len() {
         label(
             frame,
-            Rect::new(nav.x, nav.y + 9, nav.width, nav.height - 9),
-            format!(
-                "{} избранных\n{} в очереди\n{}",
-                app.library.favorites.len(),
-                app.queue.len(),
-                if loading > 0 {
-                    format!("{loading} качается\n\nv - в кеше")
-                } else if app.cache.is_some() {
-                    "\nv - в кеше,\nиграет и\nбез сети".into()
-                } else {
-                    "\nЛокальная\nбиблиотека".into()
-                }
-            ),
-            MUTED,
+            Rect::new(nav.x, nav.y + below, nav.width, nav.height - below),
+            lines.join("\n"),
+            theme.muted,
         );
     }
 }
 
-fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let center = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(2)])
         .split(area);
+    let library;
     let title = match app.view {
         View::Search => " РЕЗУЛЬТАТЫ ",
-        View::Library => " МОЯ БИБЛИОТЕКА ",
+        View::Library if app.cache.is_none() => " МОЯ БИБЛИОТЕКА ",
+        View::Library => {
+            library = format!(
+                " МОЯ БИБЛИОТЕКА | избранное: {} | в кеше: {}, {} ",
+                app.library.favorites.len(),
+                app.stored_count,
+                megabytes(app.stored_size)
+            );
+            &library
+        }
         View::Queue => " ОЧЕРЕДЬ ВОСПРОИЗВЕДЕНИЯ ",
         View::Recent => " НЕДАВНИЕ ",
     };
     let tracks = app.tracks();
+    let selected = tracks.get(app.table.selected().unwrap_or(0)).copied();
+    let evict =
+        selected.is_some_and(|track| app.cache.as_ref().is_some_and(|c| c.contains(&track.url)));
     if tracks.is_empty() {
         let message = match app.view {
             View::Search => {
                 "\n\nВаша следующая любимая песня - здесь.\n\nНажмите / и введите поисковый запрос.\nEnter - слушать, f - сохранить"
             }
             View::Library => {
-                "\n\nСоберите свою коллекцию.\n\nНажмите f на треке в результатах поиска.\nИзбранное сохранится между запусками."
+                "\n\nСоберите свою коллекцию.\n\nf - добавить трек в избранное.\nЗдесь же всё, что сохранено в кеш (d)\nи играет без сети."
             }
             View::Queue => {
                 "\n\nМузыка без перерывов.\n\nНажмите a, чтобы добавить трек в очередь.\nСледующий трек запустится автоматически."
@@ -1079,8 +1542,8 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(message)
                 .alignment(Alignment::Center)
                 .wrap(Wrap { trim: false })
-                .style(MUTED)
-                .block(block(title)),
+                .style(theme.muted)
+                .block(block(title, theme)),
             center[0],
         );
     } else {
@@ -1091,26 +1554,32 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
                 let favorite = app.library.favorites.iter().any(|t| t.url == track.url);
                 let playing = app.current.as_ref().is_some_and(|t| t.url == track.url)
                     && app.player.is_some();
-                let stored = if app.cache.as_ref().is_some_and(|c| c.contains(&track.url)) {
-                    "v"
-                } else if app.fetching(&track.url) {
-                    "~"
-                } else {
-                    "."
+                let mark = |on: bool, text: &'static str, style: Style| {
+                    if on {
+                        Cell::from(text).style(style)
+                    } else {
+                        Cell::from(".").style(theme.border)
+                    }
                 };
+                let stored = app.cache.as_ref().is_some_and(|c| c.contains(&track.url));
                 Row::new(vec![
                     if playing {
-                        "|>".into()
+                        Cell::from("|>")
                     } else {
-                        format!("{:02}", i + 1)
+                        Cell::from(format!("{:02}", i + 1)).style(theme.muted)
                     },
-                    clean(&track.title),
-                    clean(&track.artist),
-                    track.duration.map(time).unwrap_or_else(|| "-".into()),
-                    if favorite { "*" } else { "." }.into(),
-                    stored.into(),
+                    Cell::from(clean(&track.title)),
+                    Cell::from(clean(&track.artist)).style(theme.muted),
+                    Cell::from(track.duration.map(time).unwrap_or_else(|| "-".into()))
+                        .style(theme.muted),
+                    mark(favorite, "*", theme.favorite),
+                    if !stored && app.fetching(&track.url) {
+                        Cell::from("~").style(theme.waiting)
+                    } else {
+                        mark(stored, "v", theme.stored)
+                    },
                 ])
-                .style(if playing { ACCENT } else { TEXT })
+                .style(if playing { theme.playing } else { theme.text })
             })
             .collect();
         let table = Table::new(
@@ -1126,11 +1595,11 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
         )
         .header(
             Row::new(["#", "ТРЕК", "ИСПОЛНИТЕЛЬ", "ВРЕМЯ", "*", "v"])
-                .style(MUTED)
+                .style(theme.muted)
                 .bottom_margin(1),
         )
-        .block(block(title))
-        .row_highlight_style(INVERSE)
+        .block(block(title, theme))
+        .row_highlight_style(theme.selected)
         .highlight_symbol("> ");
         frame.render_stateful_widget(table, center[0], &mut app.table);
         app.rows = Rect::new(
@@ -1140,16 +1609,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
             center[0].height.saturating_sub(4),
         );
     }
-    let buttons = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 4); 4])
-        .spacing(1)
-        .split(Rect::new(
-            center[1].x + 1,
-            center[1].y,
-            center[1].width - 2,
-            1,
-        ));
+    let buttons = buttons(center[1]);
     button(frame, app, buttons[0], "|> Играть", Action::Play, false);
     button(
         frame,
@@ -1167,35 +1627,138 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
         Action::Enqueue,
         false,
     );
-    button(frame, app, buttons[3], "v В кеш", Action::Download, false);
+    if evict {
+        button(frame, app, buttons[3], "x Из кеша", Action::Evict, false);
+    } else {
+        button(frame, app, buttons[3], "v В кеш", Action::Download, false);
+    }
 }
 
-fn draw_upcoming(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines = vec![Line::styled("ДАЛЕЕ", ACCENT), Line::raw("")];
+// The row of four buttons under the middle panel.
+fn buttons(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 4); 4])
+        .spacing(1)
+        .split(Rect::new(area.x + 1, area.y, area.width - 2, 1))
+}
+
+// The settings window. It stays as tall for every setting, whose hints differ in length.
+fn draw_settings(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
+    let hints = SETTINGS
+        .iter()
+        .map(|setting| setting.hint().lines().count())
+        .max()
+        .unwrap_or(0);
+    let (width, height) = (72.min(size.width - 4), (SETTINGS.len() + hints + 7) as u16);
+    let area = Rect::new(
+        (size.width - width) / 2,
+        size.height.saturating_sub(height) / 2,
+        width,
+        height.min(size.height),
+    );
+    frame.render_widget(Clear, area);
+    let window = modal(" НАСТРОЙКИ | Esc - закрыть ", theme);
+    let inner = window.inner(area);
+    frame.render_widget(window, area);
+    let names = SETTINGS
+        .iter()
+        .map(|setting| setting.name().chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line> = SETTINGS
+        .iter()
+        .enumerate()
+        .map(|(i, setting)| {
+            let current = i == app.setting;
+            let text = format!(
+                "{} {:<names$}  {}",
+                if current { ">" } else { " " },
+                setting.name(),
+                clean(&app.value(*setting)),
+            );
+            // The whole width, so that the selection is a bar like in the lists.
+            let text = format!("{text:<width$}", width = usize::from(inner.width));
+            Line::styled(text, if current { theme.selected } else { theme.text })
+        })
+        .collect();
+    let note = |text: String| Line::styled(format!("  {text}"), theme.muted);
+    lines.push(Line::raw(""));
+    let hint = SETTINGS[app.setting].hint();
+    lines.extend(hint.lines().map(|line| note(line.into())));
+    lines.resize(SETTINGS.len() + 2 + hints, Line::raw(""));
+    lines.push(note(match &app.config {
+        Some(file) => format!("Файл: {}", clean(&file.to_string_lossy())),
+        None => "Файл настроек не определён: изменения действуют до выхода".into(),
+    }));
+    lines.push(Line::raw(""));
+    lines.push(note(
+        "Up/Down - выбор   Left/Right - изменить   Enter - переключить".into(),
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
+    app.setting_rows = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.min(SETTINGS.len() as u16),
+    );
+}
+
+fn draw_picker(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
+    // At the side: the interface behind it shows the scheme under the cursor.
+    let width = 38.min(size.width - 4);
+    let area = Rect::new(size.width - width - 1, 1, width, size.height - 2);
+    frame.render_widget(Clear, area);
+    let items: Vec<ListItem> = app
+        .themes
+        .iter()
+        .map(|name| ListItem::new(format!(" {}", clean(name))))
+        .collect();
+    let list = List::new(items)
+        .block(modal(" СХЕМА | Enter - выбрать | Esc ", theme))
+        .style(theme.text)
+        .highlight_style(theme.selected);
+    if let Some(picker) = &mut app.picker {
+        frame.render_stateful_widget(list, area, &mut picker.state);
+    }
+}
+
+fn draw_upcoming(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let mut lines = vec![Line::styled("ДАЛЕЕ", theme.accent), Line::raw("")];
     for track in app.queue.iter().take(4) {
-        lines.push(Line::raw(clean(&track.title)));
-        lines.push(Line::styled(clean(&track.artist), MUTED));
+        lines.push(Line::styled(clean(&track.title), theme.text));
+        lines.push(Line::styled(clean(&track.artist), theme.muted));
         lines.push(Line::raw(""));
     }
     if app.queue.is_empty() {
-        lines.push(Line::styled("Очередь пока пуста", MUTED));
+        lines.push(Line::styled("Очередь пока пуста", theme.muted));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled("НЕДАВНО", ACCENT));
+    lines.push(Line::styled("НЕДАВНО", theme.accent));
     for track in app.library.recent.iter().take(3) {
-        lines.push(Line::raw(clean(&track.title)));
+        lines.push(Line::styled(clean(&track.title), theme.text));
     }
-    frame.render_widget(Paragraph::new(lines).block(block(" НА СЛУХУ ")), area);
+    frame.render_widget(
+        Paragraph::new(lines).block(block(" НА СЛУХУ ", theme)),
+        area,
+    );
 }
 
-fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
-    frame.render_widget(block(" ПЛЕЕР "), area);
+fn draw_player(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    frame.render_widget(block(" ПЛЕЕР ", theme), area);
     let area = area.inner(Margin {
         horizontal: 2,
         vertical: 1,
     });
-    let (position, duration, state) = if let Some(player) = &app.player {
+    let (position, duration, state, state_style) = if let Some(player) = &app.player {
         let listed = app.current.as_ref().and_then(|t| t.duration).unwrap_or(0.0);
+        let (state, style) = if !player.loaded {
+            ("ЗАГРУЗКА", theme.waiting)
+        } else if player.paused {
+            ("ПАУЗА", theme.waiting)
+        } else {
+            ("ИГРАЕТ", theme.playing)
+        };
         (
             player.position,
             // While audio arrives, mpv reports the length of what it has got so far.
@@ -1204,16 +1767,11 @@ fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 listed
             },
-            if !player.loaded {
-                "ЗАГРУЗКА"
-            } else if player.paused {
-                "ПАУЗА"
-            } else {
-                "ИГРАЕТ"
-            },
+            state,
+            style,
         )
     } else {
-        (0.0, 0.0, "СТОП")
+        (0.0, 0.0, "СТОП", theme.muted)
     };
     let song = app
         .current
@@ -1223,14 +1781,25 @@ fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
     label(
         frame,
         Rect::new(area.x, area.y, area.width, 1),
-        format!("{state}  /  {song}"),
-        TEXT,
+        Line::from(vec![
+            Span::styled(state, state_style),
+            Span::styled("  /  ", theme.muted),
+            Span::styled(song, theme.text),
+        ]),
+        theme.text,
     );
+    let (played, left, times) = progress(position, duration, area.width);
     label(
         frame,
         Rect::new(area.x, area.y + 2, area.width, 1),
-        progress(position, duration, area.width),
-        TEXT,
+        Line::from(vec![
+            Span::styled("[", theme.muted),
+            Span::styled(played, theme.bar),
+            Span::styled(left, theme.border),
+            Span::styled("]", theme.muted),
+            Span::styled(times, theme.text),
+        ]),
+        theme.text,
     );
     let controls = Layout::default()
         .direction(Direction::Horizontal)
@@ -1266,14 +1835,14 @@ fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
         frame,
         controls[6],
         format!(" VOL {:3.0}", app.volume),
-        MUTED,
+        theme.muted,
     );
     button(frame, app, controls[7], "+", Action::Louder, false);
 }
 
-fn draw_help(frame: &mut Frame, size: Rect) {
-    let modal = Rect::new(size.width / 2 - 32, size.height / 2 - 9, 64, 17);
-    frame.render_widget(Clear, modal);
+fn draw_help(frame: &mut Frame, theme: &Theme, size: Rect) {
+    let modal_area = Rect::new(size.width / 2 - 32, size.height / 2 - 9, 64, 19);
+    frame.render_widget(Clear, modal_area);
     let keys = [
         ("/", "Поиск (Enter отправляет, Esc отменяет)"),
         ("1 2 3 4", "Поиск / библиотека / очередь / недавние"),
@@ -1282,42 +1851,50 @@ fn draw_help(frame: &mut Frame, size: Rect) {
         ("f", "Добавить / удалить из избранного"),
         ("a", "Добавить в очередь   Del  Убрать из очереди"),
         ("d / D", "Загрузить в кеш трек / весь список"),
+        ("x", "Удалить трек из кеша"),
         ("Space", "Пауза / продолжить"),
         ("p / n", "Предыдущий / следующий трек"),
-        ("Left / Right", "Перемотка на 10 секунд"),
+        ("Left / Right", "Перемотка"),
         ("- / +", "Громкость    s  Стоп    q  Выход"),
+        ("o", "Настройки и цветовые схемы"),
         ("e", "Подробности последней ошибки"),
     ];
     let mut lines = vec![Line::raw("")];
-    lines.extend(
-        keys.iter()
-            .map(|(key, action)| Line::raw(format!(" {key:<13}{action}"))),
-    );
+    lines.extend(keys.iter().map(|(key, action)| {
+        Line::from(vec![
+            Span::styled(format!(" {key:<13}"), theme.accent),
+            Span::styled(*action, theme.text),
+        ])
+    }));
     lines.push(Line::raw(""));
-    lines.push(Line::raw(
+    lines.push(Line::styled(
         " Мышь работает. Любая клавиша закрывает справку.",
+        theme.muted,
     ));
     frame.render_widget(
-        Paragraph::new(lines).block(block(" УПРАВЛЕНИЕ ").border_style(ACCENT)),
-        modal,
+        Paragraph::new(lines).block(modal(" УПРАВЛЕНИЕ ", theme)),
+        modal_area,
     );
 }
 
-fn draw_details(frame: &mut Frame, app: &App, size: Rect) {
-    let modal = Rect::new(
+fn draw_details(frame: &mut Frame, app: &App, theme: &Theme, size: Rect) {
+    let area = Rect::new(
         4,
         4,
         size.width.saturating_sub(8),
         size.height.saturating_sub(8),
     );
-    frame.render_widget(Clear, modal);
+    frame.render_widget(Clear, area);
     let detail = clean_lines(app.last_error.as_deref().unwrap_or(&app.message));
     frame.render_widget(
         Paragraph::new(detail)
             .wrap(Wrap { trim: false })
             .scroll((app.detail_scroll, 0))
-            .block(block(" ПОДРОБНОСТИ | Up/Down прокрутка | Esc закрыть ").border_style(ACCENT)),
-        modal,
+            .block(modal(
+                " ПОДРОБНОСТИ | Up/Down прокрутка | Esc закрыть ",
+                theme,
+            )),
+        area,
     );
 }
 
@@ -1335,11 +1912,19 @@ mod tests {
     }
     fn app(path: PathBuf) -> App {
         let mut app = App::new(
-            "yt-dlp".into(),
-            "mpv".into(),
-            None,
-            false,
-            None,
+            Session {
+                yt_dlp: "yt-dlp".into(),
+                mpv: "mpv".into(),
+                proxy: None,
+                direct: false,
+                cache: None,
+                cache_dir: None,
+                settings: Settings {
+                    theme: theme::MONO.into(),
+                    ..Settings::default()
+                },
+                config: None,
+            },
             path,
             Library::default(),
         );
@@ -1402,56 +1987,282 @@ mod tests {
     }
 
     #[test]
-    fn interface_is_monochrome_ascii_apart_from_text() {
-        let mut busy = app(PathBuf::new());
-        busy.library.favorites.push(track());
-        busy.library.recent.push(track());
-        busy.queue.push_back(track());
-        busy.current = Some(track());
-        busy.editing = true;
-        busy.focus = Some(5);
-        let mut empty = app(PathBuf::new());
-        empty.results.clear();
-        empty.query.clear();
-        empty.searching = true;
-        empty.proxy = Some("socks5h://127.0.0.1:9050".into());
-        let mut help = app(PathBuf::new());
-        help.help = true;
-        let mut details = app(PathBuf::new());
-        details.details = true;
-        for (mut app, width, height) in [
-            (busy, 120, 35),
-            (empty, 80, 24),
-            (help, 80, 24),
-            (details, 100, 30),
-            (app(PathBuf::new()), 60, 15),
-        ] {
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            let buffer = terminal.backend().buffer();
-            for y in 0..height {
-                for x in 0..width {
-                    let cell = &buffer[(x, y)];
-                    assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset));
-                    assert!(
-                        cell.symbol()
-                            .chars()
-                            .all(|c| c.is_ascii() || c.is_alphabetic()),
-                        "{:?} at {x},{y}",
-                        cell.symbol()
-                    );
+    fn interface_is_ascii_and_colored_by_its_scheme_alone() {
+        let screens = || {
+            let mut busy = app(PathBuf::new());
+            busy.library.favorites.push(track());
+            busy.library.recent.push(track());
+            busy.queue.push_back(track());
+            busy.current = Some(track());
+            busy.editing = true;
+            busy.focus = Some(5);
+            let mut empty = app(PathBuf::new());
+            empty.results.clear();
+            empty.query.clear();
+            empty.searching = true;
+            empty.proxy = Some("socks5h://127.0.0.1:9050".into());
+            let mut help = app(PathBuf::new());
+            help.help = true;
+            let mut details = app(PathBuf::new());
+            details.details = true;
+            let mut library = app(PathBuf::new());
+            library.select_view(View::Library);
+            let mut settings = app(PathBuf::new());
+            settings.options = true;
+            settings.config = Some("/tmp/config.json".into());
+            let mut low = app(PathBuf::new());
+            low.options = true;
+            low.setting = SETTINGS.len() - 1;
+            let mut picker = app(PathBuf::new());
+            picker.options = true;
+            picker.themes = vec![theme::MONO.into(), "Dracula".into()];
+            picker.picker = Some(Picker {
+                state: ListState::default().with_selected(Some(0)),
+                original: Theme::mono(),
+            });
+            [
+                (busy, 120, 35),
+                (empty, 80, 24),
+                (help, 80, 24),
+                (details, 100, 30),
+                (library, 80, 24),
+                (settings, 100, 30),
+                (low, 80, 24),
+                (picker, 80, 24),
+                (app(PathBuf::new()), 60, 15),
+            ]
+        };
+        for name in [theme::MONO, "Dracula", "Catppuccin Latte"] {
+            let scheme = Theme::load(name);
+            assert_eq!(scheme.name, name);
+            for (mut app, width, height) in screens() {
+                app.theme = scheme.clone();
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                for y in 0..height {
+                    for x in 0..width {
+                        let cell = &buffer[(x, y)];
+                        let at = format!("{name} {width}x{height} at {x},{y}");
+                        if name == theme::MONO {
+                            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset), "{at}");
+                        } else {
+                            // Nothing shows through from the terminal's own scheme.
+                            assert!(matches!(cell.bg, Color::Rgb(..)), "{at}");
+                            assert!(matches!(cell.fg, Color::Rgb(..)), "{at}");
+                        }
+                        assert!(
+                            cell.symbol()
+                                .chars()
+                                .all(|c| c.is_ascii() || c.is_alphabetic()),
+                            "{:?} in {at}",
+                            cell.symbol()
+                        );
+                    }
                 }
             }
         }
     }
 
     #[test]
+    fn settings_change_the_session_and_the_file() {
+        let file =
+            std::env::temp_dir().join(format!("clicloud-settings-{}.json", std::process::id()));
+        let root = std::env::temp_dir().join(format!("clicloud-settings-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut app = app(PathBuf::new());
+        app.config = Some(file.clone());
+        let choose = |app: &mut App, setting: Setting| {
+            app.setting = SETTINGS.iter().position(|s| *s == setting).unwrap();
+        };
+
+        // A proxy needs an address before it can be switched on.
+        choose(&mut app, Setting::Proxy);
+        app.activate();
+        assert!(app.proxy.is_none() && app.message.contains("адрес"));
+        choose(&mut app, Setting::ProxyAddress);
+        app.activate();
+        assert_eq!(app.input.as_deref(), Some(config::TOR));
+        app.input = Some("ftp://nope".into());
+        app.submit_address();
+        assert!(app.input.is_some() && app.address.is_none());
+        app.input = Some(" http://localhost:8080 ".into());
+        app.submit_address();
+        assert!(app.input.is_none() && app.proxy.is_none());
+        assert_eq!(app.value(Setting::ProxyAddress), "http://localhost:8080");
+        choose(&mut app, Setting::Proxy);
+        app.activate();
+        assert_eq!(app.proxy.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(app.value(Setting::Proxy), "вкл");
+
+        choose(&mut app, Setting::SearchLimit);
+        app.adjust(1);
+        assert_eq!(app.settings.search_limit, 35);
+        (0..10).for_each(|_| app.adjust(-1));
+        assert_eq!(app.value(Setting::SearchLimit), "5");
+        choose(&mut app, Setting::SeekStep);
+        app.adjust(1);
+        assert_eq!(app.settings.seek_step, 15);
+        (0..5).for_each(|_| app.adjust(1));
+        assert_eq!(app.value(Setting::SeekStep), "60 с");
+        choose(&mut app, Setting::CacheLimit);
+        app.adjust(1);
+        assert_eq!(app.value(Setting::CacheLimit), "1280 МБ");
+        (0..9).for_each(|_| app.adjust(-1));
+        assert_eq!(app.value(Setting::CacheLimit), "без ограничения");
+        choose(&mut app, Setting::Volume);
+        app.adjust(1);
+        assert_eq!((app.settings.volume, app.volume), (75, 70.0));
+
+        // The cache is opened and left by the same switch.
+        choose(&mut app, Setting::Cache);
+        app.activate();
+        assert!(app.cache.is_none() && app.message.contains("Каталог кеша"));
+        app.cache_dir = Some(root.clone());
+        app.activate();
+        assert!(app.cache.is_some() && app.settings.cache_enabled);
+        app.activate();
+        assert!(app.cache.is_none() && root.join("CACHEDIR.TAG").exists());
+
+        // The list of schemes shows each one at once and keeps it only on Enter.
+        choose(&mut app, Setting::Theme);
+        app.activate();
+        assert_eq!(app.picker.as_ref().unwrap().state.selected(), Some(1));
+        app.pick(1);
+        assert_eq!(app.theme.name, app.themes[2]);
+        app.close_picker(false);
+        assert_eq!(
+            (app.theme.name.as_str(), app.settings.theme.as_str()),
+            ("mono", "mono")
+        );
+        app.activate();
+        let dracula = app
+            .themes
+            .iter()
+            .position(|name| name == "Dracula")
+            .unwrap();
+        app.pick(dracula as isize - 1);
+        app.pick(isize::MAX);
+        app.pick(isize::MIN);
+        assert_eq!(app.theme.name, theme::TERMINAL);
+        app.pick(dracula as isize);
+        app.close_picker(true);
+        assert_eq!(
+            (app.theme.name.as_str(), app.settings.theme.as_str()),
+            ("Dracula", "Dracula")
+        );
+        app.adjust(1);
+        assert_eq!(app.theme.name, app.themes[dracula + 1]);
+        app.adjust(-1);
+        assert_eq!(app.value(Setting::Theme), "Dracula");
+
+        let saved = config::load(Some(&file)).unwrap();
+        assert_eq!(saved.proxy.as_deref(), Some("http://localhost:8080"));
+        assert!(saved.proxy_enabled && !saved.cache_enabled);
+        assert_eq!(
+            (saved.search_limit, saved.seek_step, saved.volume),
+            (5, 60, 75)
+        );
+        assert_eq!((saved.cache_limit_mb, saved.theme.as_str()), (0, "Dracula"));
+
+        // An empty address removes the proxy for good.
+        choose(&mut app, Setting::ProxyAddress);
+        app.input = Some("  ".into());
+        app.submit_address();
+        assert!(app.proxy.is_none() && app.address.is_none());
+        let saved = config::load(Some(&file)).unwrap();
+        assert!(saved.proxy.is_none() && !saved.proxy_enabled);
+        fs::remove_file(file).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn library_holds_favorites_and_stored_tracks() {
+        let root = std::env::temp_dir().join(format!("clicloud-ui-stored-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut app = app(PathBuf::new());
+        app.select_view(View::Library);
+        app.action(Action::Evict);
+        assert!(app.selected().is_none());
+
+        let cache = Cache::open(root.clone(), 0).unwrap();
+        for (name, known) in [("night", true), ("by-link", false)] {
+            let url = format!("https://soundcloud.com/test/{name}");
+            let mut partial = cache.store(&url).unwrap().unwrap();
+            if known {
+                partial.describe(&track());
+            }
+            fs::write(partial.path(), [0; 1024 * 1024]).unwrap();
+            partial.commit().unwrap();
+        }
+        app.cache = Some(cache);
+        let other = Track {
+            title: "Not stored".into(),
+            url: "https://soundcloud.com/test/other".into(),
+            ..track()
+        };
+        // A favorite that is stored too is listed once, however its link is spelled.
+        app.library.favorites = vec![
+            other.clone(),
+            Track {
+                url: "https://www.soundcloud.com/test/night?si=1".into(),
+                ..track()
+            },
+        ];
+        app.select_view(View::Library);
+        let titles = |app: &App| -> Vec<String> {
+            app.tracks()
+                .iter()
+                .map(|track| track.title.clone())
+                .collect()
+        };
+        assert_eq!(titles(&app), ["Not stored", "Ночной эфир", "by link"]);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..30)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .map(|at| buffer[at].symbol())
+            .collect();
+        assert!(text.contains("МОЯ БИБЛИОТЕКА | избранное: 2 | в кеше: 2, 2.0 МБ"));
+        // The marks of the three tracks; the header of the columns reads "* v" as well.
+        let marks = |pattern: &str| text.matches(pattern).count();
+        assert_eq!((marks(" * ."), marks(" * v"), marks(" . v")), (1, 2, 1));
+        // The button follows the selected track: this one is not in the cache.
+        assert!(text.contains("v В кеш") && !text.contains("x Из кеша"));
+
+        // Leaving the favorites, a stored track stays in the library; leaving the
+        // cache as well, it is gone.
+        app.navigate(1);
+        app.action(Action::Favorite);
+        assert_eq!(titles(&app), ["Not stored", "by link", "Ночной эфир"]);
+        app.navigate(1);
+        app.action(Action::Evict);
+        assert_eq!(app.message, "Удалено из кеша: Test artist - Ночной эфир");
+        assert_eq!(titles(&app), ["Not stored", "by link"]);
+        assert_eq!(app.table.selected(), Some(1));
+        app.action(Action::Favorite);
+        assert_eq!(app.library.favorites.len(), 2);
+        app.action(Action::Evict);
+        assert_eq!(titles(&app), ["Not stored", "by link"]);
+        assert!(app.cache.as_ref().unwrap().tracks().is_empty());
+        app.navigate(-1);
+        app.action(Action::Evict);
+        assert_eq!(app.message, "Этого трека нет в кеше");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn progress_bar_fills_its_width() {
-        assert_eq!(progress(0.0, 0.0, 24), "[----------] 0:00 / 0:00");
-        assert_eq!(progress(30.0, 60.0, 24), "[====>-----] 0:30 / 1:00");
-        assert_eq!(progress(90.0, 60.0, 24), "[=========>] 1:30 / 1:00");
-        assert_eq!(progress(1.0, 2.0, 3), "[] 0:01 / 0:02");
+        let bar = |position, duration, width| {
+            let (played, left, times) = progress(position, duration, width);
+            format!("[{played}{left}]{times}")
+        };
+        assert_eq!(bar(0.0, 0.0, 24), "[----------] 0:00 / 0:00");
+        assert_eq!(bar(30.0, 60.0, 24), "[====>-----] 0:30 / 1:00");
+        assert_eq!(bar(90.0, 60.0, 24), "[=========>] 1:30 / 1:00");
+        assert_eq!(bar(1.0, 2.0, 3), "[] 0:01 / 0:02");
     }
 
     fn script(name: &str, body: &str) -> PathBuf {

@@ -1,7 +1,7 @@
 use crate::{
     Result,
     cache::{Cache, Partial},
-    soundcloud::{self, Extractor},
+    soundcloud::{self, Extractor, Track},
 };
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -353,10 +353,12 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// `track` is what a search told about `url`; the cache keeps it for its list.
 pub fn play(
     executable: &str,
     extractor: Extractor,
     url: &str,
+    track: Option<&Track>,
     cache: Option<&Cache>,
 ) -> Result<()> {
     soundcloud::validate_url(url)?;
@@ -364,6 +366,9 @@ pub fn play(
     let mut command = mpv(executable);
     if let Some(cache) = cache {
         if let Some(file) = cache.find(url) {
+            if let Some(track) = track {
+                cache.describe(track);
+            }
             eprintln!("Трек из кеша.");
             from_file(&mut command, &file);
             let status = run(&mut command, &signals)?;
@@ -372,7 +377,10 @@ pub fn play(
             }
             return Ok(());
         }
-        if let Some(partial) = cache.store(url)? {
+        if let Some(mut partial) = cache.store(url)? {
+            if let Some(track) = track {
+                partial.describe(track);
+            }
             eprintln!("Трек загружается в кеш; перемотка - в пределах загруженного.");
             let mut source = downloader(extractor, url, partial.directory(), true, true);
             source.stderr(Stdio::inherit());

@@ -3,7 +3,7 @@ use crate::{
     Result,
     cache::Cache,
     player::{self, Download},
-    soundcloud::{self, Extractor},
+    soundcloud::{self, Extractor, Track},
 };
 use serde_json::{Value, json};
 use std::{
@@ -74,10 +74,11 @@ impl Playback {
     pub fn start(
         mpv: &str,
         extractor: Extractor,
-        url: &str,
+        track: &Track,
         cache: Option<&Cache>,
         volume: f64,
     ) -> Result<Self> {
+        let url = track.url.as_str();
         soundcloud::validate_url(url)?;
         let mut player = Self::idle(player::scratch_directory()?, volume);
         let log = fs::File::create(player.directory.join("error.log"))?;
@@ -97,10 +98,14 @@ impl Playback {
             .stdout(Stdio::null())
             .stderr(log.try_clone()?);
         if let Some(file) = cache.and_then(|cache| cache.find(url)) {
+            // Stored by its link alone, the track gets its name now.
+            cache.inspect(|cache| cache.describe(track));
             player.origin = Origin::Cache;
             player::from_file(&mut command, &file);
             command.stdin(Stdio::null());
-        } else if let Some(partial) = cache.map(|cache| cache.store(url)).transpose()?.flatten() {
+        } else if let Some(mut partial) = cache.map(|cache| cache.store(url)).transpose()?.flatten()
+        {
+            partial.describe(track);
             player.origin = Origin::Download;
             let mut source = player::downloader(extractor, url, partial.directory(), false, true);
             source.stderr(log);
