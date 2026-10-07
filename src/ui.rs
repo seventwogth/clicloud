@@ -47,8 +47,12 @@ const TAGLINES: [&str; 4] = [
 
 // The mark that turns while something runs, ASCII like every other mark here.
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
-// The drawing behind the list of tracks.
-const BACKDROP: &str = include_str!("backdrop.txt");
+// The drawings behind the list of tracks, by their names in the settings; the first is none.
+const BACKDROPS: [(&str, &str); 3] = [
+    ("none", ""),
+    ("reaper", include_str!("../backdrops/reaper")),
+    ("pentagram", include_str!("../backdrops/pentagram")),
+];
 
 // Frames, buttons and marks are ASCII in every color scheme.
 const BORDER: symbols::border::Set = symbols::border::Set {
@@ -141,6 +145,7 @@ enum View {
 #[derive(Clone, Copy, PartialEq)]
 enum Setting {
     Theme,
+    Backdrop,
     Language,
     Proxy,
     ProxyAddress,
@@ -151,8 +156,9 @@ enum Setting {
     Volume,
 }
 
-const SETTINGS: [Setting; 9] = [
+const SETTINGS: [Setting; 10] = [
     Setting::Theme,
+    Setting::Backdrop,
     Setting::Language,
     Setting::Proxy,
     Setting::ProxyAddress,
@@ -168,6 +174,7 @@ impl Setting {
     fn name(self) -> &'static str {
         match self {
             Self::Theme => t!("Цветовая схема"),
+            Self::Backdrop => t!("Фоновый рисунок"),
             Self::Language => t!("Язык"),
             Self::Proxy => t!("Прокси"),
             Self::ProxyAddress => t!("Адрес прокси"),
@@ -183,6 +190,11 @@ impl Setting {
             Self::Theme => {
                 t!(
                     "Enter - список схем с предпросмотром, Left/Right - соседняя.\nterminal повторяет цвета терминала, mono обходится без цвета,\nостальные - темы Ghostty."
+                )
+            }
+            Self::Backdrop => {
+                t!(
+                    "Enter или Left/Right - сменить рисунок за списком треков.\nнет - список без рисунка."
                 )
             }
             Self::Language => {
@@ -484,6 +496,12 @@ impl App {
         let switch = |on: bool| if on { t!("вкл") } else { t!("выкл") }.to_owned();
         match setting {
             Setting::Theme => self.theme.name.clone(),
+            Setting::Backdrop => match BACKDROPS[self.backdrop()].0 {
+                "reaper" => t!("жнец"),
+                "pentagram" => t!("пентаграмма"),
+                _ => t!("нет"),
+            }
+            .into(),
             Setting::Language => lang::current().name().into(),
             Setting::Proxy if self.proxy.is_none() && self.extractor().proxied() => {
                 t!("выкл, действует прокси из окружения").into()
@@ -516,6 +534,13 @@ impl App {
         self.themes
             .iter()
             .position(|name| *name == self.settings.theme)
+            .unwrap_or(0)
+    }
+    // The place of the chosen drawing; a name that is not known shows none.
+    fn backdrop(&self) -> usize {
+        BACKDROPS
+            .iter()
+            .position(|(name, _)| *name == self.settings.backdrop)
             .unwrap_or(0)
     }
     fn move_setting(&mut self, delta: isize) {
@@ -591,6 +616,11 @@ impl App {
                 let name = self.themes[next].clone();
                 self.set_theme(&name);
                 return;
+            }
+            Setting::Backdrop => {
+                let count = BACKDROPS.len();
+                let next = (self.backdrop() + count).saturating_add_signed(isize::from(delta));
+                self.settings.backdrop = BACKDROPS[next % count].0.into();
             }
             Setting::Language => {
                 let at = (lang::ALL.iter())
@@ -1882,6 +1912,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     };
     draw_backdrop(
         frame.buffer_mut(),
+        BACKDROPS[app.backdrop()].1,
         center[0].inner(Margin::new(1, 1)),
         taken,
         theme.border,
@@ -1927,8 +1958,8 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 
 // The drawing in the middle of the panel, in the cells nothing else has taken: the first
 // `taken` lines are the list's own, and a text below them keeps a margin on both sides.
-fn draw_backdrop(buffer: &mut Buffer, area: Rect, taken: u16, style: Style) {
-    let lines: Vec<&str> = BACKDROP.lines().collect();
+fn draw_backdrop(buffer: &mut Buffer, drawing: &str, area: Rect, taken: u16, style: Style) {
+    let lines: Vec<&str> = drawing.lines().collect();
     let width = lines.iter().map(|line| line.len()).max().unwrap_or(0);
     let left = i32::from(area.x) + (i32::from(area.width) - width as i32) / 2;
     let top = i32::from(area.y) + (i32::from(area.height) - lines.len() as i32) / 2;
@@ -2604,6 +2635,25 @@ mod tests {
         choose(&mut app, Setting::Volume);
         app.adjust(1);
         assert_eq!((app.settings.volume, app.volume), (75, 70.0));
+
+        // The drawing behind the list is changed in a circle, and taken away.
+        let drawn = |app: &mut App| screen(app, 120, 35).contains("DOOOO");
+        choose(&mut app, Setting::Backdrop);
+        assert_eq!(app.value(Setting::Backdrop), "жнец");
+        assert!(drawn(&mut app));
+        app.adjust(1);
+        assert_eq!(app.value(Setting::Backdrop), "пентаграмма");
+        assert!(!drawn(&mut app) && screen(&mut app, 120, 35).contains("\"-.-\""));
+        app.activate();
+        assert_eq!(app.value(Setting::Backdrop), "нет");
+        assert_eq!(config::load(Some(&file)).unwrap().backdrop, "none");
+        assert!(!drawn(&mut app) && !screen(&mut app, 120, 35).contains("\"-.-\""));
+        app.adjust(-1);
+        app.adjust(-1);
+        assert_eq!(app.settings.backdrop, "reaper");
+        for (_, drawing) in BACKDROPS {
+            assert!(drawing.is_ascii() && !drawing.contains('\t'));
+        }
 
         // The language changes at once, for the names of the settings too.
         choose(&mut app, Setting::Language);

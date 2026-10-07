@@ -23,6 +23,8 @@ pub struct Settings {
     pub cache_limit_mb: u64,
     /// A color scheme of the interface; see `theme`.
     pub theme: String,
+    /// The drawing behind the list of tracks: none, reaper or pentagram.
+    pub backdrop: String,
     /// The language of the interface and the messages: ru, en or ja.
     pub language: String,
     /// How many tracks a search in the interface asks for.
@@ -42,6 +44,7 @@ impl Default for Settings {
             cache_dir: None,
             cache_limit_mb: 1024,
             theme: crate::theme::TERMINAL.into(),
+            backdrop: "reaper".into(),
             language: crate::lang::Lang::Russian.code().into(),
             // A track of a search costs about a second of yt-dlp's time, so a list of
             // thirty kept the search running long after the first screen was there.
