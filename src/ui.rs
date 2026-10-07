@@ -646,6 +646,41 @@ impl App {
             None => self.theme = picker.original,
         }
     }
+    /// Where yt-dlp would keep what it has yet to learn about SoundCloud; None when
+    /// there is no cache to keep it in, or when something is kept there already.
+    fn to_learn(&self) -> Option<PathBuf> {
+        let cache = self
+            .cache
+            .as_ref()
+            .map(|cache| cache.extractor().to_owned())?;
+        let kept = fs::read_dir(&cache).is_ok_and(|mut kept| kept.next().is_some());
+        (!kept).then_some(cache)
+    }
+
+    /// Lets yt-dlp learn what it needs about SoundCloud before it is asked for music.
+    ///
+    /// Its first request of a run resolves the client id of SoundCloud and keeps it in
+    /// its cache, so doing that now spares the first search of the run a round trip.
+    /// Nothing is asked where there is no cache to keep it in, or where it is kept
+    /// already: that is every run after the first.
+    fn warm(&self) {
+        let Some(cache) = self.to_learn() else {
+            return;
+        };
+        let (binary, proxy, direct) = (self.yt_dlp.clone(), self.proxy.clone(), self.direct);
+        std::thread::spawn(move || {
+            // The results are thrown away; what yt-dlp learned on the way is kept.
+            let _ = SoundCloud::new(Extractor {
+                program: &binary,
+                proxy: proxy.as_deref(),
+                no_proxy: direct,
+                cache: Some(&cache),
+            })
+            .quiet()
+            .search("a", 1);
+        });
+    }
+
     fn search(&mut self) {
         if self.searching {
             self.message = t!("Поиск уже выполняется...").into();
@@ -1132,6 +1167,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
         signal_hook::flag::register(signal, terminate.clone())?;
     }
     let mut app = App::new(session, path, library);
+    app.warm();
     terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
@@ -2546,6 +2582,32 @@ mod tests {
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn what_yt_dlp_learns_is_asked_for_only_where_it_is_kept_and_not_kept_yet() {
+        let root = std::env::temp_dir().join(format!("clicloud-warm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut app = app(PathBuf::new());
+
+        // Without a cache there is nowhere to keep what would be learned.
+        assert!(app.to_learn().is_none());
+
+        app.cache = Some(Cache::open(root.clone(), 0).unwrap());
+        let kept = app.cache.as_ref().unwrap().extractor().to_owned();
+        assert_eq!(app.to_learn(), Some(kept.clone()));
+
+        // Something is kept already: every run after the first asks for nothing.
+        fs::create_dir_all(&kept).unwrap();
+        fs::write(kept.join("client_id"), b"kept").unwrap();
+        assert!(app.to_learn().is_none());
+
+        // An empty directory is one that yt-dlp has not written to yet.
+        fs::remove_file(kept.join("client_id")).unwrap();
+        assert_eq!(app.to_learn(), Some(kept));
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
