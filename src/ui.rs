@@ -29,12 +29,25 @@ use std::{
     time::Duration,
 };
 
-const BG: Color = Color::Rgb(17, 19, 24);
-const PANEL: Color = Color::Rgb(24, 27, 34);
-const EDGE: Color = Color::Rgb(49, 54, 65);
-const TEXT: Color = Color::Rgb(224, 227, 233);
-const MUTED: Color = Color::Rgb(137, 146, 164);
-const ACCENT: Color = Color::Rgb(255, 145, 83);
+// Monochrome: the terminal's own colors, told apart by bold, dim and reverse video.
+const TEXT: Style = Style::new();
+const MUTED: Style = Style::new().add_modifier(Modifier::DIM);
+const ACCENT: Style = Style::new()
+    .add_modifier(Modifier::BOLD)
+    .remove_modifier(Modifier::DIM);
+const INVERSE: Style = Style::new()
+    .add_modifier(Modifier::REVERSED)
+    .remove_modifier(Modifier::DIM);
+const BORDER: symbols::border::Set = symbols::border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -153,7 +166,7 @@ impl App {
             searching: false,
             receiver: None,
             table: TableState::default().with_selected(0),
-            message: "Нажмите /, чтобы найти музыку. ? — все клавиши".into(),
+            message: "Нажмите /, чтобы найти музыку. ? - все клавиши".into(),
             help: false,
             details: false,
             detail_scroll: 0,
@@ -201,7 +214,7 @@ impl App {
     }
     fn search(&mut self) {
         if self.searching {
-            self.message = "Поиск уже выполняется…".into();
+            self.message = "Поиск уже выполняется...".into();
             return;
         }
         if self.query.trim().is_empty() {
@@ -232,7 +245,7 @@ impl App {
         self.searching = true;
         self.editing = false;
         self.select_view(View::Search);
-        self.message = "Ищем треки в SoundCloud…".into();
+        self.message = "Ищем треки в SoundCloud...".into();
     }
     fn start(&mut self, track: Track) {
         self.player = None;
@@ -247,9 +260,9 @@ impl App {
         ) {
             Ok(player) => {
                 self.message = if self.proxy.is_some() {
-                    "Загрузка через прокси • перемотка ограничена буфером"
+                    "Загрузка через прокси, перемотка ограничена буфером"
                 } else {
-                    "Подключение к аудиопотоку…"
+                    "Подключение к аудиопотоку..."
                 }
                 .into();
                 self.library.recent.retain(|t| t.url != track.url);
@@ -385,7 +398,7 @@ impl App {
                         Err(error) => {
                             self.last_error = Some(error);
                             self.message =
-                                "Ошибка поиска. e — подробности; Esc — закрыть окно".into();
+                                "Ошибка поиска. e - подробности, Esc - закрыть окно".into();
                             self.details = true;
                             self.detail_scroll = 0;
                         }
@@ -403,7 +416,7 @@ impl App {
             let was_loaded = player.loaded;
             let result = player.tick();
             if !was_loaded && player.loaded {
-                self.message = "Воспроизведение • Space — пауза, n — следующий".into();
+                self.message = "Воспроизведение. Space - пауза, n - следующий".into();
             }
             self.volume = player.volume;
             match result {
@@ -606,23 +619,26 @@ pub fn run(
 }
 
 fn block(title: &str) -> Block<'_> {
-    Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(EDGE))
-        .style(Style::default().bg(PANEL))
+    Block::bordered()
+        .border_set(BORDER)
+        .border_style(MUTED)
+        .title(Line::from(vec![
+            Span::raw("-"),
+            Span::styled(title, ACCENT),
+        ]))
 }
-fn label(frame: &mut Frame, area: Rect, text: impl Into<Text<'static>>, color: Color) {
-    frame.render_widget(Paragraph::new(text).style(Style::default().fg(color)), area);
+fn label(frame: &mut Frame, area: Rect, text: impl Into<Text<'static>>, style: Style) {
+    frame.render_widget(Paragraph::new(text).style(style), area);
 }
 fn button(frame: &mut Frame, app: &mut App, area: Rect, text: &str, action: Action, active: bool) {
     let focused = app.focus == Some(app.hits.len());
     app.hits.push((area, action));
-    let style = if active || focused {
-        Style::default().fg(BG).bg(ACCENT).bold()
+    let (style, edges) = if focused {
+        (INVERSE.patch(ACCENT), [">", "<"])
+    } else if active {
+        (INVERSE, ["[", "]"])
     } else {
-        Style::default().fg(TEXT).bg(EDGE)
+        (TEXT, ["[", "]"])
     };
     frame.render_widget(
         Paragraph::new(text)
@@ -630,25 +646,43 @@ fn button(frame: &mut Frame, app: &mut App, area: Rect, text: &str, action: Acti
             .style(style),
         area,
     );
+    if area.width >= 2 {
+        for (x, edge) in [area.x, area.right() - 1].into_iter().zip(edges) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, area.y)) {
+                cell.set_symbol(edge);
+            }
+        }
+    }
 }
 fn time(value: f64) -> String {
     let seconds = value.max(0.0) as u64;
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
+fn progress(position: f64, duration: f64, width: u16) -> String {
+    let times = format!(" {} / {}", time(position), time(duration));
+    let cells = usize::from(width).saturating_sub(times.len() + 2);
+    let filled = if duration > 0.0 {
+        ((position / duration).clamp(0.0, 1.0) * cells as f64) as usize
+    } else {
+        0
+    };
+    let head = if filled > 0 { ">" } else { "" };
+    format!(
+        "[{}{head}{}]{times}",
+        "=".repeat(filled.saturating_sub(1)),
+        "-".repeat(cells - filled)
+    )
+}
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
-    frame.render_widget(
-        Block::default().style(Style::default().bg(BG).fg(TEXT)),
-        size,
-    );
     app.hits.clear();
     app.rows = Rect::default();
     if size.width < 80 || size.height < 24 {
         label(
             frame,
             size,
-            "\n  CLICLOUD\n\n  Увеличьте терминал до 80 × 24.\n  q — выход",
+            "\n  CLICLOUD\n\n  Увеличьте терминал до 80x24.\n  q - выход",
             ACCENT,
         );
         return;
@@ -675,6 +709,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         } else {
             vec![Constraint::Length(19), Constraint::Min(35)]
         })
+        .spacing(1)
         .split(outer[2]);
     // Buttons register in app.hits in drawing order, which is also the Tab order.
     draw_header(frame, app, outer[0]);
@@ -694,7 +729,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     label(
         frame,
         Rect::new(outer[4].x, outer[4].y + 1, outer[4].width, 1),
-        " / поиск  ↑↓ выбор  Enter играть  Space пауза  f ♥  a очередь  e ошибка  ? помощь  q выход",
+        " / поиск  j/k выбор  Enter играть  f избранное  a очередь  ? помощь  q выход",
         MUTED,
     );
     if app.help {
@@ -712,62 +747,60 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" ▂▄▆ CLICLOUD ", Style::default().fg(ACCENT).bold()),
-            Span::styled(" / YOUR TERMINAL, YOUR MUSIC", Style::default().fg(MUTED)),
+            Span::styled(" CLICLOUD ", ACCENT),
+            Span::styled("/ your terminal, your music", MUTED),
         ])),
         header[0],
     );
-    label(
-        frame,
-        header[1],
-        if app.proxy.is_some() {
-            "● PROXY ON  /  SOUNDCLOUD"
+    frame.render_widget(
+        Paragraph::new(if app.proxy.is_some() {
+            "PROXY ON / SOUNDCLOUD "
         } else {
-            "● SOUNDCLOUD / STREAMING"
-        },
-        ACCENT,
+            "SOUNDCLOUD / STREAMING "
+        })
+        .alignment(Alignment::Right),
+        header[1],
     );
 }
 
 fn draw_search(frame: &mut Frame, app: &mut App, area: Rect) {
     let query = if app.query.is_empty() && !app.editing {
-        "Найти исполнителя, трек, новый звук…".into()
+        "Найти исполнителя, трек, новый звук...".into()
     } else {
         format!(
             "{}{}",
             clean(&app.query),
-            if app.editing { "▏" } else { "" }
+            if app.editing { "_" } else { "" }
         )
     };
     let search = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(12)])
+        .constraints([Constraint::Min(20), Constraint::Length(11)])
+        .spacing(1)
         .split(area);
     app.hits.push((search[0], Action::Search));
     frame.render_widget(
         Paragraph::new(query)
             .block(
                 block(if app.searching {
-                    " ПОИСК • загрузка… "
+                    " ПОИСК: загрузка... "
                 } else {
-                    " / ПОИСК   Enter — найти "
+                    " / ПОИСК   Enter - найти "
                 })
-                .border_style(Style::default().fg(
-                    if app.editing || app.focus == Some(0) {
-                        ACCENT
-                    } else {
-                        EDGE
-                    },
-                )),
+                .border_style(if app.editing || app.focus == Some(0) {
+                    ACCENT
+                } else {
+                    MUTED
+                }),
             )
-            .style(Style::default().fg(if app.editing { TEXT } else { MUTED })),
+            .style(if app.editing { TEXT } else { MUTED }),
         search[0],
     );
     button(
         frame,
         app,
         Rect::new(search[1].x, search[1].y + 1, search[1].width, 1),
-        "Найти →",
+        "Найти",
         Action::Submit,
         false,
     );
@@ -791,7 +824,7 @@ fn draw_navigation(frame: &mut Frame, app: &mut App, area: Rect) {
             frame,
             app,
             Rect::new(nav.x, nav.y + i as u16 * 2, nav.width, 1),
-            name,
+            &format!("{name:<width$}", width = usize::from(nav.width) - 2),
             Action::View(view),
             app.view == view,
         );
@@ -824,7 +857,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
     if tracks.is_empty() {
         let message = match app.view {
             View::Search => {
-                "\n\nВаша следующая любимая песня — здесь.\n\nНажмите / и введите поисковый запрос.\nEnter — слушать · f — сохранить"
+                "\n\nВаша следующая любимая песня - здесь.\n\nНажмите / и введите поисковый запрос.\nEnter - слушать, f - сохранить"
             }
             View::Library => {
                 "\n\nСоберите свою коллекцию.\n\nНажмите f на треке в результатах поиска.\nИзбранное сохранится между запусками."
@@ -837,7 +870,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(message)
                 .alignment(Alignment::Center)
                 .wrap(Wrap { trim: false })
-                .style(Style::default().fg(MUTED))
+                .style(MUTED)
                 .block(block(title)),
             center[0],
         );
@@ -851,16 +884,16 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
                     && app.player.is_some();
                 Row::new(vec![
                     if playing {
-                        "▶".into()
+                        "|>".into()
                     } else {
                         format!("{:02}", i + 1)
                     },
                     clean(&track.title),
                     clean(&track.artist),
-                    track.duration.map(time).unwrap_or_else(|| "—".into()),
-                    if favorite { "♥" } else { "·" }.into(),
+                    track.duration.map(time).unwrap_or_else(|| "-".into()),
+                    if favorite { "*" } else { "." }.into(),
                 ])
-                .style(Style::default().fg(if playing { ACCENT } else { TEXT }))
+                .style(if playing { ACCENT } else { TEXT })
             })
             .collect();
         let table = Table::new(
@@ -874,13 +907,13 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
             ],
         )
         .header(
-            Row::new(["#", "ТРЕК", "ИСПОЛНИТЕЛЬ", "ВРЕМЯ", "♥"])
-                .style(Style::default().fg(MUTED))
+            Row::new(["#", "ТРЕК", "ИСПОЛНИТЕЛЬ", "ВРЕМЯ", "*"])
+                .style(MUTED)
                 .bottom_margin(1),
         )
         .block(block(title))
-        .row_highlight_style(Style::default().bg(Color::Rgb(57, 45, 40)).fg(ACCENT))
-        .highlight_symbol("› ");
+        .row_highlight_style(INVERSE)
+        .highlight_symbol("> ");
         frame.render_stateful_widget(table, center[0], &mut app.table);
         app.rows = Rect::new(
             center[0].x + 1,
@@ -896,18 +929,19 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Percentage(33),
             Constraint::Percentage(33),
         ])
+        .spacing(1)
         .split(Rect::new(
             center[1].x + 1,
             center[1].y,
             center[1].width - 2,
             1,
         ));
-    button(frame, app, buttons[0], "▶ Играть", Action::Play, false);
+    button(frame, app, buttons[0], "|> Играть", Action::Play, false);
     button(
         frame,
         app,
         buttons[1],
-        "♥ Избранное",
+        "* Избранное",
         Action::Favorite,
         false,
     );
@@ -922,26 +956,17 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_upcoming(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines = vec![
-        Line::styled("ДАЛЕЕ", Style::default().fg(ACCENT).bold()),
-        Line::raw(""),
-    ];
+    let mut lines = vec![Line::styled("ДАЛЕЕ", ACCENT), Line::raw("")];
     for track in app.queue.iter().take(4) {
         lines.push(Line::raw(clean(&track.title)));
-        lines.push(Line::styled(
-            clean(&track.artist),
-            Style::default().fg(MUTED),
-        ));
+        lines.push(Line::styled(clean(&track.artist), MUTED));
         lines.push(Line::raw(""));
     }
     if app.queue.is_empty() {
-        lines.push(Line::styled(
-            "Очередь пока пуста",
-            Style::default().fg(MUTED),
-        ));
+        lines.push(Line::styled("Очередь пока пуста", MUTED));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled("НЕДАВНО", Style::default().fg(ACCENT).bold()));
+    lines.push(Line::styled("НЕДАВНО", ACCENT));
     for track in app.library.recent.iter().take(3) {
         lines.push(Line::raw(clean(&track.title)));
     }
@@ -976,7 +1001,7 @@ fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
     let song = app
         .current
         .as_ref()
-        .map(|t| format!("{} — {}", clean(&t.artist), clean(&t.title)))
+        .map(|t| format!("{} - {}", clean(&t.artist), clean(&t.title)))
         .unwrap_or_else(|| "Выберите трек, чтобы начать".into());
     label(
         frame,
@@ -984,59 +1009,80 @@ fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
         format!("{state}  /  {song}"),
         TEXT,
     );
-    frame.render_widget(
-        Gauge::default()
-            .ratio(if duration > 0.0 {
-                (position / duration).clamp(0.0, 1.0)
-            } else {
-                0.0
-            })
-            .gauge_style(Style::default().fg(ACCENT).bg(EDGE))
-            .label(format!("{} / {}", time(position), time(duration))),
+    label(
+        frame,
         Rect::new(area.x, area.y + 2, area.width, 1),
+        progress(position, duration, area.width),
+        TEXT,
     );
     let controls = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(9),
-            Constraint::Length(12),
-            Constraint::Length(9),
-            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(13),
+            Constraint::Length(8),
+            Constraint::Length(10),
             Constraint::Min(1),
             Constraint::Length(5),
             Constraint::Length(9),
             Constraint::Length(5),
         ])
+        .spacing(1)
         .split(Rect::new(area.x, area.y + 4, area.width, 1));
-    button(frame, app, controls[0], "|◀ p", Action::Previous, false);
+    button(frame, app, controls[0], "|< p", Action::Previous, false);
     button(
         frame,
         app,
         controls[1],
         if app.player.as_ref().is_some_and(|p| !p.paused) {
-            "Ⅱ Пауза"
+            "|| Пауза"
         } else {
-            "▶ Играть"
+            "|> Играть"
         },
         Action::Pause,
-        true,
+        false,
     );
-    button(frame, app, controls[2], "n ▶|", Action::Next, false);
-    button(frame, app, controls[3], "■ Стоп", Action::Stop, false);
-    button(frame, app, controls[5], " − ", Action::Quieter, false);
+    button(frame, app, controls[2], "n >|", Action::Next, false);
+    button(frame, app, controls[3], "s Стоп", Action::Stop, false);
+    button(frame, app, controls[5], "-", Action::Quieter, false);
     label(
         frame,
         controls[6],
         format!(" VOL {:3.0}", app.volume),
         MUTED,
     );
-    button(frame, app, controls[7], " + ", Action::Louder, false);
+    button(frame, app, controls[7], "+", Action::Louder, false);
 }
 
 fn draw_help(frame: &mut Frame, size: Rect) {
     let modal = Rect::new(size.width / 2 - 32, size.height / 2 - 8, 64, 16);
     frame.render_widget(Clear, modal);
-    frame.render_widget(Paragraph::new("\n /            Поиск (Enter отправляет, Esc отменяет)\n 1 / 2 / 3    Поиск / библиотека / очередь\n ↑ ↓, j k     Выбрать трек     Enter  Проиграть\n Tab          Выбрать кнопку  Enter  Нажать\n f            Добавить / удалить из избранного\n a            Добавить в очередь   Del  Убрать из очереди\n Space        Пауза / продолжить\n p / n        Предыдущий / следующий трек\n ← / →        Перемотка на 10 секунд\n − / +        Громкость    s  Стоп    q  Выход\n\n Кнопки и строки доступны мышью.\n Любая клавиша закрывает справку.").style(Style::default().fg(TEXT)).block(block(" УПРАВЛЕНИЕ ").border_style(Style::default().fg(ACCENT))), modal);
+    let keys = [
+        ("/", "Поиск (Enter отправляет, Esc отменяет)"),
+        ("1 / 2 / 3", "Поиск / библиотека / очередь"),
+        ("Up Down, j k", "Выбрать трек     Enter  Проиграть"),
+        ("Tab", "Выбрать кнопку   Enter  Нажать"),
+        ("f", "Добавить / удалить из избранного"),
+        ("a", "Добавить в очередь   Del  Убрать из очереди"),
+        ("Space", "Пауза / продолжить"),
+        ("p / n", "Предыдущий / следующий трек"),
+        ("Left / Right", "Перемотка на 10 секунд"),
+        ("- / +", "Громкость    s  Стоп    q  Выход"),
+        ("e", "Подробности последней ошибки"),
+    ];
+    let mut lines = vec![Line::raw("")];
+    lines.extend(
+        keys.iter()
+            .map(|(key, action)| Line::raw(format!(" {key:<13}{action}"))),
+    );
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(
+        " Мышь работает. Любая клавиша закрывает справку.",
+    ));
+    frame.render_widget(
+        Paragraph::new(lines).block(block(" УПРАВЛЕНИЕ ").border_style(ACCENT)),
+        modal,
+    );
 }
 
 fn draw_details(frame: &mut Frame, app: &App, size: Rect) {
@@ -1052,11 +1098,7 @@ fn draw_details(frame: &mut Frame, app: &App, size: Rect) {
         Paragraph::new(detail)
             .wrap(Wrap { trim: false })
             .scroll((app.detail_scroll, 0))
-            .style(Style::default().fg(TEXT))
-            .block(
-                block(" ПОДРОБНОСТИ • ↑↓ прокрутка • Esc закрыть ")
-                    .border_style(Style::default().fg(ACCENT)),
-            ),
+            .block(block(" ПОДРОБНОСТИ | Up/Down прокрутка | Esc закрыть ").border_style(ACCENT)),
         modal,
     );
 }
@@ -1138,6 +1180,59 @@ mod tests {
         let row = |y| -> String { (0..80).map(|x| buffer[(x, y)].symbol()).collect() };
         assert!(row(6).contains("WARNING: first") && !row(6).contains("ERROR"));
         assert!(row(7).contains("ERROR: [31msecond"));
+    }
+
+    #[test]
+    fn interface_is_monochrome_ascii_apart_from_text() {
+        let mut busy = app(PathBuf::new());
+        busy.library.favorites.push(track());
+        busy.library.recent.push(track());
+        busy.queue.push_back(track());
+        busy.current = Some(track());
+        busy.editing = true;
+        busy.focus = Some(5);
+        let mut empty = app(PathBuf::new());
+        empty.results.clear();
+        empty.query.clear();
+        empty.searching = true;
+        empty.proxy = Some("socks5h://127.0.0.1:9050".into());
+        let mut help = app(PathBuf::new());
+        help.help = true;
+        let mut details = app(PathBuf::new());
+        details.details = true;
+        for (mut app, width, height) in [
+            (busy, 120, 35),
+            (empty, 80, 24),
+            (help, 80, 24),
+            (details, 100, 30),
+            (app(PathBuf::new()), 60, 15),
+        ] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            for y in 0..height {
+                for x in 0..width {
+                    let cell = &buffer[(x, y)];
+                    assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset));
+                    assert!(
+                        cell.symbol()
+                            .chars()
+                            .all(|c| c.is_ascii() || c.is_alphabetic()),
+                        "{:?} at {x},{y}",
+                        cell.symbol()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn progress_bar_fills_its_width() {
+        assert_eq!(progress(0.0, 0.0, 24), "[----------] 0:00 / 0:00");
+        assert_eq!(progress(30.0, 60.0, 24), "[====>-----] 0:30 / 1:00");
+        assert_eq!(progress(90.0, 60.0, 24), "[=========>] 1:30 / 1:00");
+        assert_eq!(progress(1.0, 2.0, 3), "[] 0:01 / 0:02");
     }
 
     #[test]
