@@ -248,8 +248,10 @@ SIGTERM и SIGHUP в Windows нет, поэтому интерфейс заве�
 `%USERPROFILE%\.config\clicloud`, `%USERPROFILE%\.cache\clicloud` и
 `%USERPROFILE%\.local\share\clicloud`; переменные `XDG_*` учитываются и здесь.
 Если `yt-dlp` или `mpv` установлены не в `PATH`, укажите путь к `.exe` через
-`--mpv` и `--yt-dlp`. Если вывод передаётся по конвейеру в PowerShell 5 и
-кириллица превращается в кракозябры, выполните
+`--mpv` и `--yt-dlp`. Локальный yt-dlp проекта клиент ищет в
+`.tools\venv\Scripts\yt-dlp.exe` - там, где его создаёт `py -m venv`.
+Если вывод передаётся по конвейеру в PowerShell 5 и кириллица превращается в
+кракозябры, выполните
 `[Console]::OutputEncoding = [Text.Encoding]::UTF8` или включите английский
 язык (`"language": "en"`). Интерфейс так же доступен в WSL, в том числе в
 Windows Terminal.
