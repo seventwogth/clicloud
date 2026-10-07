@@ -56,8 +56,14 @@ impl Default for Settings {
 /// which Windows names differently.
 pub fn directory(variable: &str, fallback: &str) -> Option<PathBuf> {
     let set = |name: &str| env::var_os(name).filter(|v| !v.is_empty());
+    // A shell under Windows may set HOME to a path of a world of its own, such as
+    // /home/user, which names nothing there; the profile is where the files belong.
+    #[cfg(windows)]
+    let homes = ["USERPROFILE", "HOME"];
+    #[cfg(not(windows))]
+    let homes = ["HOME", "USERPROFILE"];
     set(variable).map(PathBuf::from).or_else(|| {
-        ["HOME", "USERPROFILE"]
+        homes
             .into_iter()
             .find_map(set)
             .map(|home| PathBuf::from(home).join(fallback))

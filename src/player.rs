@@ -92,17 +92,15 @@ pub fn from_file(command: &mut Command, file: &Path) {
     command.args(["--ytdl=no", "--"]).arg(file);
 }
 
-/// A private directory for a player's socket, log and downloader fragments.
+/// A private directory for a player's log, its socket where it has one, and the
+/// fragments of a downloader.
 pub fn scratch_directory() -> Result<PathBuf> {
     let directory = std::env::temp_dir().join(format!(
         "clicloud-{}-{}",
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     ));
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(&directory)?;
+    crate::cache::private_directory(&directory)?;
     Ok(directory)
 }
 

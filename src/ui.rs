@@ -22,7 +22,6 @@ use ratatui::layout::Position;
 use ratatui::{prelude::*, widgets::*};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -1234,6 +1233,23 @@ fn tagline() -> &'static str {
     TAGLINES[seed % TAGLINES.len()]
 }
 
+// A signal leaves the interface through its own path, so that mpv is stopped and the
+// terminal restored. Windows has no such signals; there Ctrl+C arrives as a key below.
+#[cfg(unix)]
+fn terminated() -> Result<Arc<AtomicBool>> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let flag = Arc::new(AtomicBool::new(false));
+    for signal in [SIGTERM, SIGHUP, SIGINT] {
+        signal_hook::flag::register(signal, flag.clone())?;
+    }
+    Ok(flag)
+}
+
+#[cfg(not(unix))]
+fn terminated() -> Result<Arc<AtomicBool>> {
+    Ok(Arc::new(AtomicBool::new(false)))
+}
+
 pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(t!("Интерфейсу нужен интерактивный терминал. Для скриптов используйте search или play --first.").into());
@@ -1247,10 +1263,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
             "Не удалось определить путь библиотеки; укажите ui --library PATH"
         ))?;
     let library = load_library(&path)?;
-    let terminate = Arc::new(AtomicBool::new(false));
-    for signal in [SIGTERM, SIGHUP, SIGINT] {
-        signal_hook::flag::register(signal, terminate.clone())?;
-    }
+    let terminate = terminated()?;
     let mut app = App::new(session, path, library);
     app.setup = Setup::needed(&app.yt_dlp, &app.mpv);
     app.warm();
@@ -2746,12 +2759,36 @@ mod tests {
         assert_eq!(bar(1.0, 2.0, 3), "[] 0:01 / 0:02");
     }
 
-    fn script(name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("clicloud-{name}-{}", std::process::id()));
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    // A stand-in for an external program. What such a program is written in differs:
+    // `sh` on Unix, `cmd` on Windows, where the name must also say so.
+    fn script(name: &str, sh: &str, cmd: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "clicloud-{name}-{}{}",
+            std::process::id(),
+            if cfg!(windows) { ".cmd" } else { "" }
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = cmd;
+            fs::write(&path, format!("#!/bin/sh\n{sh}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = sh;
+            // A batch file is read line by line, and cmd loses a block of its own
+            // unless every line ends the way it expects, however this file is checked out.
+            let body = cmd.replace("\r\n", "\n").replace('\n', "\r\n");
+            fs::write(&path, format!("@echo off\r\n{body}\r\n")).unwrap();
+        }
         path
+    }
+
+    // A program that does nothing until it is stopped. `ping` is how a batch file
+    // waits; it keeps none of the inherited pipes, so stopping it is not waited for.
+    fn idle(name: &str) -> PathBuf {
+        script(name, "exec sleep 30", "ping -n 31 127.0.0.1 >nul 2>&1")
     }
 
     #[test]
@@ -2930,7 +2967,7 @@ mod tests {
 
     #[test]
     fn escape_cancels_a_running_search() {
-        let extractor = script("slow-search", "exec sleep 30");
+        let extractor = idle("slow-search");
         let mut app = app(PathBuf::new());
         app.yt_dlp = extractor.to_string_lossy().into_owned();
         app.search();
@@ -2951,7 +2988,7 @@ mod tests {
 
     #[test]
     fn failed_track_skips_to_the_next_until_too_many_fail_in_a_row() {
-        let player = script("idle-player", "exec sleep 30");
+        let player = idle("idle-player");
         let library =
             std::env::temp_dir().join(format!("clicloud-skip-test-{}.json", std::process::id()));
         let mut app = app(library.clone());
@@ -2995,6 +3032,15 @@ mod tests {
         let extractor = script(
             "fetch",
             r#"case "$*" in *broken*) echo 'ERROR: gone' >&2; exit 1;; esac; printf audio"#,
+            // `set /p` is how a batch file writes without a line break of its own, and
+            // the last status is the one of `findstr` until the exit below says otherwise.
+            r#"echo %*| findstr /c:broken >nul
+if not errorlevel 1 (
+echo ERROR: gone 1>&2
+exit /b 1
+)
+<nul set /p =audio
+exit /b 0"#,
         );
         let mut app = app(PathBuf::new());
         app.action(Action::Download);

@@ -3,13 +3,12 @@ mod lang;
 
 mod cache;
 mod config;
-#[cfg(unix)]
+mod ipc;
 mod playback;
 mod player;
 mod setup;
 mod soundcloud;
 mod theme;
-#[cfg(unix)]
 mod ui;
 
 use cache::Cache;
@@ -238,27 +237,19 @@ fn run(cli: Cli) -> Result<()> {
     };
     let provider = SoundCloud::new(extractor);
     match cli.command.unwrap_or(Action::Ui { library: None }) {
-        Action::Ui { library } => {
-            #[cfg(unix)]
-            ui::run(
-                ui::Session {
-                    yt_dlp: cli.yt_dlp,
-                    mpv: cli.mpv,
-                    proxy,
-                    direct: cli.no_proxy,
-                    cache,
-                    cache_dir,
-                    settings,
-                    config: config::path(cli.config.as_ref()),
-                },
-                library,
-            )?;
-            #[cfg(not(unix))]
-            {
-                let _ = library;
-                return Err(t!("TUI пока поддерживается на Unix.").into());
-            }
-        }
+        Action::Ui { library } => ui::run(
+            ui::Session {
+                yt_dlp: cli.yt_dlp,
+                mpv: cli.mpv,
+                proxy,
+                direct: cli.no_proxy,
+                cache,
+                cache_dir,
+                settings,
+                config: config::path(cli.config.as_ref()),
+            },
+            library,
+        )?,
         Action::Search { query, limit, json } => {
             let tracks = provider.search(&query, limit)?;
             if json {
