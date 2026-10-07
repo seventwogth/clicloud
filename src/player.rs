@@ -129,11 +129,7 @@ pub fn downloader(
     let mut command = extractor.command();
     command.current_dir(directory).args([
         "--socket-timeout",
-        if extractor.proxy.is_some() {
-            "30"
-        } else {
-            "15"
-        },
+        if extractor.proxied() { "30" } else { "15" },
         "--retries",
         "2",
         "--fragment-retries",

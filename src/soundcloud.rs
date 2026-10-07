@@ -40,6 +40,16 @@ pub struct Extractor<'a> {
 }
 
 impl Extractor<'_> {
+    /// Whether requests take a detour, set up here or in the environment. Such a
+    /// route, Tor above all, is slow to connect and gets more time.
+    pub fn proxied(&self) -> bool {
+        self.proxy.is_some()
+            || (!self.no_proxy
+                && ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]
+                    .iter()
+                    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty())))
+    }
+
     /// yt-dlp with the options shared by searching and downloading.
     pub fn command(&self) -> Command {
         // A relative path must keep pointing at the same file if the directory changes.
@@ -103,11 +113,7 @@ impl<'a> SoundCloud<'a> {
                 "--dump-single-json",
                 "--skip-download",
                 "--socket-timeout",
-                if self.extractor.proxy.is_some() {
-                    "45"
-                } else {
-                    "15"
-                },
+                if self.extractor.proxied() { "45" } else { "15" },
                 "--retries",
                 "2",
             ])

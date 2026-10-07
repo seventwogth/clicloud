@@ -714,4 +714,20 @@ fn proxy_search_has_longer_network_timeout() {
             .unwrap()
             .contains("--socket-timeout\n45\n")
     );
+    // A proxy from the environment is as slow as one configured here.
+    for (flag, expected) in [(None, "45"), (Some("--no-proxy"), "15")] {
+        let output = fixture
+            .command()
+            .env("HTTPS_PROXY", "http://127.0.0.1:8118")
+            .args(flag)
+            .args(["search", "ambient"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let log = fs::read_to_string(fixture.0.join("search.log")).unwrap();
+        assert!(
+            log.contains(&format!("--socket-timeout\n{expected}\n")),
+            "{log}"
+        );
+    }
 }
