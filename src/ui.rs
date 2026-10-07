@@ -2377,7 +2377,7 @@ mod tests {
 
         choose(&mut app, Setting::SearchLimit);
         app.adjust(1);
-        assert_eq!(app.settings.search_limit, 35);
+        assert_eq!(app.settings.search_limit, 15);
         (0..10).for_each(|_| app.adjust(-1));
         assert_eq!(app.value(Setting::SearchLimit), "5");
         choose(&mut app, Setting::SeekStep);

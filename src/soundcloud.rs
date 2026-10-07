@@ -118,8 +118,9 @@ impl<'a> SoundCloud<'a> {
         command
             .args([
                 "--flat-playlist",
-                // One track per line, written as it is found.
+                // One track per line, written as it is found instead of at the end.
                 "--dump-json",
+                "--lazy-playlist",
                 "--skip-download",
                 "--socket-timeout",
                 if self.extractor.proxied() { "45" } else { "15" },

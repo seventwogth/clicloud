@@ -5,7 +5,7 @@
   "cache_limit_mb": 1024,
   "theme": "terminal",
   "language": "ru",
-  "search_limit": 30,
+  "search_limit": 10,
   "seek_step": 10,
   "volume": 70
 }
