@@ -16,16 +16,27 @@ import termios
 import time
 
 
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
 def run(proxy=False, terminate=False):
     # Short path: the IPC socket below it must fit the Unix socket path limit on macOS.
     with tempfile.TemporaryDirectory(prefix="cc-", dir="/tmp") as directory:
         root = Path(directory)
         extractor = root / "yt-dlp"
         extractor.write_text('''#!/usr/bin/env python3
-import json, sys
+import json, os, sys, time
 if "--output" in sys.argv:
     sys.stdout.buffer.write(b"mock-audio")
 else:
+    if os.path.exists(os.environ["SLOW_SEARCH"]):
+        open(os.environ["SEARCH_PID"], "w").write(str(os.getpid()))
+        time.sleep(30)
     print(json.dumps({"entries":[{"title":"Night radio","uploader":"Test artist","duration":235,"webpage_url":"https://soundcloud.com/test/night"}]}))
 ''')
         player = root / "mpv"
@@ -69,7 +80,8 @@ if os.environ.get("MPV_LINGER"):
         env = dict(os.environ, TERM="xterm-256color", CLICLOUD_YT_DLP=str(extractor),
                    CLICLOUD_MPV=str(player), CLICLOUD_CONFIG=str(root / "config.json"),
                    IPC_LOG=str(root / "ipc.jsonl"), MPV_PID=str(root / "mpv.pid"),
-                   TMPDIR=str(temporary))
+                   TMPDIR=str(temporary), SLOW_SEARCH=str(root / "slow"),
+                   SEARCH_PID=str(root / "search.pid"))
         if terminate:
             env["MPV_LINGER"] = "1"
         env.pop("CLICLOUD_PROXY", None)
@@ -93,6 +105,14 @@ if os.environ.get("MPV_LINGER"):
 
         try:
             read_until(lambda: b"CLICLOUD" in output)
+            # Esc kills a hanging search; the next one must then run normally.
+            search_pid = root / "search.pid"
+            (root / "slow").touch()
+            os.write(master, b"/slow\r")
+            read_until(lambda: search_pid.exists() and search_pid.read_text())
+            os.write(master, b"\x1b")
+            read_until(lambda: not alive(int(search_pid.read_text())))
+            (root / "slow").unlink()
             os.write(master, b"/ambient\r")
             read_until(lambda: b"Night radio" in output)
             os.write(master, b"fa\r")
@@ -103,11 +123,7 @@ if os.environ.get("MPV_LINGER"):
                 process.wait(timeout=5)
                 assert process.returncode == 0, process.returncode
                 assert termios.tcgetattr(slave) == before, "Terminal mode was not restored"
-                try:
-                    os.kill(player_pid, 0)
-                    raise AssertionError("mpv outlived the client")
-                except ProcessLookupError:
-                    pass
+                assert not alive(player_pid), "mpv outlived the client"
                 assert not list(temporary.iterdir()), "IPC directory was not removed"
                 print("PASS: SIGTERM stops mpv, removes the IPC directory, restores the terminal")
                 return
@@ -123,7 +139,8 @@ if os.environ.get("MPV_LINGER"):
             saved = json.loads((root / "library.json").read_text())
             assert len(saved["favorites"]) == 1 and len(saved["recent"]) == 1
             assert not list(temporary.iterdir()), "IPC directory was not removed"
-            print("PASS: TUI search, favorites, queue, IPC controls, terminal cleanup; proxy=", proxy)
+            print("PASS: TUI search and its cancel, favorites, queue, IPC controls, terminal cleanup; proxy=",
+                  proxy)
         finally:
             if process.poll() is None:
                 process.kill()

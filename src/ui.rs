@@ -88,7 +88,11 @@ enum View {
     Search,
     Library,
     Queue,
+    Recent,
 }
+
+// A failed track must not stop the queue, but a dead network must not drain it either.
+const SKIP_LIMIT: u8 = 3;
 #[derive(Clone, Copy)]
 enum Action {
     View(View),
@@ -120,6 +124,7 @@ struct App {
     previous: Vec<Track>,
     current: Option<Track>,
     player: Option<Playback>,
+    failures: u8,
     volume: f64,
     query: String,
     editing: bool,
@@ -160,6 +165,7 @@ impl App {
             previous: vec![],
             current: None,
             player: None,
+            failures: 0,
             volume: 70.0,
             query: String::new(),
             editing: false,
@@ -181,6 +187,7 @@ impl App {
             View::Search => self.results.iter().collect(),
             View::Library => self.library.favorites.iter().collect(),
             View::Queue => self.queue.iter().collect(),
+            View::Recent => self.library.recent.iter().collect(),
         }
     }
     fn selected(&self) -> Option<Track> {
@@ -232,6 +239,7 @@ impl App {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         self.worker = Some(std::thread::spawn(move || {
             let result = SoundCloud::new(&binary, proxy.as_deref(), direct)
@@ -245,7 +253,14 @@ impl App {
         self.searching = true;
         self.editing = false;
         self.select_view(View::Search);
-        self.message = "Ищем треки в SoundCloud...".into();
+        self.message = "Ищем треки в SoundCloud... Esc - отмена".into();
+    }
+    fn cancel_search(&mut self) {
+        // The worker kills yt-dlp; its late result goes nowhere.
+        self.cancel.store(true, Ordering::Relaxed);
+        self.receiver = None;
+        self.searching = false;
+        self.message = "Поиск отменён".into();
     }
     fn start(&mut self, track: Track) {
         self.player = None;
@@ -290,6 +305,31 @@ impl App {
             self.message = "Очередь закончилась".into();
         }
     }
+    fn failed(&mut self, error: String, details: Option<String>) {
+        self.player = None;
+        self.failures += 1;
+        let mut report = error.clone();
+        if let Some(track) = &self.current {
+            report = format!("{} - {}\n{report}", track.artist, track.title);
+        }
+        if let Some(details) = details {
+            report = format!("{report}\n\n{details}");
+        }
+        if self.queue.is_empty() {
+            self.message = error;
+        } else if self.failures < SKIP_LIMIT {
+            self.next();
+            if self.player.is_none() {
+                // The next track did not even start; that error is already shown.
+                return;
+            }
+            self.message = "Трек не проигрался, включён следующий. e - подробности".into();
+        } else {
+            self.message =
+                "Очередь остановлена после нескольких ошибок подряд. e - подробности".into();
+        }
+        self.last_error = Some(report);
+    }
     fn control(&mut self, command: serde_json::Value) {
         if let Some(player) = &mut self.player {
             if let Err(error) = player.send(command) {
@@ -300,6 +340,12 @@ impl App {
         }
     }
     fn action(&mut self, action: Action) {
+        if matches!(
+            action,
+            Action::Play | Action::Pause | Action::Previous | Action::Next
+        ) {
+            self.failures = 0;
+        }
         match action {
             Action::Submit => self.search(),
             Action::View(view) => self.select_view(view),
@@ -316,6 +362,10 @@ impl App {
                         self.previous.push(current);
                     }
                     self.start(track);
+                    if self.view == View::Recent {
+                        // The started track moved to the top of the history.
+                        self.table.select(Some(0));
+                    }
                 }
             }
             Action::Favorite => {
@@ -416,18 +466,18 @@ impl App {
             let was_loaded = player.loaded;
             let result = player.tick();
             if !was_loaded && player.loaded {
-                self.message = "Воспроизведение. Space - пауза, n - следующий".into();
+                // After a skip the notice about the failed track stays on screen.
+                if self.failures == 0 {
+                    self.message = "Воспроизведение. Space - пауза, n - следующий".into();
+                }
+                self.failures = 0;
             }
             self.volume = player.volume;
             match result {
                 Ok(true) => self.next(),
                 Err(error) => {
-                    self.message = error.to_string();
-                    self.last_error = Some(match player.details() {
-                        Some(details) => format!("{}\n\n{details}", self.message),
-                        None => self.message.clone(),
-                    });
-                    self.player = None;
+                    let details = player.details();
+                    self.failed(error.to_string(), details);
                 }
                 _ => (),
             }
@@ -549,6 +599,7 @@ pub fn run(
                     KeyCode::Char('1') => app.select_view(View::Search),
                     KeyCode::Char('2') => app.select_view(View::Library),
                     KeyCode::Char('3') => app.select_view(View::Queue),
+                    KeyCode::Char('4') => app.select_view(View::Recent),
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.focus = None;
                         app.navigate(1);
@@ -568,6 +619,7 @@ pub fn run(
                                 .unwrap_or(app.hits.len().saturating_sub(1)),
                         )
                     }
+                    KeyCode::Esc if app.searching => app.cancel_search(),
                     KeyCode::Esc => app.focus = None,
                     KeyCode::Enter => app.action(
                         app.focus
@@ -783,7 +835,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(query)
             .block(
                 block(if app.searching {
-                    " ПОИСК: загрузка... "
+                    " ПОИСК: загрузка... Esc - отмена "
                 } else {
                     " / ПОИСК   Enter - найти "
                 })
@@ -812,10 +864,12 @@ fn draw_navigation(frame: &mut Frame, app: &mut App, area: Rect) {
         horizontal: 2,
         vertical: 1,
     });
+    let step = if nav.height >= 7 { 2 } else { 1 };
     for (i, (name, view)) in [
         ("1  Поиск", View::Search),
         ("2  Библиотека", View::Library),
         ("3  Очередь", View::Queue),
+        ("4  Недавние", View::Recent),
     ]
     .into_iter()
     .enumerate()
@@ -823,16 +877,16 @@ fn draw_navigation(frame: &mut Frame, app: &mut App, area: Rect) {
         button(
             frame,
             app,
-            Rect::new(nav.x, nav.y + i as u16 * 2, nav.width, 1),
+            Rect::new(nav.x, nav.y + i as u16 * step, nav.width, 1),
             &format!("{name:<width$}", width = usize::from(nav.width) - 2),
             Action::View(view),
             app.view == view,
         );
     }
-    if nav.height > 8 {
+    if nav.height > 10 {
         label(
             frame,
-            Rect::new(nav.x, nav.y + 7, nav.width, nav.height - 7),
+            Rect::new(nav.x, nav.y + 9, nav.width, nav.height - 9),
             format!(
                 "{} избранных\n{} в очереди\n\nЛокальная\nбиблиотека",
                 app.library.favorites.len(),
@@ -852,6 +906,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
         View::Search => " РЕЗУЛЬТАТЫ ",
         View::Library => " МОЯ БИБЛИОТЕКА ",
         View::Queue => " ОЧЕРЕДЬ ВОСПРОИЗВЕДЕНИЯ ",
+        View::Recent => " НЕДАВНИЕ ",
     };
     let tracks = app.tracks();
     if tracks.is_empty() {
@@ -864,6 +919,9 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             View::Queue => {
                 "\n\nМузыка без перерывов.\n\nНажмите a, чтобы добавить трек в очередь.\nСледующий трек запустится автоматически."
+            }
+            View::Recent => {
+                "\n\nИстория прослушивания.\n\nЗдесь появятся последние включённые треки.\nEnter - включить снова."
             }
         };
         frame.render_widget(
@@ -1059,7 +1117,7 @@ fn draw_help(frame: &mut Frame, size: Rect) {
     frame.render_widget(Clear, modal);
     let keys = [
         ("/", "Поиск (Enter отправляет, Esc отменяет)"),
-        ("1 / 2 / 3", "Поиск / библиотека / очередь"),
+        ("1 2 3 4", "Поиск / библиотека / очередь / недавние"),
         ("Up Down, j k", "Выбрать трек     Enter  Проиграть"),
         ("Tab", "Выбрать кнопку   Enter  Нажать"),
         ("f", "Добавить / удалить из избранного"),
@@ -1235,6 +1293,90 @@ mod tests {
         assert_eq!(progress(1.0, 2.0, 3), "[] 0:01 / 0:02");
     }
 
+    fn script(name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("clicloud-{name}-{}", std::process::id()));
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn escape_cancels_a_running_search() {
+        let extractor = script("slow-search", "exec sleep 30");
+        let mut app = app(PathBuf::new());
+        app.yt_dlp = extractor.to_string_lossy().into_owned();
+        app.search();
+        assert!(app.searching);
+        let started = std::time::Instant::now();
+        app.cancel_search();
+        assert!(!app.searching && app.message == "Поиск отменён");
+        app.worker.take().unwrap().join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        app.tick();
+        assert!(!app.details && app.last_error.is_none());
+        // The cancelled search must not block the next one.
+        app.search();
+        assert!(app.searching);
+        app.cancel_search();
+        fs::remove_file(extractor).unwrap();
+    }
+
+    #[test]
+    fn failed_track_skips_to_the_next_until_too_many_fail_in_a_row() {
+        let player = script("idle-player", "exec sleep 30");
+        let library =
+            std::env::temp_dir().join(format!("clicloud-skip-test-{}.json", std::process::id()));
+        let mut app = app(library.clone());
+        app.mpv = player.to_string_lossy().into_owned();
+        let numbered = |number: u8| Track {
+            url: format!("https://soundcloud.com/test/{number}"),
+            ..track()
+        };
+        app.current = Some(numbered(0));
+        app.queue = (1..=4).map(numbered).collect();
+
+        app.failed("boom".into(), Some("log line".into()));
+        assert_eq!(app.current.as_ref().unwrap().url, numbered(1).url);
+        assert!(app.player.is_some() && app.message.contains("включён следующий"));
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some("Test artist - Ночной эфир\nboom\n\nlog line")
+        );
+        app.failed("boom".into(), None);
+        assert_eq!(app.current.as_ref().unwrap().url, numbered(2).url);
+        app.failed("boom".into(), None);
+        assert!(app.player.is_none() && app.message.contains("Очередь остановлена"));
+        assert_eq!(app.queue.len(), 2);
+
+        // A manual start gives the queue a fresh chance.
+        app.action(Action::Next);
+        assert_eq!(app.current.as_ref().unwrap().url, numbered(3).url);
+        app.failed("boom".into(), None);
+        assert_eq!(app.current.as_ref().unwrap().url, numbered(4).url);
+        app.failed("last".into(), None);
+        assert!(app.player.is_none() && app.message == "last");
+        drop(app);
+        fs::remove_file(player).unwrap();
+        fs::remove_file(library).unwrap();
+    }
+
+    #[test]
+    fn recent_tracks_are_a_view_of_their_own() {
+        let mut app = app(PathBuf::new());
+        let other = Track {
+            url: "https://soundcloud.com/test/other".into(),
+            ..track()
+        };
+        app.library.recent = vec![other.clone(), track()];
+        app.select_view(View::Recent);
+        assert_eq!(app.selected().unwrap().url, other.url);
+        app.navigate(1);
+        assert_eq!(app.selected().unwrap().url, track().url);
+        app.action(Action::Enqueue);
+        assert_eq!(app.queue.len(), 1);
+    }
+
     #[test]
     fn queue_and_selection_handle_empty_lists() {
         let mut app = app(PathBuf::new());
@@ -1267,7 +1409,7 @@ mod tests {
             if width >= 80 {
                 assert!(text.contains("Ночной эфир"));
                 assert!(text.contains("ПЛЕЕР"));
-                assert!(app.hits.len() >= 14);
+                assert!(app.hits.len() >= 15);
                 for (rect, _) in &app.hits {
                     assert!(rect.right() <= width && rect.bottom() <= height);
                 }
