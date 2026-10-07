@@ -22,6 +22,7 @@ impl Fixture {
             r#"#!/bin/sh
 if [ "$1" = "--version" ]; then printf 'test-yt-dlp\n'; exit 0; fi
 printf '%s\n' "$@" > "$SEARCH_LOG"
+pwd > "$SEARCH_LOG.cwd"
 if [ "$FAIL_SEARCH" = "1" ]; then printf 'HTTP Error 429\n' >&2; exit 1; fi
 printf '%s\n' "$SEARCH_RESPONSE"
 "#,
@@ -31,6 +32,7 @@ printf '%s\n' "$SEARCH_RESPONSE"
             r#"#!/bin/sh
 if [ "$1" = "--version" ]; then printf 'test-mpv\n'; exit 0; fi
 printf '%s\n' "$@" > "$PLAYER_LOG"
+printf '%s\n' "${http_proxy-unset}" > "$PLAYER_PROXY"
 for arg in "$@"; do last="$arg"; done
 if [ "$last" = "-" ]; then cat > "$PLAYER_BYTES"; fi
 exit "${PLAYER_EXIT:-0}"
@@ -54,10 +56,16 @@ exit "${PLAYER_EXIT:-0}"
         command.env("CLICLOUD_YT_DLP", self.0.join("yt-dlp"))
             .env("CLICLOUD_CONFIG", self.0.join("config.json"))
             .env_remove("CLICLOUD_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("https_proxy")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("all_proxy")
+            .env_remove("ALL_PROXY")
             .env("CLICLOUD_MPV", self.0.join("mpv"))
             .env("SEARCH_LOG", self.0.join("search.log"))
             .env("PLAYER_LOG", self.0.join("player.log"))
             .env("PLAYER_BYTES", self.0.join("player.bytes"))
+            .env("PLAYER_PROXY", self.0.join("player.proxy"))
             .env("FAIL_SEARCH", "0")
             .env("PLAYER_EXIT", "0")
             .env("SEARCH_RESPONSE", r#"{"entries":[{"title":"Night","uploader":"Artist","duration":123,"webpage_url":"https://soundcloud.com/artist/night"}]}"#);
@@ -78,6 +86,12 @@ fn tor_routes_audio_through_downloader_pipe() {
     assert!(downloader.contains("--proxy\nsocks5h://127.0.0.1:9050\n"));
     assert!(downloader.contains("--downloader\nnative\n"));
     assert!(downloader.contains("--output\n-\n"));
+    // Fragment files of the downloader must land in a private directory that is removed.
+    let directory = fs::read_to_string(fixture.0.join("search.log.cwd")).unwrap();
+    let directory = std::path::Path::new(directory.trim());
+    assert!(directory.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    assert_ne!(directory, std::env::current_dir().unwrap());
+    assert!(!directory.exists());
     let player = fs::read_to_string(fixture.0.join("player.log")).unwrap();
     assert!(player.contains("--ytdl=no\n"));
     assert!(!player.contains("soundcloud.com"));
@@ -185,6 +199,24 @@ fn disabled_setting_and_explicit_direct_playback() {
             .unwrap()
             .contains("--ytdl-raw-options-append=proxy=\n")
     );
+}
+
+#[test]
+fn direct_playback_gives_mpv_the_proxy_that_yt_dlp_takes_from_the_environment() {
+    let fixture = Fixture::new();
+    let proxy = || fs::read_to_string(fixture.0.join("player.proxy")).unwrap();
+    let play = |command: &mut Command| {
+        let output = command
+            .env("HTTPS_PROXY", "http://127.0.0.1:8118")
+            .args(["play", "https://soundcloud.com/a/b"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    play(&mut fixture.command());
+    assert_eq!(proxy(), "http://127.0.0.1:8118\n");
+    play(fixture.command().arg("--no-proxy"));
+    assert_eq!(proxy(), "unset\n");
 }
 
 #[test]
@@ -322,6 +354,8 @@ fn play_first_passes_canonical_url_and_extractor_to_player() {
         "--script-opts-append=ytdl_hook-ytdl_path={}\n",
         fixture.0.join("yt-dlp").display()
     )));
+    assert!(args.contains("--script-opts-append=ytdl_hook-try_ytdl_first=yes\n"));
+    assert!(args.contains("--network-timeout=15\n"));
     assert!(args.ends_with("--\nhttps://soundcloud.com/artist/night\n"));
 }
 

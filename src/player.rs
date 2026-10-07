@@ -1,6 +1,7 @@
 use crate::{Result, soundcloud};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROXY_VARIABLES: [&str; 6] = [
     "http_proxy",
@@ -10,6 +11,19 @@ const PROXY_VARIABLES: [&str; 6] = [
     "HTTPS_PROXY",
     "ALL_PROXY",
 ];
+
+// The HTTP proxy that yt-dlp takes from the environment for HTTPS requests.
+fn https_proxy(variable: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let proxy = ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]
+        .into_iter()
+        .find_map(|name| variable(name).filter(|value| !value.is_empty()))?;
+    match proxy.split_once("://") {
+        None => Some(format!("http://{proxy}")),
+        Some(("http", _)) => Some(proxy),
+        // FFmpeg cannot use anything but a plain HTTP proxy.
+        Some(_) => None,
+    }
+}
 
 /// mpv with the options shared by `play` and the TUI.
 pub fn mpv(executable: &str) -> Command {
@@ -26,14 +40,23 @@ pub fn from_url(command: &mut Command, yt_dlp: &str, url: &str, no_proxy: bool) 
         .args([
             "--ytdl=yes",
             "--ytdl-format=bestaudio/best",
+            // Same limit as yt-dlp below; mpv's default stalls for a minute.
+            "--network-timeout=15",
             "--ytdl-raw-options=ignore-config=,no-cache-dir=,socket-timeout=15,retries=2",
         ])
-        .arg(format!("--script-opts-append=ytdl_hook-ytdl_path={yt_dlp}"));
+        .arg(format!("--script-opts-append=ytdl_hook-ytdl_path={yt_dlp}"))
+        // Otherwise mpv first opens the track page itself and only then asks yt-dlp;
+        // where soundcloud.com is unreachable that attempt hangs for a minute.
+        .arg("--script-opts-append=ytdl_hook-try_ytdl_first=yes");
     if no_proxy {
         for name in PROXY_VARIABLES {
             command.env_remove(name);
         }
         command.arg("--ytdl-raw-options-append=proxy=");
+    } else if let Some(proxy) = https_proxy(|name| std::env::var(name).ok()) {
+        // FFmpeg inside mpv only reads the lowercase http_proxy; without it the stream
+        // would bypass the proxy through which yt-dlp resolved it.
+        command.env("http_proxy", proxy);
     }
     command.arg("--").arg(url);
 }
@@ -43,10 +66,47 @@ pub fn from_pipe(command: &mut Command, source: ChildStdout) {
     command.args(["--ytdl=no", "--", "-"]).stdin(source);
 }
 
+/// A private directory for a player's socket, log and downloader fragments.
+pub fn scratch_directory() -> Result<PathBuf> {
+    let directory = std::env::temp_dir().join(format!(
+        "clicloud-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&directory)?;
+    Ok(directory)
+}
+
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// yt-dlp writing the audio of `url` to its stdout through `proxy`.
-pub fn downloader(yt_dlp: &str, url: &str, proxy: &str, progress: bool) -> Command {
-    let mut command = Command::new(yt_dlp);
-    command.args([
+///
+/// It keeps the fragment being downloaded in a file in its working directory and
+/// leaves it behind when stopped, so it runs in `directory`, which the caller removes.
+pub fn downloader(
+    yt_dlp: &str,
+    url: &str,
+    proxy: &str,
+    directory: &Path,
+    progress: bool,
+) -> Command {
+    // A relative path to the executable must keep pointing at the same file.
+    let program = Path::new(yt_dlp);
+    let mut command = if program.components().count() > 1 {
+        Command::new(std::path::absolute(program).unwrap_or_else(|_| program.into()))
+    } else {
+        Command::new(yt_dlp)
+    };
+    command.current_dir(directory).args([
         "--ignore-config",
         "--no-cache-dir",
         "--proxy",
@@ -213,7 +273,8 @@ fn play_through_proxy(
     signals: &Signals,
 ) -> Result<()> {
     eprintln!("Прокси: аудио через yt-dlp; перемотка ограничена, воспроизводится один трек.");
-    let mut source = downloader(yt_dlp, url, proxy, true)
+    let scratch = Scratch(scratch_directory()?);
+    let mut source = downloader(yt_dlp, url, proxy, &scratch.0, true)
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| format!("Не удалось запустить yt-dlp: {error}"))?;
@@ -239,4 +300,47 @@ fn play_through_proxy(
         return Err(format!("mpv завершился с {status}.").into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::https_proxy;
+
+    #[test]
+    fn picks_the_http_proxy_that_yt_dlp_would_use_for_https() {
+        let environment = |pairs: &'static [(&str, &str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        for (pairs, expected) in [
+            (&[][..], None),
+            (
+                &[("HTTPS_PROXY", "http://127.0.0.1:8118")][..],
+                Some("http://127.0.0.1:8118"),
+            ),
+            (
+                &[
+                    ("https_proxy", "localhost:3128"),
+                    ("HTTPS_PROXY", "http://other:1"),
+                ][..],
+                Some("http://localhost:3128"),
+            ),
+            (
+                &[("https_proxy", ""), ("ALL_PROXY", "http://all:8080")][..],
+                Some("http://all:8080"),
+            ),
+            (&[("ALL_PROXY", "socks5h://127.0.0.1:9050")][..], None),
+            (&[("http_proxy", "http://plain-http-only:1")][..], None),
+        ] {
+            assert_eq!(
+                https_proxy(environment(pairs)).as_deref(),
+                expected,
+                "{pairs:?}"
+            );
+        }
+    }
 }
