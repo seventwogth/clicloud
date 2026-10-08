@@ -1,0 +1,20 @@
+pkgbase = clicloud-bin
+	pkgdesc = Terminal music player built on yt-dlp and mpv (binary release)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/seventwogth/clicloud
+	arch = x86_64
+	license = MIT
+	depends = gcc-libs
+	depends = glibc
+	depends = mpv
+	depends = yt-dlp
+	depends = curl
+	optdepends = mpv-mpris: media keys and the player of the desktop panel
+	optdepends = tor: playing through Tor with --tor
+	provides = clicloud
+	conflicts = clicloud
+	source = https://github.com/seventwogth/clicloud/releases/download/v0.1.0/clicloud-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums = 23418663db767962587a43186384140ccff03674e63f322f444176e38c9bba5d
+
+pkgname = clicloud-bin

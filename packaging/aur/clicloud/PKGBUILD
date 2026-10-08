@@ -1,0 +1,41 @@
+# Maintainer: seventwogth <mxllywd at gmail dot com>
+pkgname=clicloud
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Terminal music player built on yt-dlp and mpv"
+arch=('x86_64' 'aarch64')
+url="https://github.com/seventwogth/clicloud"
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'mpv' 'yt-dlp' 'curl')
+makedepends=('cargo')
+optdepends=('mpv-mpris: media keys and the player of the desktop panel'
+            'tor: playing through Tor with --tor')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('97d2a0214d06e88e55d5efacc062cd5e74618b3a47a620a2f949bcd0bea17b7a')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm0755 -t "$pkgdir/usr/bin/" target/release/clicloud
+  install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE THIRD_PARTY_NOTICES
+  install -Dm0644 -t "$pkgdir/usr/share/doc/$pkgname/" README.md README.ru.md config.example.json
+}

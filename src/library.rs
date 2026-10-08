@@ -120,10 +120,22 @@ pub fn load(path: &PathBuf) -> Result<Library> {
     }
 }
 
+/// How long a transaction waits for the one before it: the interface saves on its
+/// own thread and must not stand still for longer.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Read, change and replace the library under one OS lock. The separate lock file
 /// stays in place: locking the JSON itself would stop protecting it after rename.
 /// Closing the handle releases the lock even if the process exits unexpectedly.
 pub fn update<T>(path: &PathBuf, change: impl FnOnce(&mut Library) -> T) -> Result<(T, Library)> {
+    update_within(path, LOCK_WAIT, change)
+}
+
+fn update_within<T>(
+    path: &PathBuf,
+    wait: std::time::Duration,
+    change: impl FnOnce(&mut Library) -> T,
+) -> Result<(T, Library)> {
     if path.file_name().is_none() {
         return Err(
             io::Error::new(io::ErrorKind::InvalidInput, "Invalid library file path").into(),
@@ -140,7 +152,7 @@ pub fn update<T>(path: &PathBuf, change: impl FnOnce(&mut Library) -> T) -> Resu
         .create(true)
         .truncate(false)
         .open(lock_path)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + wait;
     loop {
         match fs2::FileExt::try_lock_exclusive(&lock) {
             Ok(()) => break,
@@ -198,8 +210,11 @@ mod tests {
             .unwrap();
             return;
         }
+        // Writers that never pause take the lock from one another unfairly, and on a
+        // slow disk the last of them waits longer than a transaction is given. What is
+        // held here is that no addition is lost, not how long one waits for its turn.
         for index in 0..20 {
-            update(&path, |library| {
+            update_within(&path, std::time::Duration::from_secs(60), |library| {
                 library.merge([track(&format!(
                     "https://soundcloud.com/process-{}/track-{index}",
                     std::process::id()
@@ -249,7 +264,8 @@ mod tests {
         let mut children: Vec<_> = (0..4)
             .map(|_| {
                 std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "library::tests::writer_process"])
+                    // Uncaptured, what a writer fails with reaches the log of this test.
+                    .args(["--exact", "library::tests::writer_process", "--nocapture"])
                     .env("CLICLOUD_TEST_LIBRARY", &path)
                     .stdout(std::process::Stdio::null())
                     .spawn()

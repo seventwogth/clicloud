@@ -1,0 +1,22 @@
+# Maintainer: seventwogth <mxllywd at gmail dot com>
+pkgname=clicloud-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Terminal music player built on yt-dlp and mpv (binary release)"
+arch=('x86_64')
+url="https://github.com/seventwogth/clicloud"
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'mpv' 'yt-dlp' 'curl')
+optdepends=('mpv-mpris: media keys and the player of the desktop panel'
+            'tor: playing through Tor with --tor')
+provides=('clicloud')
+conflicts=('clicloud')
+source=("$url/releases/download/v$pkgver/clicloud-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+sha256sums=('23418663db767962587a43186384140ccff03674e63f322f444176e38c9bba5d')
+
+package() {
+  cd "clicloud-$pkgver-x86_64-unknown-linux-gnu"
+  install -Dm0755 -t "$pkgdir/usr/bin/" clicloud
+  install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE THIRD_PARTY_NOTICES
+  install -Dm0644 -t "$pkgdir/usr/share/doc/$pkgname/" README.md README.ru.md RELEASE_NOTES.md config.example.json
+}

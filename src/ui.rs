@@ -306,6 +306,11 @@ fn shuffled(mut tracks: Vec<Track>) -> Vec<Track> {
 const LIST_LIMIT: u16 = 500;
 // A failed track must not stop the queue, but a dead network must not drain it either.
 const SKIP_LIMIT: u8 = 3;
+// A track that is handed out encrypted fails whatever the network does, so it is no
+// sign of a dead one; a list of nothing else is still not walked to its end.
+const PROTECTED_LIMIT: u8 = 10;
+// What yt-dlp says of such a track.
+const PROTECTED: &str = "DRM protected";
 #[derive(Clone, Copy)]
 enum Action {
     View(View),
@@ -424,6 +429,8 @@ struct App {
     current: Option<Track>,
     player: Option<Playback>,
     failures: u8,
+    // How many of them were tracks that are handed out encrypted.
+    protected: u8,
     volume: f64,
     // How fast tracks play, for as long as the interface runs.
     speed: f64,
@@ -534,6 +541,7 @@ impl App {
             current: None,
             player: None,
             failures: 0,
+            protected: 0,
             speed: 1.0,
             covers: HashMap::new(),
             told: HashMap::new(),
@@ -1569,7 +1577,7 @@ impl App {
         if let Some(cache) = &self.cache {
             cache.find(&track.url);
         }
-        self.failures = 0;
+        (self.failures, self.protected) = (0, 0);
         self.library.recent.retain(|t| t.url != track.url);
         self.library.recent.insert(0, track.clone());
         self.library.recent.truncate(30);
@@ -1586,6 +1594,13 @@ impl App {
     fn failed(&mut self, error: String, details: Option<String>) {
         self.player = None;
         self.failures += 1;
+        let protected = details.as_deref().is_some_and(|d| d.contains(PROTECTED));
+        let error = if protected {
+            self.protected += 1;
+            t!("Трек защищён DRM: воспроизвести его нельзя.").into()
+        } else {
+            error
+        };
         // Marked in its lists until it plays: for this run, since the network may be
         // the reason as well as the track.
         if let Some(name) = self.current.as_ref().and_then(|t| cache::key(&t.url)) {
@@ -1600,13 +1615,18 @@ impl App {
         }
         if !self.more() {
             self.message = error;
-        } else if self.failures < SKIP_LIMIT {
+        } else if self.failures - self.protected < SKIP_LIMIT && self.protected < PROTECTED_LIMIT {
             self.next();
             if self.player.is_none() {
                 // The next track did not even start; that error is already shown.
                 return;
             }
-            self.message = t!("Трек не проигрался, включён следующий. e - подробности").into();
+            self.message = if protected {
+                t!("Трек защищён DRM, включён следующий. e - подробности")
+            } else {
+                t!("Трек не проигрался, включён следующий. e - подробности")
+            }
+            .into();
         } else {
             self.message =
                 t!("Очередь остановлена после нескольких ошибок подряд. e - подробности").into();
@@ -1833,7 +1853,7 @@ impl App {
             action,
             Action::Play | Action::Pause | Action::Previous | Action::Next
         ) {
-            self.failures = 0;
+            (self.failures, self.protected) = (0, 0);
         }
         match action {
             Action::Submit => self.search(),
@@ -2126,8 +2146,13 @@ impl App {
                 if !details.is_empty() {
                     report = format!("{report}\n\n{}", details.join("\n"));
                 }
+                self.message = if details.iter().any(|line| line.contains(PROTECTED)) {
+                    t!("Трек защищён DRM: в кеш он не загрузится. e - подробности")
+                } else {
+                    t!("Трек не загрузился в кеш. e - подробности")
+                }
+                .into();
                 self.last_error = Some(report);
-                self.message = t!("Трек не загрузился в кеш. e - подробности").into();
             }
             self.fetch = None;
             self.fetch_next();
@@ -2191,7 +2216,7 @@ impl App {
                     }
                     .into();
                 }
-                self.failures = 0;
+                (self.failures, self.protected) = (0, 0);
             }
             self.volume = player.volume;
             let (advanced, astray) = (player.advanced(), player.astray());
@@ -6006,6 +6031,59 @@ exit /b 1"#,
         assert_eq!(app.current.as_ref().unwrap().url, numbered(4).url);
         app.failed("last".into(), None);
         assert!(app.player.is_none() && app.message == "last");
+        drop(app);
+        fs::remove_file(player).unwrap();
+        fs::remove_file(library).unwrap();
+    }
+
+    #[test]
+    fn a_protected_track_is_named_and_is_no_sign_of_a_dead_network() {
+        lang::set(Lang::Russian);
+        let player = idle("idle-protected");
+        let library = std::env::temp_dir().join(format!(
+            "clicloud-protected-test-{}.json",
+            std::process::id()
+        ));
+        let mut app = app(library.clone());
+        app.mpv = player.to_string_lossy().into_owned();
+        let numbered = |number: u8| Track {
+            url: format!("https://soundcloud.com/test/{number}"),
+            ..track()
+        };
+        let said = || Some("ERROR: [soundcloud] 1: This video is DRM protected".to_owned());
+        app.current = Some(numbered(0));
+        app.queue = (1..=20).map(numbered).collect();
+
+        // More of them in a row than failures are allowed, and the queue goes on.
+        for number in 1..=4 {
+            app.failed("boom".into(), said());
+            assert_eq!(app.current.as_ref().unwrap().url, numbered(number).url);
+            assert!(app.player.is_some() && app.message.contains("защищён DRM, включён следующий"));
+        }
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some(
+                "Test artist - Ночной эфир\nТрек защищён DRM: воспроизвести его нельзя.\n\n\
+                 ERROR: [soundcloud] 1: This video is DRM protected"
+            )
+        );
+        // Failures of another kind are counted by themselves, as before.
+        app.failed("boom".into(), None);
+        app.failed("boom".into(), None);
+        assert_eq!(app.current.as_ref().unwrap().url, numbered(6).url);
+        app.failed("boom".into(), None);
+        assert!(app.player.is_none() && app.message.contains("Очередь остановлена"));
+
+        // A list of nothing else is not walked to its end.
+        app.action(Action::Next);
+        assert_eq!(app.current.as_ref().unwrap().url, numbered(7).url);
+        for _ in 1..PROTECTED_LIMIT {
+            app.failed("boom".into(), said());
+            assert!(app.player.is_some());
+        }
+        app.failed("boom".into(), said());
+        assert!(app.player.is_none() && app.message.contains("Очередь остановлена"));
+        assert_eq!(app.queue.len(), 4);
         drop(app);
         fs::remove_file(player).unwrap();
         fs::remove_file(library).unwrap();

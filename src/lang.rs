@@ -251,6 +251,21 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "再生できず、次の曲に移りました。e - 詳細",
     ),
     (
+        "Трек защищён DRM: воспроизвести его нельзя.",
+        "The track is DRM protected and cannot be played.",
+        "この曲は DRM で保護されており、再生できません。",
+    ),
+    (
+        "Трек защищён DRM, включён следующий. e - подробности",
+        "The track is DRM protected, the next one is on. e - details",
+        "DRM で保護された曲のため、次の曲に移りました。e - 詳細",
+    ),
+    (
+        "Трек защищён DRM: в кеш он не загрузится. e - подробности",
+        "The track is DRM protected and cannot be stored. e - details",
+        "この曲は DRM で保護されており、保存できません。e - 詳細",
+    ),
+    (
         "Очередь остановлена после нескольких ошибок подряд. e - подробности",
         "The queue stopped after several failures in a row. e - details",
         "エラーが続いたためキューを停止しました。e - 詳細",

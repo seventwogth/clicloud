@@ -35,6 +35,40 @@ MM.           MM      ,   MM MM.           MM      , MM.      ,MP MM       M    
 Rust нужен только для самостоятельной сборки, а в командах ниже вместо
 `cargo run --` тогда пишется `clicloud`.
 
+Linux, в `~/.local/bin`:
+
+```sh
+v=0.1.0
+base=https://github.com/seventwogth/clicloud/releases/download/v$v
+curl -LO $base/clicloud-$v-x86_64-unknown-linux-gnu.tar.gz
+curl -LO $base/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+tar xzf clicloud-$v-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 clicloud-$v-x86_64-unknown-linux-gnu/clicloud ~/.local/bin/clicloud
+clicloud doctor
+```
+
+Windows, в PowerShell; две суммы, которые он напечатает, должны совпасть:
+
+```powershell
+$v    = "0.1.0"
+$zip  = "clicloud-$v-x86_64-pc-windows-msvc.zip"
+$base = "https://github.com/seventwogth/clicloud/releases/download/v$v"
+Invoke-WebRequest "$base/$zip" -OutFile $zip
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
+(Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+Select-String $zip SHA256SUMS
+Expand-Archive $zip -DestinationPath "$env:LOCALAPPDATA\Programs"
+$dir = "$env:LOCALAPPDATA\Programs\clicloud-$v-x86_64-pc-windows-msvc"
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User")
+```
+
+Чтобы изменённый PATH подействовал, откройте новый терминал. mpv для Windows
+перечислен на [mpv.io](https://mpv.io/installation/), а yt-dlp клиент
+предложит скачать сам. Бинарники не подписаны: архиву, скачанному браузером,
+запуск разрешают командой `Unblock-File` в Windows до распаковки и
+`xattr -d com.apple.quarantine clicloud` в macOS.
+
 Нужны Rust/Cargo 1.88+ (edition 2024), `yt-dlp` не старше 2023.01 (поиск
 использует `--lazy-playlist`) и `mpv` с поддержкой встроенного `ytdl_hook`
 (обычная сборка с Lua).
@@ -603,6 +637,9 @@ API. Работа зависит от текущего экстрактора
 yt-dlp; при ошибках сначала обновите его (`pipx upgrade yt-dlp`). Наличие
 результата поиска не гарантирует воспроизведение: приватные, платные,
 удалённые и недоступные в регионе треки могут выдавать ошибку или превью.
+Треки, которые SoundCloud отдаёт только зашифрованными, в основном это треки
+крупных лейблов, защищены DRM и не играют совсем: клиент сообщает об этом и
+включает следующий.
 Вход в аккаунт и синхронизация с библиотекой SoundCloud не поддерживаются:
 перенос только добавляет в избранное лайки, видимые в профиле.
 Кеш хранит треки в исходном виде и без тегов; это не экспорт коллекции.

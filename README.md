@@ -35,6 +35,40 @@ are installed separately, as below (on macOS `brew install mpv yt-dlp`); Rust
 is needed only to build the client yourself, and the commands further down
 then read `clicloud` in place of `cargo run --`.
 
+Linux, into `~/.local/bin`:
+
+```sh
+v=0.1.0
+base=https://github.com/seventwogth/clicloud/releases/download/v$v
+curl -LO $base/clicloud-$v-x86_64-unknown-linux-gnu.tar.gz
+curl -LO $base/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+tar xzf clicloud-$v-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 clicloud-$v-x86_64-unknown-linux-gnu/clicloud ~/.local/bin/clicloud
+clicloud doctor
+```
+
+Windows, in PowerShell; the two sums it prints must be the same:
+
+```powershell
+$v    = "0.1.0"
+$zip  = "clicloud-$v-x86_64-pc-windows-msvc.zip"
+$base = "https://github.com/seventwogth/clicloud/releases/download/v$v"
+Invoke-WebRequest "$base/$zip" -OutFile $zip
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
+(Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+Select-String $zip SHA256SUMS
+Expand-Archive $zip -DestinationPath "$env:LOCALAPPDATA\Programs"
+$dir = "$env:LOCALAPPDATA\Programs\clicloud-$v-x86_64-pc-windows-msvc"
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User")
+```
+
+Open a new terminal for the changed PATH. mpv for Windows is listed on
+[mpv.io](https://mpv.io/installation/), and yt-dlp the client offers to fetch
+itself. The binaries are not signed: an archive that came through a browser
+is let run with `Unblock-File` on Windows before it is extracted, and with
+`xattr -d com.apple.quarantine clicloud` on macOS.
+
 You need Rust/Cargo 1.88+ (edition 2024), `yt-dlp` no older than 2023.01 (the
 search uses `--lazy-playlist`) and `mpv` with its built-in `ytdl_hook` (the
 usual build with Lua).
@@ -624,7 +658,10 @@ is not endorsed by it, and the name SoundCloud belongs to its owner. This is
 not the official SoundCloud API. It depends on the current extractor
 of yt-dlp; when something fails, update that first (`pipx upgrade yt-dlp`). A
 search result is no promise of playback: private, paid, deleted and
-region-locked tracks may give an error or a preview. Signing in to an account
+region-locked tracks may give an error or a preview. Tracks that SoundCloud
+hands out encrypted only, those of the large labels for the most part, are
+protected by DRM and do not play at all: the client says so and goes on to the
+next one. Signing in to an account
 and synchronizing with a SoundCloud library are not supported: bringing likes
 over only adds the likes that are visible in a profile to the favorites. The
 cache keeps tracks as they come and without tags; it is not an export of a

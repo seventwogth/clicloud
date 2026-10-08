@@ -1,7 +1,9 @@
 # Preparing a release
 
 1. Set the version in `Cargo.toml`, update `Cargo.lock`, and write
-   `docs/releases/vVERSION.md`.
+   `docs/releases/vVERSION.md`. Set the same version in the download commands of
+   both READMEs. The READMEs and the notes are packed into the archives, so
+   finish them before the archives are built.
 2. Run CI on the exact commit: Linux, macOS (Apple Silicon and Intel), Windows,
    and Rust 1.88. CI includes the multiprocess library tests; Unix jobs also run
    CLI integration and PTY smoke tests.
@@ -14,8 +16,12 @@
    SHA-256 checksums. Artifacts are available from the workflow run.
 5. Enable the workflow's `draft` input to also create a draft GitHub Release.
    Inspect its archives, notes and checksums before publishing it. The draft uses
-   the version from Cargo and targets the workflow's exact commit. Existing
-   releases are not overwritten; an attempt to create one again fails.
+   the version from Cargo and targets the workflow's exact commit. A published
+   release is not overwritten: creating one for its tag again fails. A draft has
+   no tag yet, so a second run adds another draft of the same name beside the
+   first; delete a stale draft on the releases page before running again.
+6. After publishing, set `pkgver` and the checksums in `packaging/aur/*/PKGBUILD`
+   and write each `.SRCINFO` again with `makepkg --printsrcinfo > .SRCINFO`.
 
 The release workflow does not publish a release automatically. A successful
 offline CI run does not establish that SoundCloud is reachable from users' networks.
