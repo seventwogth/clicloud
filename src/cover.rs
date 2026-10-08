@@ -25,14 +25,18 @@ pub struct Cover {
 pub enum Mode {
     Blocks,
     Braille,
+    BlockScheme,
+    BrailleScheme,
     BlockTones,
     BrailleTones,
     Off,
 }
 
-pub const MODES: [(&str, Mode); 5] = [
+pub const MODES: [(&str, Mode); 7] = [
     ("blocks", Mode::Blocks),
     ("braille", Mode::Braille),
+    ("block-scheme", Mode::BlockScheme),
+    ("braille-scheme", Mode::BrailleScheme),
     ("block-tones", Mode::BlockTones),
     ("braille-tones", Mode::BrailleTones),
     ("none", Mode::Off),
@@ -57,8 +61,11 @@ pub struct Cell {
 }
 
 /// What the scheme lets a picture be drawn with.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Palette {
+    /// The colors of the scheme itself, for a picture that is to be made of them;
+    /// none where the scheme leaves its colors to the terminal.
+    pub scheme: Vec<Rgb>,
     /// Whether cells may be colored at all; without it marks alone make the picture.
     pub colors: bool,
     /// The two colors that tones run between, the darker first.
@@ -71,6 +78,45 @@ pub struct Palette {
 fn light(color: Rgb) -> f64 {
     (0.299 * f64::from(color[0]) + 0.587 * f64::from(color[1]) + 0.114 * f64::from(color[2]))
         / 255.0
+}
+
+// The one of `colors` that is nearest to `color`, which is itself where there are none.
+fn nearest(color: [f64; 3], colors: &[Rgb]) -> Rgb {
+    let apart = |other: &Rgb| -> f64 {
+        (0..3)
+            .map(|channel| (color[channel] - f64::from(other[channel])).powi(2))
+            .sum()
+    };
+    (colors.iter())
+        .min_by(|a, b| apart(a).total_cmp(&apart(b)))
+        .copied()
+        .unwrap_or(color.map(|channel| channel.clamp(0.0, 255.0) as u8))
+}
+
+// The points of a picture, each the nearest of `colors` to it. What a point is off by
+// goes to its neighbors still to come, so that an area keeps its color on the whole,
+// made of the two or three colors of the scheme that it lies between.
+fn fit(points: &[Rgb], width: usize, colors: &[Rgb]) -> Vec<Rgb> {
+    let mut wanted: Vec<[f64; 3]> = (points.iter()).map(|point| point.map(f64::from)).collect();
+    let height = wanted.len() / width.max(1);
+    let mut fitted = Vec::with_capacity(wanted.len());
+    for y in 0..height {
+        for x in 0..width {
+            let at = y * width + x;
+            let color = nearest(wanted[at], colors);
+            fitted.push(color);
+            for (across, down, share) in [(1, 0, 7.0), (-1, 1, 3.0), (0, 1, 5.0), (1, 1, 1.0)] {
+                let (nx, ny) = (x as isize + across, y + down);
+                if nx >= 0 && (nx as usize) < width && ny < height {
+                    for channel in 0..3 {
+                        let rest = wanted[at][channel] - f64::from(color[channel]);
+                        wanted[ny * width + nx as usize][channel] += rest * share / 16.0;
+                    }
+                }
+            }
+        }
+    }
+    fitted
 }
 
 fn blend(from: Rgb, to: Rgb, share: f64) -> Rgb {
@@ -119,16 +165,20 @@ impl Cover {
 
     /// The picture in `columns` by `rows` cells. A cell is twice as tall as it is
     /// wide, so a square picture takes twice as many columns as rows.
-    pub fn cells(&self, columns: usize, rows: usize, mode: Mode, palette: Palette) -> Vec<Cell> {
+    pub fn cells(&self, columns: usize, rows: usize, mode: Mode, palette: &Palette) -> Vec<Cell> {
         let tone = |light: f64| blend(palette.tones.0, palette.tones.1, light.clamp(0.0, 1.0));
         match mode {
             Mode::Off => Vec::new(),
             // Two pixels to a cell: the upper half is the mark, the lower what is behind.
-            Mode::Blocks | Mode::BlockTones if palette.colors => {
-                let points = self.grid(columns, rows * 2);
+            Mode::Blocks | Mode::BlockScheme | Mode::BlockTones if palette.colors => {
+                let mut points = self.grid(columns, rows * 2);
+                // Made of the colors of the scheme, where it has any of its own.
+                if mode == Mode::BlockScheme && !palette.scheme.is_empty() {
+                    points = fit(&points, columns, &palette.scheme);
+                }
                 let shade = |point: Rgb| match mode {
-                    Mode::Blocks => point,
-                    _ => tone(light(point)),
+                    Mode::BlockTones => tone(light(point)),
+                    _ => point,
                 };
                 (0..rows * columns)
                     .map(|cell| {
@@ -142,7 +192,7 @@ impl Cover {
                     .collect()
             }
             // Without colors a half is either there or not.
-            Mode::Blocks | Mode::BlockTones => {
+            Mode::Blocks | Mode::BlockScheme | Mode::BlockTones => {
                 let marked = dither(&self.grid(columns, rows * 2), columns, palette.light_marks);
                 (0..rows * columns)
                     .map(|cell| {
@@ -164,7 +214,7 @@ impl Cover {
             }
             // Eight dots to a cell, two across and four down; the cell has one color
             // for all of them, that of what its dots stand for.
-            Mode::Braille | Mode::BrailleTones => {
+            Mode::Braille | Mode::BrailleScheme | Mode::BrailleTones => {
                 const DOTS: [[u32; 2]; 4] =
                     [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
                 let width = columns * 2;
@@ -187,6 +237,21 @@ impl Cover {
                         let mean = sum.map(|channel| (channel / count.max(1)) as u8);
                         let color = match mode {
                             Mode::Braille => mean,
+                            // The color of the scheme nearest to what the dots stand
+                            // for, but not the one behind them: dots would vanish.
+                            Mode::BrailleScheme if !palette.scheme.is_empty() => {
+                                let behind = if palette.light_marks {
+                                    palette.tones.0
+                                } else {
+                                    palette.tones.1
+                                };
+                                let apart: Vec<Rgb> = (palette.scheme.iter())
+                                    .filter(|color| **color != behind)
+                                    .copied()
+                                    .collect();
+                                nearest(mean.map(f64::from), &apart)
+                            }
+                            Mode::BrailleScheme => mean,
                             // Dots are thin: a tone too near to what is behind them is lost.
                             _ if palette.light_marks => tone(0.45 + 0.55 * light(mean)),
                             _ => tone(0.55 * light(mean)),
@@ -325,12 +390,13 @@ mod tests {
         Cover::new(&bytes).unwrap()
     }
 
-    fn palette(colors: bool, light_marks: bool) -> Palette {
-        Palette {
+    fn palette(colors: bool, light_marks: bool) -> &'static Palette {
+        Box::leak(Box::new(Palette {
+            scheme: vec![[0, 0, 40], [200, 200, 255], [250, 60, 60], [60, 200, 60]],
             colors,
             tones: ([0, 0, 40], [200, 200, 255]),
             light_marks,
-        }
+        }))
     }
 
     fn text(cells: &[Cell], columns: usize) -> Vec<String> {
@@ -358,6 +424,31 @@ mod tests {
         assert_eq!(cells[7].fg, Some([200, 200, 255]));
         let red = cells[31].bg.unwrap();
         assert!(red[0] > 0 && red[0] < 200 && red[0] == red[1], "{red:?}");
+
+        // Made of the colors of the scheme: each point the nearest of them, the red
+        // of the picture the red of the scheme.
+        let cells = cover.cells(8, 4, Mode::BlockScheme, palette(true, true));
+        let scheme = &palette(true, true).scheme;
+        assert!(cells.iter().all(|cell| {
+            scheme.contains(&cell.fg.unwrap()) && scheme.contains(&cell.bg.unwrap())
+        }));
+        assert_eq!(
+            (cells[0].fg, cells[7].fg),
+            (Some([0, 0, 40]), Some([200, 200, 255]))
+        );
+        assert_eq!(cells[31].bg, Some([250, 60, 60]));
+        let cells = cover.cells(8, 4, Mode::BrailleScheme, palette(true, true));
+        assert_eq!(
+            (cells[4].fg, cells[31].fg),
+            (Some([200, 200, 255]), Some([250, 60, 60]))
+        );
+        // A scheme with no colors of its own leaves the picture its own.
+        let plain = Palette {
+            scheme: vec![],
+            ..palette(true, true).clone()
+        };
+        let cells = cover.cells(8, 4, Mode::BlockScheme, &plain);
+        assert_eq!(cells[31].bg, Some([255, 0, 0]));
 
         // Dots: light ones for what is light, colored by what they stand for.
         let cells = cover.cells(8, 4, Mode::Braille, palette(true, true));
@@ -389,6 +480,7 @@ mod tests {
         assert_eq!((cells[0].fg, cells[199].fg), (Some([0; 3]), Some([255; 3])));
 
         assert_eq!(Mode::parse("braille-tones"), Mode::BrailleTones);
+        assert_eq!(Mode::parse("block-scheme"), Mode::BlockScheme);
         assert_eq!(Mode::parse("sixel"), Mode::Off);
     }
 
