@@ -99,6 +99,19 @@ impl Cache {
         self.root.join("audio")
     }
 
+    /// All that was looked up of the track at `url`, kept for its screen.
+    pub fn info(&self, url: &str) -> Option<Details> {
+        let text = fs::read(self.root.join("info").join(key(url)?)).ok()?;
+        Details::parse(&text)
+    }
+
+    /// Keeps what was looked up of the track at `url`.
+    pub fn note(&self, url: &str, details: &Details) {
+        if let Some(key) = key(url) {
+            let _ = write_info(&self.root.join("info"), &key, details);
+        }
+    }
+
     /// The pictures of tracks as pixels, each in a file named like the audio.
     pub fn art(&self) -> PathBuf {
         self.root.join("art")
@@ -222,7 +235,7 @@ impl Cache {
 
     /// Removes the audio, unfinished downloads and what yt-dlp has stored.
     pub fn clear(&self) -> io::Result<()> {
-        for name in ["audio", "tracks", "art", "partial", "yt-dlp"] {
+        for name in ["audio", "tracks", "art", "info", "partial", "yt-dlp"] {
             match fs::remove_dir_all(self.root.join(name)) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
                 _ => (),
@@ -272,6 +285,10 @@ impl Partial {
                 });
             noted.apply(&mut track);
             self.track = Some(track).filter(|track| !track.title.is_empty());
+            // The rest of it is kept too, for the screen of the track.
+            if let (Some(root), Some(key)) = (self.details.parent(), key(&self.url)) {
+                let _ = write_info(&root.join("info"), &key, &noted);
+            }
         }
         let path = self.path();
         if fs::metadata(&path)?.len() == 0 {
@@ -335,6 +352,11 @@ fn files(directory: &Path) -> Vec<(SystemTime, u64, PathBuf)> {
             Some((metadata.modified().ok()?, metadata.len(), entry.path()))
         })
         .collect()
+}
+
+fn write_info(directory: &Path, key: &str, details: &Details) -> io::Result<()> {
+    private_directory(directory)?;
+    fs::write(directory.join(key), serde_json::to_vec(details)?)
 }
 
 fn write_details(directory: &Path, key: &str, track: &Track) -> io::Result<()> {
