@@ -335,7 +335,14 @@ fn run(cli: Cli) -> Result<()> {
                 clean(&url),
                 t!("Пробел: пауза; ←/→: перемотка; 9/0: громкость; q: выход.")
             );
-            player::play(&cli.mpv, extractor, &url, found.as_ref(), cache.as_ref())?;
+            player::play(
+                &cli.mpv,
+                extractor,
+                &url,
+                found.as_ref(),
+                cache.as_ref(),
+                settings.sound(),
+            )?;
         }
         Action::Import {
             profile,

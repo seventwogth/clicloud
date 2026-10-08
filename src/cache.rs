@@ -121,6 +121,11 @@ impl Cache {
         self.path(url).is_some_and(|path| path.is_file())
     }
 
+    /// The stored audio of `url`, without noting a use of it.
+    pub fn stored(&self, url: &str) -> Option<PathBuf> {
+        self.path(url).filter(|path| path.is_file())
+    }
+
     /// The stored audio of `url`, noted as used just now.
     pub fn find(&self, url: &str) -> Option<PathBuf> {
         let path = self.path(url).filter(|path| path.is_file())?;

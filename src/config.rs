@@ -33,6 +33,11 @@ pub struct Settings {
     pub seek_step: u16,
     /// The volume the interface starts with.
     pub volume: u8,
+    /// Whether tracks are brought to one loudness.
+    pub normalize: bool,
+    /// The device mpv plays on, by the name it knows it by; mpv chooses without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_device: Option<String>,
     /// Whether a list plays in an order of chance.
     pub shuffle: bool,
     /// What happens at the end of a list: off, all or one.
@@ -58,6 +63,8 @@ impl Default for Settings {
             search_limit: 10,
             seek_step: 10,
             volume: 70,
+            normalize: false,
+            audio_device: None,
             shuffle: false,
             repeat: "off".into(),
             soundcloud_profile: None,
@@ -111,6 +118,14 @@ pub fn load(explicit: Option<&PathBuf>) -> Result<Settings> {
 }
 
 impl Settings {
+    /// How mpv is to sound.
+    pub fn sound(&self) -> crate::player::Sound<'_> {
+        crate::player::Sound {
+            normalize: self.normalize,
+            device: self.audio_device.as_deref(),
+        }
+    }
+
     pub fn proxy(
         &self,
         override_proxy: Option<&str>,

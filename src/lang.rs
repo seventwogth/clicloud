@@ -580,7 +580,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Previous / next track",
         "前の曲 / 次の曲",
     ),
-    ("Перемотка", "Seek", "シーク"),
+    (
+        "Перемотка        , .  Медленнее / быстрее",
+        "Seek             , .  Slower / faster",
+        "シーク           , .  遅く / 速く",
+    ),
     (
         "Громкость    s  Стоп    q  Выход",
         "Volume       s  Stop    q  Quit",
@@ -994,6 +998,25 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "All of the list to favorites / list before",
         "一覧をすべてお気に入りへ / 前の一覧へ",
     ),
+    ("Ровная громкость", "Even loudness", "音量をそろえる"),
+    ("Аудиоустройство", "Audio device", "オーディオ機器"),
+    (
+        "Enter - включить или выключить: тихие и громкие треки\nприводятся к одной громкости. Действует со следующего трека.",
+        "Enter - switch on or off: quiet and loud tracks are brought\nto one loudness. Applies from the next track.",
+        "Enter - オンとオフ: 小さい曲と大きい曲の音量を\nそろえます。次の曲から有効になります。",
+    ),
+    (
+        "Enter или Left/Right - следующее из устройств, что видит mpv.\nавто оставляет выбор за ним. Действует сразу.",
+        "Enter or Left/Right - the next of the devices that mpv sees.\nauto leaves the choice to it. Applies at once.",
+        "Enter か Left/Right - mpv が見つけた次の機器に切り替えます。\n自動は mpv に任せます。すぐに有効になります。",
+    ),
+    ("авто", "auto", "自動"),
+    (
+        "mpv не назвал ни одного устройства",
+        "mpv named no device",
+        "mpv から機器の一覧を取得できません",
+    ),
+    ("Скорость: x{}", "Speed: x{}", "速度: x{}"),
 ];
 
 #[cfg(test)]
