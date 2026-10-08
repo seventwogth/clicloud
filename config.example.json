@@ -9,6 +9,7 @@
   "search_limit": 10,
   "seek_step": 10,
   "volume": 70,
+  "cover": "blocks",
   "normalize": false,
   "shuffle": false,
   "repeat": "off"

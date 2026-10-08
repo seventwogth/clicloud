@@ -78,14 +78,14 @@ pub fn mpv() -> String {
 pub fn install(proxy: Option<&str>, directory: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(directory)?;
     let sums = directory.join("SHA2-256SUMS");
-    let listed = fetch(proxy, &format!("{RELEASE}/SHA2-256SUMS"), &sums)
+    let listed = fetch(proxy, &format!("{RELEASE}/SHA2-256SUMS"), &sums, 900)
         .and_then(|()| Ok(std::fs::read_to_string(&sums)?));
     let _ = std::fs::remove_file(&sums);
     let expected = published(&listed?, asset())
         .ok_or_else(|| t!("В релизе yt-dlp нет суммы для {}", asset()))?;
     let partial = directory.join(format!("{}.part", name()));
     let fetched = (|| -> Result<PathBuf> {
-        fetch(proxy, &url(), &partial)?;
+        fetch(proxy, &url(), &partial, 900)?;
         let sum = sha256(&std::fs::read(&partial)?);
         if sum != expected {
             return Err(t!("Сумма не совпала: {} вместо {}", sum, expected).into());
@@ -106,7 +106,7 @@ pub fn install(proxy: Option<&str>, directory: &Path) -> Result<PathBuf> {
 }
 
 /// Downloads `url` into `file` with curl, which every platform we run on carries.
-fn fetch(proxy: Option<&str>, url: &str, file: &Path) -> Result<()> {
+pub fn fetch(proxy: Option<&str>, url: &str, file: &Path, seconds: u32) -> Result<()> {
     let mut command = Command::new("curl");
     command.args([
         "--fail",
@@ -114,7 +114,7 @@ fn fetch(proxy: Option<&str>, url: &str, file: &Path) -> Result<()> {
         "--silent",
         "--show-error",
         "--max-time",
-        "900",
+        &seconds.to_string(),
     ]);
     if let Some(proxy) = proxy {
         command.args(["--proxy", proxy]);

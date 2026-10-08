@@ -3,6 +3,7 @@ mod lang;
 
 mod cache;
 mod config;
+mod cover;
 mod ipc;
 mod library;
 mod playback;
