@@ -3,7 +3,7 @@ use crate::{
     Result,
     cache::Cache,
     player::{self, Download},
-    soundcloud::{self, Extractor, Track},
+    soundcloud::{self, Details, Extractor, Track},
 };
 use serde_json::{Value, json};
 use std::{
@@ -47,6 +47,8 @@ pub struct Playback {
     eof: bool,
     error: Option<String>,
     log: Vec<String>,
+    // Where the yt-dlp that feeds the player notes what it learns of the track.
+    noted: Option<PathBuf>,
 }
 
 impl Playback {
@@ -68,6 +70,7 @@ impl Playback {
             eof: false,
             error: None,
             log: Vec::new(),
+            noted: None,
         }
     }
 
@@ -106,6 +109,7 @@ impl Playback {
         } else if let Some(mut partial) = cache.map(|cache| cache.store(url)).transpose()?.flatten()
         {
             partial.describe(track);
+            player.noted = Some(partial.directory().to_owned());
             player.origin = Origin::Download;
             let mut source = player::downloader(extractor, url, partial.directory(), false, true);
             source.stderr(log);
@@ -113,6 +117,7 @@ impl Playback {
             player::from_pipe(&mut command, Stdio::piped());
         } else if extractor.proxy.is_some() {
             player.origin = Origin::Pipe;
+            player.noted = Some(player.directory.clone());
             let mut source = player::downloader(extractor, url, &player.directory, false, false)
                 .stderr(log)
                 .spawn()
@@ -131,6 +136,13 @@ impl Playback {
         }
         player.child = Some(child);
         Ok(player)
+    }
+
+    /// What yt-dlp has noted of the track it fetches for this player, told once.
+    pub fn learn(&mut self) -> Option<Details> {
+        let details = Details::read(self.noted.as_ref()?)?;
+        self.noted = None;
+        Some(details)
     }
 
     /// Audio is still arriving: mpv then only knows the length of what it has got.

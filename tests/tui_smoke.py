@@ -31,6 +31,10 @@ def run(proxy=False, terminate=False):
         extractor = root / "yt-dlp"
         extractor.write_text('''#!/usr/bin/env python3
 import json, os, sys, time
+if "--print-to-file" in sys.argv and sys.argv[-1].endswith("/remote-viewing"):
+    # What a download learns of its track on the way is noted in the file it is told.
+    with open(sys.argv[sys.argv.index("--print-to-file") + 2], "w") as noted:
+        noted.write(json.dumps({"title": "Remote Viewing", "artist": "low_sea", "duration": 196.645}) + "\\n")
 if "--output" in sys.argv:
     sys.stdout.buffer.write(b"mock-audio")
 elif sys.argv[-1] == "https://soundcloud.com/someone/likes":
@@ -164,13 +168,23 @@ if os.environ.get("MPV_LINGER"):
             library = root / "library.json"
             read_until(lambda: len(json.loads(library.read_text())["favorites"]) == 2)
             assert json.loads(settings.read_text())["soundcloud_profile"] == "someone"
-            os.write(master, b"\x1bq")
+            # Fetched into the cache, the liked track gets the names and the length that
+            # its link did not tell; the order of a list is kept in the settings.
+            # Escape by itself: followed at once by a letter it would read as Alt with it.
+            os.write(master, b"\x1b")
+            time.sleep(0.3)
+            os.write(master, b"jdzr")
+            read_until(lambda: json.loads(library.read_text())["favorites"][1]["duration"] == 196.645)
+            read_until(lambda: json.loads(settings.read_text()).get("repeat") == "all")
+            assert json.loads(settings.read_text())["shuffle"] is True
+            os.write(master, b"q")
             process.wait(timeout=5)
             assert process.returncode == 0
             assert termios.tcgetattr(slave) == before, "Terminal mode was not restored"
             saved = json.loads((root / "library.json").read_text())
             assert len(saved["favorites"]) == 2 and len(saved["recent"]) == 1
-            assert saved["favorites"][1]["artist"] == "low sea"
+            assert saved["favorites"][1]["artist"] == "low_sea"
+            assert json.loads((cache / "tracks" / "low-sea.remote-viewing").read_text())["duration"] == 196.645
             assert not list(temporary.iterdir()), "IPC directory was not removed"
             assert not (root / "home-cache").exists(), "The cache directory flag was ignored"
             print("PASS: TUI search and its cancel, favorites, queue, IPC controls, cache, settings,",

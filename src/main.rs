@@ -343,8 +343,7 @@ fn run(cli: Cli) -> Result<()> {
             // Checked before the network is asked: a bad name, a damaged library.
             soundcloud::profile(&profile)?;
             let path = library::path(library, "import")?;
-            let mut kept = library::load(&path)?;
-            let before = kept.favorites.len();
+            library::load(&path)?;
             let counted = io::stderr().is_terminal();
             let mut liked = Vec::new();
             let listed = provider.likes(&profile, |track| {
@@ -362,6 +361,9 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{}", t!("В профиле нет лайков."));
                 return Ok(());
             }
+            // Read again: the list took its time, and the interface may have written since.
+            let mut kept = library::load(&path)?;
+            let before = kept.favorites.len();
             let merged = kept.merge(liked);
             if dry_run {
                 print_tracks(&kept.favorites[before..]);
