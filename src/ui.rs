@@ -4729,27 +4729,33 @@ exit /b 1"#,
         app.fetch_ahead();
         assert!(app.fetch.is_none(), "{}", app.message);
         assert!(app.message.contains("Загрузка трека"), "{}", app.message);
-        for _ in 0..500 {
-            app.tick();
-            if stored(&app, 1) {
-                break;
+        // The stand-in for mpv never answers, and a player that does not answer within
+        // seconds has failed: on a loaded machine that is sooner than a download ends.
+        // So no player is waited on here. The track is stored the way `d` stores one
+        // and started from the cache, and the player is put away before the next wait.
+        let wait = |app: &mut App, done: &dyn Fn(&App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !done(app) && Instant::now() < deadline {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        };
+        app.player = None;
+        app.download(vec![numbered(1)]);
+        wait(&mut app, &|app| {
+            app.fetch.is_none() && app.pending.is_empty()
+        });
         assert!(stored(&app, 1) && !stored(&app, 2));
+        app.start(numbered(1));
+        assert!(app.message.contains("Трек из кеша"), "{}", app.message);
         // All of it is there and it plays: the one after it is fetched, quietly.
         app.player.as_mut().unwrap().loaded = true;
         app.message = "playing".into();
         app.fetch_ahead();
         assert!(app.fetch.as_ref().is_some_and(|fetch| fetch.ahead));
         assert_eq!(app.fetch.as_ref().unwrap().track.title, "Title 2");
-        for _ in 0..500 {
-            if app.fetch.is_none() {
-                break;
-            }
-            app.tick();
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        app.player = None;
+        wait(&mut app, &|app| app.fetch.is_none());
         assert!(stored(&app, 2) && !stored(&app, 3));
         assert_eq!(app.message, "playing");
 
@@ -4760,6 +4766,8 @@ exit /b 1"#,
         assert_eq!(app.previous.last().unwrap().title, "Title 1");
         assert_eq!(app.ahead.len(), 1);
         // A track that could not be fetched ahead is not asked for on every tick.
+        app.start(numbered(2));
+        app.player.as_mut().unwrap().loaded = true;
         app.yt_dlp = "clicloud-no-such-program".into();
         app.fetch_ahead();
         app.fetch_ahead();
