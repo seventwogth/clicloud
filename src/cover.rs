@@ -253,46 +253,16 @@ pub fn small(artwork: &str) -> Option<String> {
     Some(sized.unwrap_or_else(|| artwork.to_owned()))
 }
 
-/// Fetches the picture of the track at `track` and keeps its pixels in `file`.
-/// `artwork` is where the picture is, if a download told; yt-dlp is asked otherwise.
-/// `scratch` is a directory for the picture as it arrives.
+/// Fetches the picture at `artwork` and keeps its pixels in `file`. `scratch` is a
+/// directory for the picture as it arrives; the route is the one yt-dlp takes.
 pub fn fetch(
     extractor: Extractor,
     mpv: &str,
-    track: &str,
-    artwork: Option<&str>,
+    artwork: &str,
     scratch: &Path,
     file: &Path,
 ) -> Result<()> {
-    let artwork = match artwork {
-        Some(artwork) => artwork.to_owned(),
-        None => {
-            let mut command = extractor.command();
-            let output = command
-                .args([
-                    "--ignore-no-formats-error",
-                    "--extractor-args",
-                    "soundcloud:formats=none",
-                    "--skip-download",
-                    "--no-playlist",
-                    "--socket-timeout",
-                    if extractor.proxied() { "30" } else { "15" },
-                    "--print",
-                    "thumbnail",
-                    "--",
-                    track,
-                ])
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()?;
-            (String::from_utf8_lossy(&output.stdout).lines())
-                .map(str::trim)
-                .rfind(|line| line.starts_with("https://"))
-                .ok_or("yt-dlp named no picture")?
-                .to_owned()
-        }
-    };
-    let artwork = small(&artwork).ok_or("not a picture of SoundCloud")?;
+    let artwork = small(artwork).ok_or("not a picture of SoundCloud")?;
     let fetched = scratch.join("cover");
     // curl takes a proxy from the environment by itself; a direct route is said.
     let proxy = match (extractor.proxy, extractor.no_proxy) {

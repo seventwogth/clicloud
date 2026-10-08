@@ -14,37 +14,59 @@ pub struct Track {
     pub url: String,
 }
 
-/// What yt-dlp tells of a track when it fetches it, which is more than the list of a
+/// What yt-dlp tells of a track when it looks it up, which is more than the list of a
 /// profile does: there a track has a title and a link, and its maker is a guess.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Details {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub duration: Option<f64>,
     /// Where the picture of the track is.
-    #[serde(default)]
     pub artwork: Option<String>,
+    pub genre: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub description: Option<String>,
+    pub plays: Option<u64>,
+    pub likes: Option<u64>,
+    pub reposts: Option<u64>,
+    pub comments: Option<u64>,
+    /// The day it was published, as eight digits: year, month, day.
+    pub date: Option<String>,
+    pub license: Option<String>,
 }
 
 impl Details {
     /// The file that a download notes them in, in the directory it runs in.
     pub const FILE: &'static str = "details.json";
-    /// What makes yt-dlp write that file: a line of JSON, with null for what it lacks.
+    // What yt-dlp is to write of a track: a line of JSON, with null for what it lacks.
+    const TEMPLATE: &'static str = concat!(
+        r#"{"title":%(title)j,"artist":%(uploader)j,"duration":%(duration)j,"#,
+        r#""artwork":%(thumbnail)j,"genre":%(genres.0)j,"tags":%(tags)j,"#,
+        r#""description":%(description)j,"plays":%(view_count)j,"likes":%(like_count)j,"#,
+        r#""reposts":%(repost_count)j,"comments":%(comment_count)j,"#,
+        r#""date":%(upload_date)j,"license":%(license)j}"#
+    );
+    /// What makes a download write that file.
     pub const ARGUMENTS: [&'static str; 5] = [
         "--output-na-placeholder",
         "null",
         "--print-to-file",
-        r#"{"title":%(title)j,"artist":%(uploader)j,"duration":%(duration)j,"artwork":%(thumbnail)j}"#,
+        Self::TEMPLATE,
         Self::FILE,
     ];
+
+    /// The details in a line that yt-dlp wrote; None for one that tells nothing.
+    pub fn parse(line: &[u8]) -> Option<Self> {
+        let details: Self = serde_json::from_slice(line).ok()?;
+        (details.title.is_some() || details.artist.is_some() || details.duration.is_some())
+            .then_some(details)
+    }
 
     /// The details noted in `directory`; None until yt-dlp has looked the track up.
     pub fn read(directory: &Path) -> Option<Self> {
         let text = std::fs::read(directory.join(Self::FILE)).ok()?;
-        let line = text.split(|byte| *byte == b'\n').next()?;
-        let details: Self = serde_json::from_slice(line).ok()?;
-        (details.title.is_some() || details.artist.is_some() || details.duration.is_some())
-            .then_some(details)
+        Self::parse(text.split(|byte| *byte == b'\n').next()?)
     }
 
     /// Puts what is known in place of what `track` had.
@@ -159,6 +181,44 @@ impl<'a> SoundCloud<'a> {
             Some(_) => self.open(question, Some(limit), found),
             None => self.stream(question, limit.clamp(1, 50) as u8, found),
         }
+    }
+
+    /// Looks one track up: all that SoundCloud tells of it, but where its audio is.
+    pub fn details(&self, url: &str) -> Result<Details> {
+        validate_url(url)?;
+        let mut command = self.extractor.command();
+        let output = command
+            .args([
+                "--ignore-no-formats-error",
+                "--extractor-args",
+                "soundcloud:formats=none",
+                "--skip-download",
+                "--no-playlist",
+                "--socket-timeout",
+                if self.extractor.proxied() { "30" } else { "15" },
+                "--retries",
+                "2",
+                "--output-na-placeholder",
+                "null",
+                "--print",
+                Details::TEMPLATE,
+                "--",
+                url,
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|error| {
+                t!(
+                    "Не удалось запустить yt-dlp ({}): {}. Проверьте clicloud doctor.",
+                    self.extractor.program,
+                    error
+                )
+            })?;
+        (output.stdout.split(|byte| *byte == b'\n'))
+            .rev()
+            .find_map(Details::parse)
+            .ok_or_else(|| t!("Некорректный ответ JSON от yt-dlp: {}", "").into())
     }
 
     /// The tracks behind a link: those of a playlist, of a page of a profile, of the
@@ -666,9 +726,8 @@ mod tests {
         // What yt-dlp lacks leaves what was there.
         let partly = Details {
             title: Some(" ".into()),
-            artist: None,
             duration: Some(0.0),
-            artwork: None,
+            ..Details::default()
         };
         partly.apply(&mut track);
         assert_eq!(
