@@ -5,6 +5,30 @@ use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+#[test]
+fn first_launch_is_english_and_saved_language_is_respected() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("config.json"), "{}").unwrap();
+    let output = fixture
+        .command()
+        .args(["--no-cache", "cache"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Cache: off"));
+    let help = fixture.command().arg("--help").output().unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Search and play SoundCloud"));
+    assert!(help.stdout.is_ascii());
+    fs::write(fixture.0.join("config.json"), r#"{"language":"ru"}"#).unwrap();
+    let output = fixture
+        .command()
+        .args(["--no-cache", "cache"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Кеш: отключён"));
+}
+
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -16,7 +40,7 @@ impl Fixture {
         ));
         fs::create_dir(&root).unwrap();
         let fixture = Self(root);
-        fs::write(fixture.0.join("config.json"), "{}").unwrap();
+        fs::write(fixture.0.join("config.json"), r#"{"language":"ru"}"#).unwrap();
         fixture.script(
             "yt-dlp",
             r#"#!/bin/sh
@@ -242,7 +266,7 @@ fn cache_settings_flags_and_links_that_are_not_stored() {
     fs::write(
         fixture.0.join("config.json"),
         format!(
-            r#"{{"cache_dir":"{}","cache_limit_mb":0}}"#,
+            r#"{{"cache_dir":"{}","cache_limit_mb":0,"language":"ru"}}"#,
             elsewhere.display()
         ),
     )
@@ -277,7 +301,11 @@ fn cache_settings_flags_and_links_that_are_not_stored() {
     assert!(fixture.0.join("relative/audio/artist.night").exists());
     assert!(!elsewhere.join("audio").exists());
 
-    fs::write(fixture.0.join("config.json"), r#"{"cache_enabled":false}"#).unwrap();
+    fs::write(
+        fixture.0.join("config.json"),
+        r#"{"cache_enabled":false,"language":"ru"}"#,
+    )
+    .unwrap();
     play(&mut fixture.cached(), "https://soundcloud.com/artist/night");
     let player = fixture.read("player.log");
     assert!(player.contains("--ytdl-raw-options-append=no-cache-dir=\n"));

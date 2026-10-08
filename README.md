@@ -7,9 +7,9 @@ library. `yt-dlp` does the searching and fetches the audio, `mpv` plays it.
 Tracks you have played stay in a cache on disk: the second time they start at
 once and play without a network.
 
-The interface speaks Russian, English and Japanese. It starts in Russian: press
-`o`, go down to the fourth line (it reads «Язык») and press `Enter`, or put
-`"language": "en"` in the settings file.
+The interface speaks English, Russian and Japanese. English is the default on
+first launch. Change Language in settings (`o`), or set `"language": "ru"` or
+`"language": "ja"` in the settings file. An existing language choice is preserved.
 
 ## Installation
 
@@ -264,7 +264,10 @@ tracks can be played again. What played and what was ahead of it, the queue and
 the rest of the list, up to 500 tracks, is kept there too when you quit: the
 next time it waits in the queue, and `n` starts it from the track it stopped
 at. The path can be changed with `ui --library`. A damaged library file is not
-overwritten.
+overwritten, including if it becomes damaged while the interface is open. Updates
+from TUI sessions and imports share a lock beside the JSON file (`library.json.lock`);
+keep that file in place. A failed save on exit returns an error. Older client
+versions and external editors do not participate in this locking protocol.
 
 A track that could not be played is marked `!!` in place of its number for the
 rest of the run, or until it plays: the network may have been the reason.
@@ -298,7 +301,7 @@ tracks. On SIGTERM, SIGHUP or SIGINT `play` asks mpv to end, stops yt-dlp and
 exits with 128 plus the number of the signal, rather than leaving the player
 playing in the background.
 
-The help of the command line (`--help`) is in Russian only.
+The help of the command line (`--help`) is in English only.
 
 ### Bringing over the likes of a SoundCloud profile
 
@@ -387,7 +390,7 @@ the state for one run; switching it in the settings replaces that.
 
 The language changes at once and covers everything the client writes: the
 interface, the error messages and the output of `search`, `play`, `import`,
-`cache` and `doctor`. Only `--help` stays in Russian. Japanese letters take two
+`cache` and `doctor`. Only `--help` stays in English. Japanese letters take two
 cells, so the terminal needs a font that has them.
 
 Schemes:

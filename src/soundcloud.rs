@@ -593,6 +593,7 @@ mod tests {
 
     #[test]
     fn handles_flat_results_missing_metadata_and_unavailable_entries() {
+        crate::lang::set(crate::lang::Lang::Russian);
         let tracks = parse_line(br#"{"entries":[null,{"title":"Track","uploader":"Artist","duration":90.5,"webpage_url":"https://soundcloud.com/a/b","url":"https://api.soundcloud.com/tracks/123"},{"url":"https://api.soundcloud.com/tracks/456"},{"url":"file:///tmp/audio"}]}"#).unwrap();
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].url, "https://soundcloud.com/a/b");
@@ -633,6 +634,7 @@ mod tests {
 
     #[test]
     fn a_liked_track_is_named_after_the_profile_in_its_link() {
+        crate::lang::set(crate::lang::Lang::Russian);
         // A line of the likes of a profile, as yt-dlp 2026.08 writes it.
         let line = br#"{"_type":"url","ie_key":"Soundcloud","id":"157407329","title":"Bitter Sweet Tears","url":"https://soundcloud.com/the-propolis/bitter-sweet-tears","webpage_url":"https://soundcloud.com/the-propolis/bitter-sweet-tears","duration":null,"uploader":null}"#;
         let tracks = parse_line(line).unwrap();
@@ -654,6 +656,7 @@ mod tests {
 
     #[test]
     fn reads_the_name_of_a_profile_from_a_name_or_a_link() {
+        crate::lang::set(crate::lang::Lang::Russian);
         for input in [
             "night_owl-1",
             " @night_owl-1 ",

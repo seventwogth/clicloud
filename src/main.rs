@@ -22,30 +22,30 @@ use std::process::{Command, ExitCode};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser)]
-#[command(version, about = "Поиск и прослушивание SoundCloud в терминале")]
+#[command(version, about = "Search and play SoundCloud in the terminal")]
 struct Cli {
-    /// Путь к yt-dlp
+    /// Path to yt-dlp
     #[arg(long, global = true, env = "CLICLOUD_YT_DLP", default_value_t = default_yt_dlp())]
     yt_dlp: String,
-    /// Путь к mpv
+    /// Path to mpv
     #[arg(long, global = true, env = "CLICLOUD_MPV", default_value = "mpv")]
     mpv: String,
-    /// JSON-файл настроек (по умолчанию ~/.config/clicloud/config.json)
+    /// Settings JSON file (default: ~/.config/clicloud/config.json)
     #[arg(long, global = true, env = "CLICLOUD_CONFIG")]
     config: Option<std::path::PathBuf>,
-    /// HTTP(S) или SOCKS5 прокси
+    /// HTTP(S) or SOCKS5 proxy
     #[arg(long, global = true, env = "CLICLOUD_PROXY", hide_env_values = true)]
     proxy: Option<String>,
-    /// Использовать локальный Tor: socks5h://127.0.0.1:9050
+    /// Use local Tor: socks5h://127.0.0.1:9050
     #[arg(long, global = true, conflicts_with = "no_proxy")]
     tor: bool,
-    /// Отключить прокси, включая настройки окружения
+    /// Disable proxies, including environment settings
     #[arg(long, global = true)]
     no_proxy: bool,
-    /// Каталог кеша (по умолчанию ~/.cache/clicloud)
+    /// Cache directory (default: ~/.cache/clicloud)
     #[arg(long, global = true, env = "CLICLOUD_CACHE_DIR")]
     cache_dir: Option<std::path::PathBuf>,
-    /// Ничего не хранить на диске: ни аудио, ни данные yt-dlp
+    /// Disable the audio and yt-dlp disk cache
     #[arg(
         long,
         global = true,
@@ -59,48 +59,48 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Открыть терминальный интерфейс (также запускается без команды)
+    /// Open the terminal interface (also the default command)
     Ui {
-        /// Путь к JSON-библиотеке
+        /// Path to the library JSON file
         #[arg(long)]
         library: Option<std::path::PathBuf>,
     },
-    /// Найти треки
+    /// Search for tracks
     Search {
         query: String,
         #[arg(short, long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=50))]
         limit: u8,
-        /// Вывести JSON вместо списка
+        /// Print JSON instead of a list
         #[arg(long)]
         json: bool,
     },
-    /// Найти и выбрать трек или проиграть ссылку SoundCloud
+    /// Find and select a track, or play a SoundCloud URL
     Play {
         query_or_url: String,
         #[arg(short, long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=50))]
         limit: u8,
-        /// Воспроизвести первый результат без выбора
+        /// Play the first result without prompting
         #[arg(long)]
         first: bool,
     },
-    /// Добавить в избранное лайки профиля SoundCloud или треки списка по ссылке
+    /// Import favorites from a SoundCloud profile or list URL
     Import {
-        /// Имя профиля (name, @name, soundcloud.com/name) или ссылка на плейлист, репосты, треки автора
+        /// Profile (name, @name, soundcloud.com/name), playlist, reposts or artist tracks URL
         profile: String,
-        /// Путь к JSON-библиотеке
+        /// Path to the library JSON file
         #[arg(long)]
         library: Option<std::path::PathBuf>,
-        /// Показать, что было бы добавлено, ничего не записывая
+        /// Show what would be added without writing anything
         #[arg(long)]
         dry_run: bool,
     },
-    /// Показать, сколько занимает кеш, или очистить его
+    /// Show cache usage or clear it
     Cache {
-        /// Удалить сохранённое аудио и данные yt-dlp
+        /// Remove cached audio and yt-dlp data
         #[arg(long)]
         clear: bool,
     },
-    /// Проверить наличие внешних программ
+    /// Check external programs
     Doctor,
 }
 
@@ -386,9 +386,18 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             // Read again: the list took its time, and the interface may have written since.
-            let mut kept = library::load(&path)?;
-            let before = kept.favorites.len();
-            let merged = kept.merge(liked);
+            let (before, merged, kept) = if dry_run {
+                let mut kept = library::load(&path)?;
+                let before = kept.favorites.len();
+                let merged = kept.merge(liked);
+                (before, merged, kept)
+            } else {
+                let ((before, merged), kept) = library::update(&path, |kept| {
+                    let before = kept.favorites.len();
+                    (before, kept.merge(liked))
+                })?;
+                (before, merged, kept)
+            };
             if dry_run {
                 print_tracks(&kept.favorites[before..]);
                 println!(
@@ -401,9 +410,6 @@ fn run(cli: Cli) -> Result<()> {
                     )
                 );
             } else {
-                if merged.added > 0 {
-                    library::save(&path, &kept)?;
-                }
                 println!(
                     "{}\n{}",
                     t!(

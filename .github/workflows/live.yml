@@ -1,0 +1,30 @@
+name: Live smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  soundcloud:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install real playback dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mpv tinyproxy
+          python -m pip install yt-dlp
+          sudo systemctl start tinyproxy
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - run: cargo +stable build --locked
+      - name: Direct search, playback and offline cache
+        run: python tests/live_smoke.py
+      - name: Search and playback through HTTP proxy
+        run: python tests/live_smoke.py --proxy http://127.0.0.1:8888

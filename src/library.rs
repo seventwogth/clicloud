@@ -120,10 +120,52 @@ pub fn load(path: &PathBuf) -> Result<Library> {
     }
 }
 
-pub fn save(path: &PathBuf, library: &Library) -> Result<()> {
+/// Read, change and replace the library under one OS lock. The separate lock file
+/// stays in place: locking the JSON itself would stop protecting it after rename.
+/// Closing the handle releases the lock even if the process exits unexpectedly.
+pub fn update<T>(path: &PathBuf, change: impl FnOnce(&mut Library) -> T) -> Result<(T, Library)> {
+    if path.file_name().is_none() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "Invalid library file path").into(),
+        );
+    }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == fs2::lock_contended_error().kind()
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // A read/parse error must abort the transaction, preserving the original bytes.
+    let mut library = load(path)?;
+    let result = change(&mut library);
+    write(path, &library)?;
+    Ok((result, library))
+}
+
+#[cfg(test)]
+pub fn save(path: &PathBuf, library: &Library) -> Result<()> {
+    update(path, |disk| *disk = library.clone()).map(|_| ())
+}
+
+fn write(path: &PathBuf, library: &Library) -> Result<()> {
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     let result = (|| -> Result<()> {
         let mut file = fs::File::create(&temp)?;
@@ -141,6 +183,102 @@ pub fn save(path: &PathBuf, library: &Library) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_process() {
+        let Some(path) = std::env::var_os("CLICLOUD_TEST_LIBRARY") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        if let Some(marker) = std::env::var_os("CLICLOUD_TEST_LOCK_READY") {
+            update(&path, |_| {
+                fs::write(marker, b"locked").unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            })
+            .unwrap();
+            return;
+        }
+        for index in 0..20 {
+            update(&path, |library| {
+                library.merge([track(&format!(
+                    "https://soundcloud.com/process-{}/track-{index}",
+                    std::process::id()
+                ))]);
+                // Widen the race window: without the transaction lock writers lose
+                // each other's additions even though every rename is atomic.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_killed_writer_does_not_leave_the_library_locked() {
+        let root = std::env::temp_dir().join(format!("clicloud-lock-death-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("library.json");
+        let marker = root.join("ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "library::tests::writer_process"])
+            .env("CLICLOUD_TEST_LIBRARY", &path)
+            .env("CLICLOUD_TEST_LOCK_READY", &marker)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ready = marker.exists();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(ready, "child did not acquire the lock");
+        update(&path, |library| {
+            library.merge([track("https://soundcloud.com/a/after-crash")]);
+        })
+        .unwrap();
+        assert_eq!(load(&path).unwrap().favorites.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_processes_keep_every_addition() {
+        let root = std::env::temp_dir().join(format!("clicloud-writers-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("library.json");
+        let mut children: Vec<_> = (0..4)
+            .map(|_| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "library::tests::writer_process"])
+                    .env("CLICLOUD_TEST_LIBRARY", &path)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+        assert_eq!(load(&path).unwrap().favorites.len(), 80);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn damaged_library_is_preserved_and_lock_is_released_on_error() {
+        let root = std::env::temp_dir().join(format!("clicloud-damaged-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("library.json");
+        fs::write(&path, b"{broken").unwrap();
+        assert!(update(&path, |_| panic!("must not change damaged data")).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"{broken");
+        fs::write(&path, b"{}").unwrap();
+        update(&path, |library| {
+            library.merge([track("https://soundcloud.com/a/recovered")]);
+        })
+        .unwrap();
+        assert_eq!(load(&path).unwrap().favorites.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn track(url: &str) -> Track {
         Track {

@@ -120,7 +120,7 @@ if os.environ.get("MPV_LINGER"):
 
         try:
             # The name is drawn, not spelled, on a screen this tall; the search box is always there.
-            read_until(lambda: "ПОИСК".encode() in output)
+            read_until(lambda: b"SEARCH" in output)
             # Esc kills a hanging search; the next one must then run normally.
             search_pid = root / "search.pid"
             (root / "slow").touch()
@@ -177,6 +177,7 @@ if os.environ.get("MPV_LINGER"):
             read_until(lambda: json.loads(library.read_text())["favorites"][1]["duration"] == 196.645)
             read_until(lambda: json.loads(settings.read_text()).get("repeat") == "all")
             assert json.loads(settings.read_text())["shuffle"] is True
+            assert json.loads(settings.read_text())["language"] == "en"
             os.write(master, b"q")
             process.wait(timeout=5)
             assert process.returncode == 0
@@ -197,12 +198,51 @@ if os.environ.get("MPV_LINGER"):
             os.close(slave)
 
 
+def damaged_library_on_exit():
+    with tempfile.TemporaryDirectory(prefix="cc-", dir="/tmp") as directory:
+        root = Path(directory)
+        config = root / "config.json"
+        config.write_text("{}")
+        library = root / "library.json"
+        library.write_text("{}")
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+        before = termios.tcgetattr(slave)
+        process = subprocess.Popen(["target/debug/clicloud", "--no-proxy", "--no-cache",
+                                    "--yt-dlp", "/bin/true", "--mpv", "/bin/true",
+                                    "--config", str(config), "ui", "--library", str(library)],
+                                   stdin=slave, stdout=slave, stderr=slave)
+        output = bytearray()
+        try:
+            deadline = time.monotonic() + 5
+            while b"SEARCH" not in output and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    output.extend(os.read(master, 65536))
+            assert b"SEARCH" in output, "English first-launch screen did not appear"
+            library.write_text("{broken-library")
+            os.write(master, b"q")
+            deadline = time.monotonic() + 5
+            while process.poll() is None and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    output.extend(os.read(master, 65536))
+            assert process.wait(timeout=1) == 1, "Failed save must produce an error exit"
+            assert library.read_text() == "{broken-library"
+            assert termios.tcgetattr(slave) == before, "Failed save left terminal in raw mode"
+            print("PASS: damaged library survives exit; save failure restores terminal and returns error")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+
+
 def hangup():
     # The window of the terminal is closed: the interface must end, not go round and
     # round on a terminal that is gone.
     with tempfile.TemporaryDirectory(prefix="cc-", dir="/tmp") as directory:
         root = Path(directory)
-        (root / "config.json").write_text("{}")
+        (root / "config.json").write_text('{"language":"ru"}')
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
         process = subprocess.Popen(["target/debug/clicloud", "--no-proxy", "--no-cache",
@@ -233,3 +273,4 @@ if __name__ == "__main__":
     run(proxy=True)
     run(terminate=True)
     hangup()
+    damaged_library_on_exit()

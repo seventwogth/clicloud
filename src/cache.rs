@@ -749,6 +749,7 @@ mod tests {
 
     #[test]
     fn foreign_directories_are_left_alone() {
+        crate::lang::set(crate::lang::Lang::Russian);
         let root = directory("foreign");
         fs::create_dir_all(root.join("audio")).unwrap();
         fs::write(root.join("audio/song.mp3"), b"mine").unwrap();

@@ -46,18 +46,18 @@ impl Lang {
         }
     }
 
-    /// An unknown code gives Russian, in which everything is written.
+    /// An unknown code gives the default language, English.
     pub fn parse(code: &str) -> Self {
         ALL.into_iter()
             .find(|language| language.code() == code)
-            .unwrap_or(Self::Russian)
+            .unwrap_or(Self::English)
     }
 }
 
 thread_local! {
     // Per thread, so that tests in different languages do not meet. A thread that
     // produces messages of its own is given the language of the one that starts it.
-    static CURRENT: Cell<Lang> = const { Cell::new(Lang::Russian) };
+    static CURRENT: Cell<Lang> = const { Cell::new(Lang::English) };
 }
 
 pub fn set(language: Lang) {
@@ -843,9 +843,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Enter か Left/Right - 曲の一覧の後ろの絵を切り替えます。\nなし - 絵のない一覧。",
     ),
     (
-        "Enter или Left/Right - сменить язык интерфейса и сообщений.\nСправка командной строки (--help) остаётся на русском.",
-        "Enter or Left/Right - the language of the interface and messages.\nThe command line help (--help) stays in Russian.",
-        "Enter か Left/Right - 画面とメッセージの言語を切り替えます。\nコマンドラインのヘルプ (--help) はロシア語のままです。",
+        "Enter или Left/Right - сменить язык интерфейса и сообщений.\nСправка командной строки (--help) остаётся на английском.",
+        "Enter or Left/Right - the language of the interface and messages.\nThe command line help (--help) stays in English.",
+        "Enter か Left/Right - 画面とメッセージの言語を切り替えます。\nコマンドラインのヘルプ (--help) は英語のままです。",
     ),
     (
         "Читаю лайки профиля {}…",
@@ -1193,7 +1193,8 @@ mod tests {
 
     #[test]
     fn language_is_switched_and_arguments_are_filled_in() {
-        assert_eq!(current(), Lang::Russian);
+        assert_eq!(current(), Lang::English);
+        set(Lang::Russian);
         assert_eq!(t!("Найдено треков: {}", 3), "Найдено треков: 3");
         set(Lang::English);
         assert_eq!(t!("Поиск отменён"), "Search cancelled");
@@ -1206,7 +1207,7 @@ mod tests {
         assert_eq!(t!("Найдено треков: {}", 3), "3 曲見つかりました");
         assert_eq!(translate("нет такого текста"), "нет такого текста");
         assert_eq!(Lang::parse("ja"), Lang::Japanese);
-        assert_eq!(Lang::parse("xx"), Lang::Russian);
+        assert_eq!(Lang::parse("xx"), Lang::English);
         for language in ALL {
             assert_eq!(Lang::parse(language.code()), language);
         }

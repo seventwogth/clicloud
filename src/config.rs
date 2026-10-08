@@ -63,7 +63,7 @@ impl Default for Settings {
             cache_limit_mb: 1024,
             theme: crate::theme::TERMINAL.into(),
             backdrop: "reaper".into(),
-            language: crate::lang::Lang::Russian.code().into(),
+            language: crate::lang::Lang::English.code().into(),
             // A track of a search costs about a second of yt-dlp's time, so a list of
             // thirty kept the search running long after the first screen was there.
             search_limit: 10,

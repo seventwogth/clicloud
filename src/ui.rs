@@ -192,7 +192,7 @@ impl Setting {
             }
             Self::Language => {
                 t!(
-                    "Enter или Left/Right - сменить язык интерфейса и сообщений.\nСправка командной строки (--help) остаётся на русском."
+                    "Enter или Left/Right - сменить язык интерфейса и сообщений.\nСправка командной строки (--help) остаётся на английском."
                 )
             }
             Self::Proxy => {
@@ -721,8 +721,11 @@ impl App {
         });
     }
     fn save(&mut self) {
-        // What another process wrote meanwhile is not written over.
-        self.sync();
+        if let Err(error) = self.save_library() {
+            self.message = t!("Не удалось сохранить библиотеку: {}", error);
+        }
+    }
+    fn save_library(&mut self) -> Result<()> {
         // What plays and what is ahead of it is kept for the next run, up to a point:
         // a list may be thousands of tracks long.
         self.library.queue = (self.current.iter())
@@ -731,13 +734,19 @@ impl App {
             .take(500)
             .cloned()
             .collect();
-        match library::save(&self.library_path, &self.library) {
-            Ok(()) => {
-                self.base = self.library.clone();
-                self.stamp = library::stamp(&self.library_path);
+        let (_, saved) = library::update(&self.library_path, |disk| {
+            let mut next = self.library.clone();
+            if self.library_path.exists() {
+                next.adopt(&self.base, disk);
             }
-            Err(error) => self.message = t!("Не удалось сохранить библиотеку: {}", error),
-        }
+            *disk = next;
+        })?;
+        self.library = saved;
+        self.base = self.library.clone();
+        // Do not stat after unlocking: another writer could already have replaced
+        // our file. Let the next sync read it against the base we actually wrote.
+        self.stamp = None;
+        Ok(())
     }
     /// Takes over what another process did to the library file since this one last
     /// read or wrote it, such as an import of likes; true if the library changed.
@@ -2667,12 +2676,12 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
         }
     }
     // What plays and what is ahead of it is kept as it stands at the end of the run.
-    app.save();
+    let saved = app.save_library();
     // A terminal that is gone has no cursor to bring back, and saying so to it fails.
     if gone {
         std::mem::forget(terminal);
     }
-    Ok(())
+    saved.map_err(|error| t!("Не удалось сохранить библиотеку: {}", error).into())
 }
 
 fn block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
@@ -3896,6 +3905,7 @@ mod tests {
                 cache: None,
                 cache_dir: None,
                 settings: Settings {
+                    language: "ru".into(),
                     theme: theme::MONO.into(),
                     ..Settings::default()
                 },
@@ -3912,6 +3922,7 @@ mod tests {
 
     #[test]
     fn favorites_persist_and_toggle_without_duplicates() {
+        lang::set(Lang::Russian);
         let path =
             std::env::temp_dir().join(format!("clicloud-library-test-{}.json", std::process::id()));
         let mut app = app(path.clone());
@@ -3929,6 +3940,7 @@ mod tests {
 
     #[test]
     fn error_details_follow_the_latest_search_or_playback() {
+        lang::set(Lang::Russian);
         let mut app = app(PathBuf::new());
         app.yt_dlp = "/missing/yt-dlp".into();
         app.mpv = "/missing/mpv".into();
@@ -3964,6 +3976,7 @@ mod tests {
 
     #[test]
     fn interface_is_ascii_and_colored_by_its_scheme_alone() {
+        lang::set(Lang::Russian);
         let screens = || {
             let mut busy = app(PathBuf::new());
             busy.library.favorites.push(track());
@@ -4081,6 +4094,7 @@ mod tests {
 
     #[test]
     fn the_logo_is_shown_small_where_the_screen_has_a_line_for_it() {
+        lang::set(Lang::Russian);
         // Eight marks to a cell: two across, four down, and nothing for a space.
         assert_eq!(dots("MM\nMM\nMM\nMM"), ["\u{28ff}"]);
         assert_eq!(
@@ -4118,6 +4132,7 @@ mod tests {
 
     #[test]
     fn every_language_fits_its_places() {
+        lang::set(Lang::Russian);
         for language in lang::ALL {
             lang::set(language);
             for (width, height) in [(80, 24), (120, 35)] {
@@ -4189,6 +4204,7 @@ mod tests {
 
     #[test]
     fn settings_change_the_session_and_the_file() {
+        lang::set(Lang::Russian);
         let file =
             std::env::temp_dir().join(format!("clicloud-settings-{}.json", std::process::id()));
         let root = std::env::temp_dir().join(format!("clicloud-settings-{}", std::process::id()));
@@ -4352,6 +4368,7 @@ mod tests {
 
     #[test]
     fn the_likes_of_a_profile_join_the_favorites_from_the_settings() {
+        lang::set(Lang::Russian);
         let stamp = std::process::id();
         let path = std::env::temp_dir().join(format!("clicloud-likes-{stamp}.json"));
         let file = std::env::temp_dir().join(format!("clicloud-likes-settings-{stamp}.json"));
@@ -4548,6 +4565,7 @@ mod tests {
 
     #[test]
     fn links_open_as_lists_to_go_through_and_back() {
+        lang::set(Lang::Russian);
         // What yt-dlp would answer for each page; a playlist tells all of every track.
         let program = script(
             "pages",
@@ -4709,6 +4727,7 @@ exit /b 1"#,
 
     #[test]
     fn the_next_track_is_fetched_ahead_and_the_player_goes_on_to_it() {
+        lang::set(Lang::Russian);
         let root = std::env::temp_dir().join(format!("clicloud-ahead-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         // `set /p` writes without a line break and leaves a status of failure behind,
@@ -4799,6 +4818,7 @@ exit /b 1"#,
 
     #[test]
     fn the_media_keys_of_the_desktop_are_let_through_where_the_plugin_is() {
+        lang::set(Lang::Russian);
         let mut app = app(PathBuf::new());
         app.setting = SETTINGS
             .iter()
@@ -4835,6 +4855,7 @@ exit /b 1"#,
 
     #[test]
     fn the_settings_tell_the_version_of_yt_dlp() {
+        lang::set(Lang::Russian);
         let program = script("version", "echo 2099.01.01", "echo 2099.01.01");
         let mut app = app(PathBuf::new());
         app.setting = SETTINGS
@@ -4861,6 +4882,7 @@ exit /b 1"#,
 
     #[test]
     fn mpv_is_told_how_to_sound_by_the_settings() {
+        lang::set(Lang::Russian);
         let file = std::env::temp_dir().join(format!("clicloud-sound-{}.json", std::process::id()));
         let player = script(
             "sound-player",
@@ -4914,6 +4936,7 @@ exit /b 1"#,
 
     #[test]
     fn the_track_that_plays_has_a_tab_with_its_picture_and_all_that_is_known() {
+        lang::set(Lang::Russian);
         let mut app = app(PathBuf::new());
         app.logo = false;
         let lists = screen(&mut app, 80, 24);
@@ -5140,6 +5163,7 @@ exit /b 1"#,
 
     #[test]
     fn what_the_tab_of_a_track_shows_is_read_from_the_cache_while_it_is_open() {
+        lang::set(Lang::Russian);
         let root = std::env::temp_dir().join(format!("clicloud-art-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut app = app(PathBuf::new());
@@ -5219,6 +5243,7 @@ exit /b 1"#,
 
     #[test]
     fn the_settings_window_shows_the_lines_around_the_current_one() {
+        lang::set(Lang::Russian);
         let mut app = app(PathBuf::new());
         app.options = true;
         app.greeted = app.message.clone();
@@ -5242,6 +5267,7 @@ exit /b 1"#,
 
     #[test]
     fn what_was_to_play_is_kept_for_the_next_run_and_what_failed_is_marked() {
+        lang::set(Lang::Russian);
         let path = std::env::temp_dir().join(format!("clicloud-kept-{}.json", std::process::id()));
         let _ = fs::remove_file(&path);
         let mut first = app(path.clone());
@@ -5261,6 +5287,7 @@ exit /b 1"#,
                 cache: None,
                 cache_dir: None,
                 settings: Settings {
+                    language: "ru".into(),
                     theme: theme::MONO.into(),
                     ..Settings::default()
                 },
@@ -5297,6 +5324,7 @@ exit /b 1"#,
 
     #[test]
     fn a_list_plays_on_from_the_track_that_was_started() {
+        lang::set(Lang::Russian);
         let player = idle("order-player");
         let file = std::env::temp_dir().join(format!("clicloud-order-{}.json", std::process::id()));
         let mut app = app(PathBuf::new());
@@ -5393,6 +5421,7 @@ exit /b 1"#,
 
     #[test]
     fn a_long_list_is_paged_counted_and_narrowed() {
+        lang::set(Lang::Russian);
         let mut app = app(PathBuf::new());
         app.library.favorites = (1..=1200).map(numbered).collect();
         app.logo = false;
@@ -5470,6 +5499,7 @@ exit /b 1"#,
 
     #[test]
     fn what_is_learned_of_a_track_reaches_every_list_it_is_in() {
+        lang::set(Lang::Russian);
         let path = std::env::temp_dir().join(format!("clicloud-learn-{}.json", std::process::id()));
         let mut app = app(path.clone());
         let liked = Track {
@@ -5523,6 +5553,7 @@ exit /b 1"#,
 
     #[test]
     fn the_library_follows_what_another_process_writes() {
+        lang::set(Lang::Russian);
         let path = std::env::temp_dir().join(format!("clicloud-sync-{}.json", std::process::id()));
         let _ = fs::remove_file(&path);
         let mut app = app(path.clone());
@@ -5556,13 +5587,23 @@ exit /b 1"#,
         // A file that is gone takes nothing away, and one that is damaged is left out.
         fs::remove_file(&path).unwrap();
         assert!(!app.sync() && app.library.favorites.len() == 2);
+        app.save_library().unwrap();
+        assert_eq!(kept(&library::load(&path).unwrap()), ["Title 2", "Title 3"]);
         fs::write(&path, "{broken").unwrap();
         assert!(!app.sync() && app.library.favorites.len() == 2);
+        assert!(app.save_library().is_err());
+        app.save();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
+        // Once the external damage is repaired, pending local edits can be saved.
+        fs::write(&path, serde_json::to_vec(&app.base).unwrap()).unwrap();
+        app.save_library().unwrap();
+        assert_eq!(kept(&library::load(&path).unwrap()), ["Title 2", "Title 3"]);
         fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn what_is_said_while_the_settings_are_open_shows_in_them() {
+        lang::set(Lang::Russian);
         assert_eq!(
             wrap("Ожидается имя профиля SoundCloud или ссылка", 20),
             ["Ожидается имя", "профиля SoundCloud", "или ссылка"]
@@ -5591,6 +5632,7 @@ exit /b 1"#,
 
     #[test]
     fn library_holds_favorites_and_stored_tracks() {
+        lang::set(Lang::Russian);
         let root = std::env::temp_dir().join(format!("clicloud-ui-stored-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut app = app(PathBuf::new());
@@ -5667,6 +5709,7 @@ exit /b 1"#,
 
     #[test]
     fn progress_bar_fills_its_width() {
+        lang::set(Lang::Russian);
         let bar = |position, duration, width| {
             let (played, loaded, left, times) = progress(position, 0.0, duration, width);
             format!("[{played}{loaded}{left}]{times}")
@@ -5729,6 +5772,7 @@ exit /b 1"#,
 
     #[test]
     fn the_programs_that_are_missing_are_offered_or_named() {
+        lang::set(Lang::Russian);
         // One that is certainly there wherever the tests run, and one that is not.
         let there = if cfg!(windows) { "cmd" } else { "sh" };
         let absent = "clicloud-no-such-program";
@@ -5761,6 +5805,7 @@ exit /b 1"#,
 
     #[test]
     fn the_mark_of_a_search_turns_through_its_frames() {
+        lang::set(Lang::Russian);
         let mut app = app(PathBuf::new());
         let mut seen = Vec::new();
         for step in 0..SPINNER.len() * 2 {
@@ -5786,6 +5831,7 @@ exit /b 1"#,
 
     #[test]
     fn what_yt_dlp_learns_is_asked_for_only_where_it_is_kept_and_not_kept_yet() {
+        lang::set(Lang::Russian);
         let root = std::env::temp_dir().join(format!("clicloud-warm-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut app = app(PathBuf::new());
@@ -5812,6 +5858,7 @@ exit /b 1"#,
 
     #[test]
     fn the_list_fills_while_the_search_is_still_running() {
+        lang::set(Lang::Russian);
         let mut app = app(PathBuf::new());
         let limit = u16::from(app.settings.search_limit);
         let found = |title: &str| {
@@ -5859,6 +5906,7 @@ exit /b 1"#,
 
     #[test]
     fn a_question_asked_before_is_answered_without_a_search() {
+        lang::set(Lang::Russian);
         let mut app = app(PathBuf::new());
         // No search of this test may reach the network, whatever is installed here.
         app.yt_dlp = "clicloud-no-such-program".into();
@@ -5903,6 +5951,7 @@ exit /b 1"#,
 
     #[test]
     fn escape_cancels_a_running_search() {
+        lang::set(Lang::Russian);
         let extractor = idle("slow-search");
         let mut app = app(PathBuf::new());
         app.yt_dlp = extractor.to_string_lossy().into_owned();
@@ -5924,6 +5973,7 @@ exit /b 1"#,
 
     #[test]
     fn failed_track_skips_to_the_next_until_too_many_fail_in_a_row() {
+        lang::set(Lang::Russian);
         let player = idle("idle-player");
         let library =
             std::env::temp_dir().join(format!("clicloud-skip-test-{}.json", std::process::id()));
@@ -5963,6 +6013,7 @@ exit /b 1"#,
 
     #[test]
     fn tracks_are_downloaded_into_the_cache_one_at_a_time() {
+        lang::set(Lang::Russian);
         let root = std::env::temp_dir().join(format!("clicloud-ui-cache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let extractor = script(
@@ -6031,6 +6082,7 @@ exit /b 0"#,
 
     #[test]
     fn recent_tracks_are_a_view_of_their_own() {
+        lang::set(Lang::Russian);
         let mut app = app(PathBuf::new());
         let other = Track {
             url: "https://soundcloud.com/test/other".into(),
@@ -6047,6 +6099,7 @@ exit /b 0"#,
 
     #[test]
     fn queue_and_selection_handle_empty_lists() {
+        lang::set(Lang::Russian);
         let mut app = app(PathBuf::new());
         app.action(Action::Enqueue);
         app.select_view(View::Queue);
@@ -6060,6 +6113,7 @@ exit /b 0"#,
 
     #[test]
     fn responsive_render_and_buttons_are_inside_terminal() {
+        lang::set(Lang::Russian);
         for (width, height) in [(120, 35), (80, 24), (60, 15)] {
             let mut app = app(PathBuf::new());
             let mut terminal =
