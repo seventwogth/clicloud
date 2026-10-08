@@ -99,6 +99,11 @@ impl Cache {
         self.root.join("audio")
     }
 
+    /// The pictures of tracks as pixels, each in a file named like the audio.
+    pub fn art(&self) -> PathBuf {
+        self.root.join("art")
+    }
+
     // What is known about each track, in a file named like its audio.
     fn details(&self) -> PathBuf {
         self.root.join("tracks")
@@ -217,7 +222,7 @@ impl Cache {
 
     /// Removes the audio, unfinished downloads and what yt-dlp has stored.
     pub fn clear(&self) -> io::Result<()> {
-        for name in ["audio", "tracks", "partial", "yt-dlp"] {
+        for name in ["audio", "tracks", "art", "partial", "yt-dlp"] {
             match fs::remove_dir_all(self.root.join(name)) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
                 _ => (),

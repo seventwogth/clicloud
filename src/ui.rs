@@ -3,6 +3,7 @@ use crate::{
     cache::{self, Cache},
     clean, clean_lines,
     config::{self, Settings},
+    cover::{self, Cover, Mode},
     lang,
     library::{self, Library},
     megabytes,
@@ -110,12 +111,15 @@ enum View {
     Library,
     Queue,
     Recent,
+    // The track that plays, with its picture, in place of the search and a list.
+    Track,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Setting {
     Theme,
     Backdrop,
+    Cover,
     Language,
     Proxy,
     ProxyAddress,
@@ -129,9 +133,10 @@ enum Setting {
     Likes,
 }
 
-const SETTINGS: [Setting; 13] = [
+const SETTINGS: [Setting; 14] = [
     Setting::Theme,
     Setting::Backdrop,
+    Setting::Cover,
     Setting::Language,
     Setting::Proxy,
     Setting::ProxyAddress,
@@ -151,6 +156,7 @@ impl Setting {
         match self {
             Self::Theme => t!("Цветовая схема"),
             Self::Backdrop => t!("Фоновый рисунок"),
+            Self::Cover => t!("Обложка"),
             Self::Language => t!("Язык"),
             Self::Proxy => t!("Прокси"),
             Self::ProxyAddress => t!("Адрес прокси"),
@@ -174,6 +180,11 @@ impl Setting {
             Self::Backdrop => {
                 t!(
                     "Enter или Left/Right - сменить рисунок за списком треков.\nнет - список без рисунка."
+                )
+            }
+            Self::Cover => {
+                t!(
+                    "Enter или Left/Right - как рисовать обложку на экране трека (5):\nблоками или точками Брайля, в её цветах или в тонах схемы."
                 )
             }
             Self::Language => {
@@ -350,6 +361,8 @@ struct App {
     options: bool,
     setting: usize,
     setting_rows: Rect,
+    // The first of the lines that the window shows, when it cannot show them all.
+    setting_first: usize,
     // What is being typed into the current line: a proxy address or a profile.
     input: Option<String>,
     import: Option<Import>,
@@ -394,6 +407,13 @@ struct App {
     volume: f64,
     // How fast tracks play, for as long as the interface runs.
     speed: f64,
+    // The pictures of tracks by the names of their files; None for one that could not
+    // be had, which is not asked for again. Where each picture is, as a download told.
+    covers: HashMap<String, Option<Cover>>,
+    artworks: HashMap<String, String>,
+    // The picture that is being fetched, and the one that was last drawn, as cells.
+    cover_job: Option<(String, mpsc::Receiver<Option<Cover>>)>,
+    drawn: Option<(String, u16, u16, Mode, String, Vec<cover::Cell>)>,
     // The devices mpv can play on, once it was asked.
     devices: Vec<(String, String)>,
     // The track that was last fetched ahead of its turn: one that fails is not asked for
@@ -439,6 +459,7 @@ impl App {
             options: false,
             setting: 0,
             setting_rows: Rect::default(),
+            setting_first: 0,
             input: None,
             import: None,
             imported: None,
@@ -471,6 +492,10 @@ impl App {
             player: None,
             failures: 0,
             speed: 1.0,
+            covers: HashMap::new(),
+            artworks: HashMap::new(),
+            cover_job: None,
+            drawn: None,
             devices: vec![],
             fetched_ahead: None,
             query: String::new(),
@@ -519,6 +544,7 @@ impl App {
             // What will play, in its order: the queue, then the rest of the list.
             View::Queue => self.queue.iter().chain(&self.ahead).collect(),
             View::Recent => self.library.recent.iter().collect(),
+            View::Track => Vec::new(),
         }
     }
     // How the list plays, in words: for the player's frame and for the messages.
@@ -669,6 +695,9 @@ impl App {
         let Some(name) = cache::key(url) else {
             return;
         };
+        if let Some(artwork) = &details.artwork {
+            self.artworks.insert(name.clone(), artwork.clone());
+        }
         let known = |track: &mut Track| {
             let same = track.duration.is_none() && cache::key(&track.url).as_deref() == Some(&name);
             if same {
@@ -717,6 +746,14 @@ impl App {
                 "reaper" => t!("жнец"),
                 "pentagram" => t!("пентаграмма"),
                 _ => t!("нет"),
+            }
+            .into(),
+            Setting::Cover => match Mode::parse(&self.settings.cover) {
+                Mode::Blocks => t!("цветные блоки"),
+                Mode::Braille => t!("цветной брайль"),
+                Mode::BlockTones => t!("блоки в тонах"),
+                Mode::BrailleTones => t!("брайль в тонах"),
+                Mode::Off => t!("нет"),
             }
             .into(),
             Setting::Language => lang::current().name().into(),
@@ -862,6 +899,14 @@ impl App {
                 let count = BACKDROPS.len();
                 let next = (self.backdrop() + count).saturating_add_signed(isize::from(delta));
                 self.settings.backdrop = BACKDROPS[next % count].0.into();
+            }
+            Setting::Cover => {
+                let at = (cover::MODES.iter())
+                    .position(|(_, mode)| *mode == Mode::parse(&self.settings.cover))
+                    .unwrap_or(0);
+                let count = cover::MODES.len();
+                let next = (at + count).saturating_add_signed(isize::from(delta)) % count;
+                self.settings.cover = cover::MODES[next].0.into();
             }
             Setting::Language => {
                 let at = (lang::ALL.iter())
@@ -1502,6 +1547,68 @@ impl App {
             });
         }
     }
+    /// Has the picture of the track that plays ready for its screen: read from the
+    /// cache, or fetched once in the background, while that screen is shown.
+    fn fetch_cover(&mut self) {
+        if let Some((name, receiver)) = &self.cover_job {
+            let cover = match receiver.try_recv() {
+                Ok(cover) => cover,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            };
+            // A run plays few tracks; a set that somehow grows large is dropped whole.
+            if self.covers.len() >= 64 {
+                self.covers.clear();
+            }
+            self.covers.insert(name.clone(), cover);
+            self.cover_job = None;
+        }
+        if self.view != View::Track || Mode::parse(&self.settings.cover) == Mode::Off {
+            return;
+        }
+        let Some(track) = &self.current else {
+            return;
+        };
+        let Some(name) = cache::key(&track.url).filter(|name| !self.covers.contains_key(name))
+        else {
+            return;
+        };
+        let (binary, proxy, direct) = (self.yt_dlp.clone(), self.proxy.clone(), self.direct);
+        let (mpv, url) = (self.mpv.clone(), track.url.clone());
+        let learned = (self.cache.as_ref()).map(|cache| cache.extractor().to_owned());
+        let kept = self.cache.as_ref().map(|cache| cache.art().join(&name));
+        let artwork = self.artworks.get(&name).cloned();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let fetch = || -> Option<Cover> {
+                if let Some(cover) = kept.as_deref().and_then(Cover::read) {
+                    return Some(cover);
+                }
+                let scratch = player::scratch_directory().ok()?;
+                // Without a cache the pixels live as long as the interface runs.
+                let file = match &kept {
+                    Some(kept) => {
+                        fs::create_dir_all(kept.parent()?).ok()?;
+                        kept.clone()
+                    }
+                    None => scratch.join("pixels"),
+                };
+                let extractor = Extractor {
+                    program: &binary,
+                    proxy: proxy.as_deref(),
+                    no_proxy: direct,
+                    cache: learned.as_deref(),
+                };
+                let fetched =
+                    cover::fetch(extractor, &mpv, &url, artwork.as_deref(), &scratch, &file);
+                let cover = fetched.ok().and_then(|()| Cover::read(&file));
+                let _ = fs::remove_dir_all(scratch);
+                cover
+            };
+            let _ = sender.send(fetch());
+        });
+        self.cover_job = Some((name, receiver));
+    }
     // Faster or slower by a tenth, between half and twice the speed of the recording.
     fn pace(&mut self, tenths: f64) {
         self.speed = ((self.speed * 10.0 + tenths).round() / 10.0).clamp(0.5, 2.0);
@@ -1572,6 +1679,10 @@ impl App {
             Action::Submit => self.search(),
             Action::View(view) => self.select_view(view),
             Action::Search => {
+                // The screen of the track has no place to type in.
+                if self.view == View::Track {
+                    self.select_view(View::Search);
+                }
                 self.editing = true;
                 self.filtering = false;
                 self.focus = None;
@@ -1842,6 +1953,7 @@ impl App {
             self.fetch_next();
         }
         self.fetch_ahead();
+        self.fetch_cover();
         // An import from the command line writes the library while this one is open.
         if self.synced.elapsed() > Duration::from_secs(2) && self.sync() {
             self.list_stored();
@@ -1861,6 +1973,7 @@ impl App {
                         title: None,
                         artist: None,
                         duration: Some(player.duration),
+                        artwork: None,
                     })
             })
         });
@@ -2117,6 +2230,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     KeyCode::Char('2') => app.select_view(View::Library),
                     KeyCode::Char('3') => app.select_view(View::Queue),
                     KeyCode::Char('4') => app.select_view(View::Recent),
+                    KeyCode::Char('5') | KeyCode::Char('t') => app.select_view(View::Track),
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.focus = None;
                         app.navigate(1);
@@ -2201,7 +2315,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                         .setting_rows
                         .contains(Position::new(mouse.column, mouse.row)) =>
                 {
-                    let line = usize::from(mouse.row - app.setting_rows.y);
+                    let line = usize::from(mouse.row - app.setting_rows.y) + app.setting_first;
                     if line == app.setting {
                         app.activate();
                     } else {
@@ -2381,7 +2495,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
                     0
                 },
             ),
-            Constraint::Length(3),
+            // The screen of the track has the lines of the search for its picture.
+            Constraint::Length(if app.view == View::Track { 0 } else { 3 }),
             Constraint::Min(8),
             Constraint::Length(7),
             Constraint::Length(2),
@@ -2402,9 +2517,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .split(outer[2]);
     // Buttons register in app.hits in drawing order, which is also the Tab order.
     draw_header(frame, app, &theme, outer[0]);
-    draw_search(frame, app, &theme, outer[1]);
     draw_navigation(frame, app, &theme, body[0]);
-    draw_tracks(frame, app, &theme, body[1]);
+    if app.view == View::Track {
+        draw_track(frame, app, &theme, body[1]);
+    } else {
+        draw_search(frame, app, &theme, outer[1]);
+        draw_tracks(frame, app, &theme, body[1]);
+    }
     if let Some(area) = body.get(2) {
         draw_upcoming(frame, app, &theme, *area);
     }
@@ -2572,6 +2691,7 @@ fn draw_navigation(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) 
         (t!("2  Библиотека"), View::Library),
         (t!("3  Очередь"), View::Queue),
         (t!("4  Недавние"), View::Recent),
+        (t!("5  Трек"), View::Track),
     ];
     let step = if nav.height >= 2 * views.len() as u16 - 1 {
         2
@@ -2648,7 +2768,8 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 &library
             }
             View::Queue => t!(" ОЧЕРЕДЬ ВОСПРОИЗВЕДЕНИЯ "),
-            View::Recent => t!(" НЕДАВНИЕ "),
+            // The screen of the track draws no list.
+            View::Recent | View::Track => t!(" НЕДАВНИЕ "),
         },
     };
     let tracks = app.tracks();
@@ -2675,7 +2796,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                     "\n\nМузыка без перерывов.\n\nНажмите a, чтобы добавить трек в очередь.\nСледующий трек запустится автоматически."
                 )
             }
-            View::Recent => {
+            View::Recent | View::Track => {
                 t!(
                     "\n\nИстория прослушивания.\n\nЗдесь появятся последние включённые треки.\nEnter - включить снова."
                 )
@@ -2822,6 +2943,95 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     }
 }
 
+// The track that plays: its picture, drawn the way the settings say, and beside it what
+// it is and what follows it.
+fn draw_track(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let panel = block(t!(" ТРЕК "), theme);
+    let inner = panel.inner(area).inner(Margin::new(1, 0));
+    frame.render_widget(panel, area);
+    let Some(track) = app.current.clone() else {
+        frame.render_widget(
+            Paragraph::new(t!(
+                "\n\nНичего не играет.\n\nEnter на треке в списке включает его."
+            ))
+            .alignment(Alignment::Center)
+            .style(theme.muted),
+            inner,
+        );
+        return;
+    };
+    // A cell is twice as tall as wide, so a square picture is twice as many columns as
+    // rows; it leaves a third of the width to the words.
+    let mode = Mode::parse(&app.settings.cover);
+    let rows = inner.height.min(inner.width / 3);
+    let columns = rows * 2;
+    let mut taken = 0;
+    if mode != Mode::Off && rows >= 4 {
+        taken = columns + 2;
+        let place = Rect::new(inner.x, inner.y, columns, rows);
+        let name = cache::key(&track.url).unwrap_or_default();
+        match app.covers.get(&name) {
+            Some(Some(cover)) => {
+                let fresh = (app.drawn.as_ref()).is_some_and(|(of, wide, high, how, scheme, _)| {
+                    (of, *wide, *high, *how, scheme) == (&name, columns, rows, mode, &theme.name)
+                });
+                if !fresh {
+                    let cells = cover.cells(columns.into(), rows.into(), mode, theme.palette());
+                    app.drawn = Some((name, columns, rows, mode, theme.name.clone(), cells));
+                }
+                let truecolor = theme.truecolor();
+                let cells = app.drawn.as_ref().map(|drawn| &drawn.5);
+                let buffer = frame.buffer_mut();
+                for (at, cell) in cells.into_iter().flatten().enumerate() {
+                    let (x, y) = (at as u16 % columns, at as u16 / columns);
+                    let drawn = &mut buffer[(place.x + x, place.y + y)];
+                    drawn.set_char(cell.symbol).set_style(theme.text);
+                    if let Some(color) = cell.fg {
+                        drawn.set_fg(theme.paint(color, truecolor));
+                    }
+                    if let Some(color) = cell.bg {
+                        drawn.set_bg(theme.paint(color, truecolor));
+                    }
+                }
+            }
+            waited => {
+                let said = match waited {
+                    Some(_) => t!("обложки нет"),
+                    None => t!("ждём обложку"),
+                };
+                label(
+                    frame,
+                    Rect::new(place.x, place.y + rows / 2, columns, 1),
+                    Line::styled(said, theme.muted).centered(),
+                    theme.muted,
+                );
+            }
+        }
+    }
+    let words = Rect::new(
+        inner.x + taken,
+        inner.y,
+        inner.width.saturating_sub(taken),
+        inner.height,
+    );
+    let mut lines: Vec<Line> = wrap(&clean(&track.title), words.width.into())
+        .into_iter()
+        .take(2)
+        .map(|line| Line::styled(line, theme.strong))
+        .collect();
+    lines.push(Line::styled(clean(&track.artist), theme.muted));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(t!("ДАЛЕЕ"), theme.accent));
+    for next in app.queue.iter().chain(&app.ahead) {
+        lines.push(Line::styled(clean(&next.title), theme.text));
+        lines.push(Line::styled(clean(&next.artist), theme.muted));
+    }
+    if app.queue.is_empty() && app.ahead.is_empty() {
+        lines.push(Line::styled(t!("Очередь пока пуста"), theme.muted));
+    }
+    frame.render_widget(Paragraph::new(lines), words);
+}
+
 // The drawing in the middle of the panel, in the cells nothing else has taken: the first
 // `taken` lines are the list's own, and a text below them keeps a margin on both sides.
 fn draw_backdrop(buffer: &mut Buffer, drawing: &str, area: Rect, taken: u16, style: Style) {
@@ -2868,12 +3078,16 @@ fn draw_settings(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
         .map(|setting| setting.hint().lines().count())
         .max()
         .unwrap_or(0);
-    let (width, height) = (72.min(size.width - 4), (SETTINGS.len() + hints + 8) as u16);
+    // A screen too short for every line shows those around the current one.
+    let height = ((SETTINGS.len() + hints + 8) as u16).min(size.height);
+    let shown = (usize::from(height).saturating_sub(hints + 8)).clamp(1, SETTINGS.len());
+    let first = (app.setting + 1).saturating_sub(shown);
+    let width = 72.min(size.width - 4);
     let area = Rect::new(
         (size.width - width) / 2,
-        size.height.saturating_sub(height) / 2,
+        (size.height - height) / 2,
         width,
-        height.min(size.height),
+        height,
     );
     frame.render_widget(Clear, area);
     let window = modal(t!(" НАСТРОЙКИ | Esc - закрыть "), theme);
@@ -2887,6 +3101,8 @@ fn draw_settings(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
     let mut lines: Vec<Line> = SETTINGS
         .iter()
         .enumerate()
+        .skip(first)
+        .take(shown)
         .map(|(i, setting)| {
             let current = i == app.setting;
             let text = format!(
@@ -2904,7 +3120,7 @@ fn draw_settings(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
     lines.push(Line::raw(""));
     let hint = SETTINGS[app.setting].hint();
     lines.extend(hint.lines().map(|line| note(line.into())));
-    lines.resize(SETTINGS.len() + 2 + hints, Line::raw(""));
+    lines.resize(shown + 2 + hints, Line::raw(""));
     lines.push(note(match &app.config {
         Some(file) => t!("Файл: {}", clean(&file.to_string_lossy())),
         None => t!("Файл настроек не определён: изменения действуют до выхода").into(),
@@ -2930,8 +3146,9 @@ fn draw_settings(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
         inner.x,
         inner.y,
         inner.width,
-        inner.height.min(SETTINGS.len() as u16),
+        inner.height.min(shown as u16),
     );
+    app.setting_first = first;
 }
 
 fn draw_picker(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
@@ -3090,7 +3307,10 @@ fn draw_help(frame: &mut Frame, theme: &Theme, size: Rect) {
     frame.render_widget(Clear, modal_area);
     let keys = [
         ("/", t!("Поиск (Enter отправляет, Esc отменяет)")),
-        ("1 2 3 4", t!("Поиск / библиотека / очередь / недавние")),
+        (
+            "1 2 3 4 5",
+            t!("Поиск / библиотека / очередь / недавние / трек"),
+        ),
         ("Up Down, j k", t!("Выбрать трек     Enter  Проиграть")),
         ("PgUp PgDn", t!("Листать список   Home End  К краям списка")),
         ("Ctrl+F", t!("Фильтр библиотеки (Esc сбрасывает)")),
@@ -3498,8 +3718,13 @@ mod tests {
                 for (index, setting) in SETTINGS.iter().enumerate() {
                     app.setting = index;
                     let text = screen(&mut app, width, height);
+                    // A screen too short for every line shows those around the current.
+                    let all = usize::from(height) >= SETTINGS.len() + 11;
                     for name in SETTINGS.map(Setting::name) {
-                        assert!(text.contains(name), "{at}: {name:?}\n{text}");
+                        assert!(
+                            text.contains(name) || !all && name != setting.name(),
+                            "{at}: {name:?}\n{text}"
+                        );
                     }
                     for line in setting.hint().lines().chain([
                         t!(" НАСТРОЙКИ | Esc - закрыть "),
@@ -4127,6 +4352,230 @@ esac"#,
         }
     }
 
+    // Left half black, right half white: a picture that every way of drawing tells apart.
+    fn halves() -> Cover {
+        let side = cover::SIDE;
+        let bytes: Vec<u8> = (0..side * side)
+            .flat_map(|at| [if at % side < side / 2 { 0 } else { 255 }; 3])
+            .collect();
+        Cover::new(&bytes).unwrap()
+    }
+
+    #[test]
+    fn the_track_that_plays_has_a_screen_with_its_picture() {
+        let mut app = app(PathBuf::new());
+        app.logo = false;
+        app.select_view(View::Track);
+        let text = screen(&mut app, 80, 24);
+        assert!(
+            text.contains(" ТРЕК ") && text.contains("Ничего не играет."),
+            "{text}"
+        );
+        // The screen has the lines of the search and of the list; the player stays.
+        assert!(
+            !text.contains(" / ПОИСК ") && text.contains(" ПЛЕЕР "),
+            "{text}"
+        );
+        assert!(text.contains("5  Трек"), "{text}");
+
+        app.current = Some(track());
+        app.queue.push_back(numbered(7));
+        let name = cache::key(&track().url).unwrap();
+        let text = screen(&mut app, 80, 24);
+        for part in [
+            "ждём обложку",
+            "Ночной эфир",
+            "Test artist",
+            "ДАЛЕЕ",
+            "Title 7",
+        ] {
+            assert!(text.contains(part), "{part}\n{text}");
+        }
+        app.covers.insert(name.clone(), None);
+        assert!(screen(&mut app, 80, 24).contains("обложки нет"));
+
+        // Under a scheme without colors the halves of a block are there or not: nine
+        // rows of eighteen cells at this size, the dark of the picture left empty.
+        app.covers.insert(name.clone(), Some(halves()));
+        let text = screen(&mut app, 80, 24);
+        let rows: Vec<&str> = text.lines().filter(|line| line.contains('█')).collect();
+        assert_eq!(rows.len(), 9, "{text}");
+        assert!(
+            rows.iter()
+                .all(|row| row.contains("|          █████████  ")),
+            "{text}"
+        );
+        app.settings.cover = "braille".into();
+        let text = screen(&mut app, 80, 24);
+        assert!(
+            text.contains("|          ⣿⣿⣿⣿⣿⣿⣿⣿⣿  ") && !text.contains('█'),
+            "{text}"
+        );
+        // A screen with room to spare draws it larger.
+        let tall = screen(&mut app, 100, 40);
+        assert_eq!(
+            tall.lines().filter(|line| line.contains('⣿')).count(),
+            24,
+            "{tall}"
+        );
+
+        // Under a scheme with colors every cell of the picture has its own: of the
+        // picture itself, or between the two colors of the scheme.
+        app.theme = Theme::with("Dracula", true);
+        let colors = |app: &mut App| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            // The first and the last cell of the first row of the picture.
+            let row = (0..24)
+                .find(|y| buffer[(23, *y)].symbol() == "▀" || buffer[(40, *y)].symbol() == "⣿")
+                .unwrap();
+            let cell = |x: u16| {
+                (
+                    buffer[(x, row)].symbol().to_owned(),
+                    buffer[(x, row)].fg,
+                    buffer[(x, row)].bg,
+                )
+            };
+            (cell(23), cell(40))
+        };
+        app.settings.cover = "blocks".into();
+        let (dark, light) = colors(&mut app);
+        assert_eq!(dark, ("▀".into(), Color::Rgb(0, 0, 0), Color::Rgb(0, 0, 0)));
+        assert_eq!(
+            light,
+            (
+                "▀".into(),
+                Color::Rgb(255, 255, 255),
+                Color::Rgb(255, 255, 255)
+            )
+        );
+        app.settings.cover = "block-tones".into();
+        let (dark, light) = colors(&mut app);
+        let (behind, text_color) = (app.theme.base.bg.unwrap(), app.theme.base.fg.unwrap());
+        assert_eq!((dark.1, light.1), (behind, text_color));
+        app.settings.cover = "braille-tones".into();
+        let (dark, light) = colors(&mut app);
+        assert_eq!(
+            (dark.0.as_str(), light.0.as_str(), light.1),
+            (" ", "⣿", text_color)
+        );
+        // A terminal of 256 colors gets the nearest of them.
+        app.theme = Theme::with("Dracula", false);
+        app.settings.cover = "blocks".into();
+        let (dark, light) = colors(&mut app);
+        assert_eq!((dark.1, light.1), (Color::Indexed(16), Color::Indexed(231)));
+
+        // Without a picture the words have the whole width.
+        app.settings.cover = "none".into();
+        let text = screen(&mut app, 80, 24);
+        assert!(
+            text.contains("| Ночной эфир") && !text.contains('▀'),
+            "{text}"
+        );
+        // The settings go round the ways of drawing it.
+        app.setting = SETTINGS.iter().position(|s| *s == Setting::Cover).unwrap();
+        let mut seen = vec![];
+        for _ in 0..5 {
+            app.adjust(1);
+            seen.push(app.value(Setting::Cover));
+        }
+        assert_eq!(
+            seen,
+            [
+                "цветные блоки",
+                "цветной брайль",
+                "блоки в тонах",
+                "брайль в тонах",
+                "нет"
+            ]
+        );
+        // Typing a search leaves the screen for the list it fills.
+        app.action(Action::Search);
+        assert!(app.view == View::Search && app.editing);
+    }
+
+    #[test]
+    fn a_picture_is_read_from_the_cache_while_its_screen_is_shown() {
+        let root = std::env::temp_dir().join(format!("clicloud-art-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut app = app(PathBuf::new());
+        app.cache = Some(Cache::open(root.clone(), 0).unwrap());
+        // Nothing may reach the network: neither program is there to be started.
+        app.yt_dlp = "clicloud-no-such-program".into();
+        app.mpv = "clicloud-no-such-program".into();
+        app.current = Some(track());
+        let name = cache::key(&track().url).unwrap();
+        let art = app.cache.as_ref().unwrap().art();
+        fs::create_dir_all(&art).unwrap();
+        fs::write(art.join(&name), vec![7; cover::SIDE * cover::SIDE * 3]).unwrap();
+        let settle = |app: &mut App| {
+            for _ in 0..500 {
+                app.fetch_cover();
+                if app.cover_job.is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // Another screen asks for no picture, and neither does a setting of none.
+        app.fetch_cover();
+        assert!(app.cover_job.is_none());
+        app.select_view(View::Track);
+        app.settings.cover = "none".into();
+        app.fetch_cover();
+        assert!(app.cover_job.is_none());
+        app.settings.cover = "blocks".into();
+        app.fetch_cover();
+        assert!(app.cover_job.is_some());
+        settle(&mut app);
+        assert!(app.covers[&name].is_some());
+        // One that cannot be had is not asked for on every tick.
+        app.current = Some(numbered(9));
+        app.fetch_cover();
+        settle(&mut app);
+        let other = cache::key(&numbered(9).url).unwrap();
+        assert!(app.covers[&other].is_none());
+        app.fetch_cover();
+        assert!(app.cover_job.is_none());
+        // What a download told of the picture is kept for when it is asked for.
+        let details = Details {
+            title: None,
+            artist: None,
+            duration: Some(1.0),
+            artwork: Some("https://i1.sndcdn.com/artworks-abc-large.jpg".into()),
+        };
+        app.learn(&numbered(9).url, &details);
+        assert_eq!(
+            app.artworks[&other],
+            "https://i1.sndcdn.com/artworks-abc-large.jpg"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_settings_window_shows_the_lines_around_the_current_one() {
+        let mut app = app(PathBuf::new());
+        app.options = true;
+        app.greeted = app.message.clone();
+        let first = SETTINGS[0].name();
+        let last = SETTINGS[SETTINGS.len() - 1].name();
+        // The least screen has no room for every line.
+        let text = screen(&mut app, 80, 24);
+        assert!(text.contains(first) && !text.contains(last), "{text}");
+        app.setting = SETTINGS.len() - 1;
+        let text = screen(&mut app, 80, 24);
+        assert!(
+            !text.contains(first) && text.contains(&format!("> {last}")),
+            "{text}"
+        );
+        assert_eq!(app.setting_first, 1);
+        assert!(text.contains("Up/Down - выбор"), "{text}");
+        // A taller one shows them all.
+        let text = screen(&mut app, 80, 30);
+        assert!(text.contains(first) && text.contains(last) && app.setting_first == 0);
+    }
+
     #[test]
     fn a_list_plays_on_from_the_track_that_was_started() {
         let player = script("order-player", "exec sleep 30");
@@ -4324,6 +4773,7 @@ esac"#,
             title: Some("Remote Viewing".into()),
             artist: Some("low_sea".into()),
             duration: Some(196.645),
+            artwork: Some("https://i1.sndcdn.com/artworks-abc-large.jpg".into()),
         };
         app.learn(&liked.url, &details);
         for track in [

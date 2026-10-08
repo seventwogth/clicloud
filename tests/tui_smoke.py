@@ -159,7 +159,7 @@ if os.environ.get("MPV_LINGER"):
             os.write(master, b"2x")
             read_until(lambda: not stored.exists())
             # A setting changed in the settings window lands in the settings file.
-            os.write(master, b"ojjjjjjj\x1b[C")
+            os.write(master, b"ojjjjjjjj\x1b[C")
             settings = root / "config.json"
             read_until(lambda: json.loads(settings.read_text() or "{}").get("search_limit") == 15)
             # The last line of the settings brings the likes of a profile into the favorites:

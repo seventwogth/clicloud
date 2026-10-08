@@ -33,6 +33,9 @@ pub struct Settings {
     pub seek_step: u16,
     /// The volume the interface starts with.
     pub volume: u8,
+    /// How the picture of a track is drawn: blocks, braille, block-tones,
+    /// braille-tones or none.
+    pub cover: String,
     /// Whether tracks are brought to one loudness.
     pub normalize: bool,
     /// The device mpv plays on, by the name it knows it by; mpv chooses without one.
@@ -63,6 +66,7 @@ impl Default for Settings {
             search_limit: 10,
             seek_step: 10,
             volume: 70,
+            cover: "blocks".into(),
             normalize: false,
             audio_device: None,
             shuffle: false,

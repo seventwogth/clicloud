@@ -3,6 +3,7 @@ mod lang;
 
 mod cache;
 mod config;
+mod cover;
 mod library;
 #[cfg(unix)]
 mod playback;

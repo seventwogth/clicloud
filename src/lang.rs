@@ -540,9 +540,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "検索 (Enter で実行、Esc で中止)",
     ),
     (
-        "Поиск / библиотека / очередь / недавние",
-        "Search / library / queue / recent",
-        "検索 / ライブラリ / キュー / 履歴",
+        "Поиск / библиотека / очередь / недавние / трек",
+        "Search / library / queue / recent / track",
+        "検索 / ライブラリ / キュー / 履歴 / 曲",
     ),
     (
         "Выбрать трек     Enter  Проиграть",
@@ -1017,6 +1017,25 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "mpv から機器の一覧を取得できません",
     ),
     ("Скорость: x{}", "Speed: x{}", "速度: x{}"),
+    ("Обложка", "Cover", "ジャケット"),
+    (
+        "Enter или Left/Right - как рисовать обложку на экране трека (5):\nблоками или точками Брайля, в её цветах или в тонах схемы.",
+        "Enter or Left/Right - how the track screen (5) draws the cover:\nblocks or Braille dots, in its own colors or in tones of the scheme.",
+        "Enter か Left/Right - 曲の画面 (5) でのジャケットの描き方:\nブロックか点字、元の色か配色の濃淡で描きます。",
+    ),
+    ("цветные блоки", "colored blocks", "カラーのブロック"),
+    ("цветной брайль", "colored Braille", "カラーの点字"),
+    ("блоки в тонах", "blocks in tones", "濃淡のブロック"),
+    ("брайль в тонах", "Braille in tones", "濃淡の点字"),
+    (" ТРЕК ", " TRACK ", " 曲 "),
+    ("5  Трек", "5  Track", "5  曲"),
+    (
+        "\n\nНичего не играет.\n\nEnter на треке в списке включает его.",
+        "\n\nNothing is playing.\n\nEnter on a track in a list starts it.",
+        "\n\n何も再生していません。\n\n一覧の曲で Enter を押すと再生します。",
+    ),
+    ("ждём обложку", "cover is coming", "読み込み中..."),
+    ("обложки нет", "no cover", "ジャケットなし"),
 ];
 
 #[cfg(test)]
@@ -1061,6 +1080,7 @@ mod tests {
         let sources = [
             include_str!("cache.rs"),
             include_str!("config.rs"),
+            include_str!("cover.rs"),
             include_str!("library.rs"),
             include_str!("main.rs"),
             include_str!("playback.rs"),

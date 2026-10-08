@@ -397,6 +397,54 @@ impl Theme {
         }
     }
 
+    /// What a picture may be drawn with under this scheme: whether cells take colors
+    /// at all, the two colors that its tones run between, the darker first, and
+    /// whether marks are lighter than what is behind them.
+    pub fn palette(&self) -> crate::cover::Palette {
+        let rgb = |color: Option<Color>| match color {
+            Some(Color::Rgb(red, green, blue)) => Some(Rgb(red, green, blue)),
+            Some(Color::Indexed(index)) => Some(Rgb::of(index)),
+            _ => None,
+        };
+        // A scheme that leaves the colors to the terminal names neither: its tones
+        // are grays, and the terminal is taken for a dark one.
+        let (behind, marks) = match (rgb(self.base.bg), rgb(self.base.fg)) {
+            (Some(behind), Some(marks)) => (behind, marks),
+            _ => (Rgb(0, 0, 0), Rgb(255, 255, 255)),
+        };
+        let light_marks = marks.luminance() >= behind.luminance();
+        let (dark, light) = if light_marks {
+            (behind, marks)
+        } else {
+            (marks, behind)
+        };
+        crate::cover::Palette {
+            colors: self.text.fg.is_some() || self.base.bg.is_some(),
+            tones: ([dark.0, dark.1, dark.2], [light.0, light.1, light.2]),
+            light_marks,
+        }
+    }
+
+    /// The color of the terminal for one of a picture: itself where the scheme is in
+    /// true color, the nearest of the 256 otherwise. A scheme of the terminal's own
+    /// colors asks the terminal what it takes.
+    pub fn paint(&self, [red, green, blue]: [u8; 3], truecolor: bool) -> Color {
+        if truecolor {
+            Color::Rgb(red, green, blue)
+        } else {
+            Color::Indexed(Rgb(red, green, blue).indexed())
+        }
+    }
+
+    /// Whether colors may be given as red, green and blue under this scheme.
+    pub fn truecolor(&self) -> bool {
+        match self.base.bg {
+            Some(Color::Rgb(..)) => true,
+            Some(Color::Indexed(_)) => false,
+            _ => truecolor(|name| std::env::var(name).ok()),
+        }
+    }
+
     // The same scheme in the 256 colors that terminals without true color have.
     fn reduced(mut self) -> Self {
         let index = |color: Option<Color>| match color {

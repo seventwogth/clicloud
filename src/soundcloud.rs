@@ -21,6 +21,9 @@ pub struct Details {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub duration: Option<f64>,
+    /// Where the picture of the track is.
+    #[serde(default)]
+    pub artwork: Option<String>,
 }
 
 impl Details {
@@ -31,7 +34,7 @@ impl Details {
         "--output-na-placeholder",
         "null",
         "--print-to-file",
-        r#"{"title":%(title)j,"artist":%(uploader)j,"duration":%(duration)j}"#,
+        r#"{"title":%(title)j,"artist":%(uploader)j,"duration":%(duration)j,"artwork":%(thumbnail)j}"#,
         Self::FILE,
     ];
 
@@ -665,6 +668,7 @@ mod tests {
             title: Some(" ".into()),
             artist: None,
             duration: Some(0.0),
+            artwork: None,
         };
         partly.apply(&mut track);
         assert_eq!(
