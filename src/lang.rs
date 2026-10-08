@@ -347,9 +347,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "この画面には対話型の端末が必要です。スクリプトでは search か play --first を使ってください。",
     ),
     (
-        "Не удалось определить путь библиотеки; укажите ui --library PATH",
-        "The library path is unknown; pass ui --library PATH",
-        "ライブラリの場所が不明です。ui --library PATH を指定してください",
+        "Не удалось определить путь библиотеки; укажите {} --library PATH",
+        "The library path is unknown; pass {} --library PATH",
+        "ライブラリの場所が不明です。{} --library PATH を指定してください",
     ),
     (
         "\n  CLICLOUD\n\n  Увеличьте терминал до 80x24.\n  q - выход",
@@ -778,9 +778,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "yt-dlp ({}) を実行できません: {}  clicloud doctor で確認してください。",
     ),
     (
-        "Поиск yt-dlp завершился с {}:\n{}",
-        "The yt-dlp search ended with {}:\n{}",
-        "yt-dlp の検索が {} で終了しました:\n{}",
+        "yt-dlp завершился с {}:\n{}",
+        "yt-dlp ended with {}:\n{}",
+        "yt-dlp が {} で終了しました:\n{}",
     ),
     (
         "Некорректный ответ JSON от yt-dlp: {}",
@@ -829,10 +829,88 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "キャッシュ {} を準備できません: {}  --cache-dir か --no-cache を指定してください。",
     ),
     ("Язык", "Language", "言語"),
+    ("Фоновый рисунок", "Backdrop", "背景の絵"),
+    ("нет", "none", "なし"),
+    ("жнец", "reaper", "死神"),
+    ("пентаграмма", "pentagram", "五芒星"),
+    (
+        "Enter или Left/Right - сменить рисунок за списком треков.\nнет - список без рисунка.",
+        "Enter or Left/Right - the drawing behind the list of tracks.\nnone - a list without a drawing.",
+        "Enter か Left/Right - 曲の一覧の後ろの絵を切り替えます。\nなし - 絵のない一覧。",
+    ),
     (
         "Enter или Left/Right - сменить язык интерфейса и сообщений.\nСправка командной строки (--help) остаётся на русском.",
         "Enter or Left/Right - the language of the interface and messages.\nThe command line help (--help) stays in Russian.",
         "Enter か Left/Right - 画面とメッセージの言語を切り替えます。\nコマンドラインのヘルプ (--help) はロシア語のままです。",
+    ),
+    (
+        "Читаю лайки профиля {}…",
+        "Reading the likes of {}…",
+        "{} のいいねを読み込み中…",
+    ),
+    (
+        "Ожидается имя профиля SoundCloud или ссылка на него: name или soundcloud.com/name.",
+        "A SoundCloud profile name or a link to it is expected: name or soundcloud.com/name.",
+        "SoundCloud のプロフィール名かそのリンクを指定してください: name か soundcloud.com/name",
+    ),
+    (
+        "{} - раздел сайта, а не профиль. Имя профиля стоит в адресе его страницы: soundcloud.com/name.",
+        "{} is a section of the site, not a profile. The name of a profile is in the address of its page: soundcloud.com/name.",
+        "{} はサイトのセクションで、プロフィールではありません。プロフィール名はそのページのアドレスにあります: soundcloud.com/name",
+    ),
+    ("Получено: {}", "Received: {}", "取得済み: {}"),
+    (
+        "В профиле нет лайков.",
+        "The profile has no likes.",
+        "このプロフィールにいいねはありません。",
+    ),
+    (
+        "Было бы добавлено: {}, уже в избранном: {}, пропущено: {}",
+        "Would be added: {}, already among the favorites: {}, skipped: {}",
+        "追加予定: {}、お気に入りに登録済み: {}、スキップ: {}",
+    ),
+    (
+        "Добавлено в избранное: {}, уже было: {}, пропущено: {}",
+        "Added to the favorites: {}, already there: {}, skipped: {}",
+        "お気に入りに追加: {}、登録済み: {}、スキップ: {}",
+    ),
+    ("Библиотека: {}", "Library: {}", "ライブラリ: {}"),
+    (
+        "Лайки SoundCloud",
+        "SoundCloud likes",
+        "SoundCloud のいいね",
+    ),
+    (
+        "Enter - имя профиля или ссылка, ещё раз Enter - добавить его\nлайки в избранное. Лайки должны быть видны в профиле.\nПока список читается, Enter прерывает его.",
+        "Enter - a profile name or a link, Enter again - add its likes\nto the favorites. The likes must be visible in the profile.\nWhile the list is being read, Enter stops it.",
+        "Enter - プロフィール名かリンク、もう一度 Enter でいいねを\nお気に入りに追加。いいねは公開されている必要があります。\n読み込み中に Enter を押すと中断します。",
+    ),
+    ("{}: получено {}", "{}: received {}", "{}: {} 件取得"),
+    ("{}: прервано", "{}: stopped", "{}: 中断しました"),
+    (
+        "{}: добавлено {}, уже было {}",
+        "{}: added {}, already there {}",
+        "{}: 追加 {}、登録済み {}",
+    ),
+    (
+        "{}: оборвалось, добавлено {}",
+        "{}: broke off, added {}",
+        "{}: 途中で失敗、追加 {}",
+    ),
+    (
+        "Лайки {}: добавлено {}, уже было {}, пропущено {}",
+        "Likes of {}: added {}, already there {}, skipped {}",
+        "{} のいいね: 追加 {}、登録済み {}、スキップ {}",
+    ),
+    (
+        "Список лайков оборвался. e - подробности, Esc - закрыть окно",
+        "The list of likes broke off. e - details, Esc - close the window",
+        "いいねの一覧が途中で失敗しました。e - 詳細、Esc - 閉じる",
+    ),
+    (
+        "Чтение лайков прервано",
+        "Reading the likes was interrupted",
+        "いいねの読み込みが中断されました",
     ),
 ];
 
@@ -878,6 +956,7 @@ mod tests {
         let sources = [
             include_str!("cache.rs"),
             include_str!("config.rs"),
+            include_str!("library.rs"),
             include_str!("main.rs"),
             include_str!("playback.rs"),
             include_str!("player.rs"),

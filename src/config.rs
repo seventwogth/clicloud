@@ -23,6 +23,8 @@ pub struct Settings {
     pub cache_limit_mb: u64,
     /// A color scheme of the interface; see `theme`.
     pub theme: String,
+    /// The drawing behind the list of tracks: none, reaper or pentagram.
+    pub backdrop: String,
     /// The language of the interface and the messages: ru, en or ja.
     pub language: String,
     /// How many tracks a search in the interface asks for.
@@ -31,6 +33,9 @@ pub struct Settings {
     pub seek_step: u16,
     /// The volume the interface starts with.
     pub volume: u8,
+    /// The profile whose likes the interface was last asked to bring in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soundcloud_profile: Option<String>,
 }
 
 impl Default for Settings {
@@ -42,12 +47,14 @@ impl Default for Settings {
             cache_dir: None,
             cache_limit_mb: 1024,
             theme: crate::theme::TERMINAL.into(),
+            backdrop: "reaper".into(),
             language: crate::lang::Lang::Russian.code().into(),
             // A track of a search costs about a second of yt-dlp's time, so a list of
             // thirty kept the search running long after the first screen was there.
             search_limit: 10,
             seek_step: 10,
             volume: 70,
+            soundcloud_profile: None,
         }
     }
 }

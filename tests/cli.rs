@@ -659,6 +659,148 @@ fn invalid_input_fails_before_search() {
     }
 }
 
+// What yt-dlp writes for the likes of a profile: a line for each, with no word of who
+// made the track; a liked playlist is among them.
+const LIKES: &str = r#"{"_type":"url","title":"Night","url":"https://soundcloud.com/artist/night","uploader":null,"duration":null}
+{"_type":"url","title":"Album","url":"https://soundcloud.com/artist/sets/album"}
+{"_type":"url","title":"Old","url":"https://www.soundcloud.com/other_one/old?si=1"}"#;
+
+#[test]
+fn import_adds_the_likes_of_a_profile_to_the_favorites_once() {
+    let fixture = Fixture::new();
+    let library = fixture.0.join("data/library.json");
+    fs::create_dir(fixture.0.join("data")).unwrap();
+    fs::write(
+        &library,
+        r#"{"favorites":[{"title":"Old","artist":"Other","duration":61.0,"url":"https://soundcloud.com/other_one/old"}],"recent":[{"title":"Played","artist":"Other","duration":null,"url":"https://soundcloud.com/other_one/played"}]}"#,
+    )
+    .unwrap();
+    let import = |profile: &str, flags: &[&str]| {
+        let mut command = fixture.command();
+        command
+            .env("SEARCH_RESPONSE", LIKES)
+            .args(["import", profile, "--library"])
+            .arg(&library)
+            .args(flags);
+        command.output().unwrap()
+    };
+    let read =
+        || -> serde_json::Value { serde_json::from_slice(&fs::read(&library).unwrap()).unwrap() };
+
+    // A trial run names what is new and writes nothing.
+    let before = fs::read(&library).unwrap();
+    let output = import("https://soundcloud.com/Some-One/likes", &["--dry-run"]);
+    assert!(output.status.success(), "{:?}", output);
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        said.contains("artist — Night")
+            && said.contains("добавлено: 1, уже в избранном: 1, пропущено: 1"),
+        "{said}"
+    );
+    assert_eq!(fs::read(&library).unwrap(), before);
+    let args = fixture.read("search.log");
+    assert!(args.contains("--flat-playlist\n") && args.contains("--lazy-playlist\n"));
+    assert!(
+        args.ends_with("--\nhttps://soundcloud.com/Some-One/likes\n"),
+        "{args}"
+    );
+
+    let output = import("@Some-One", &[]);
+    assert!(output.status.success(), "{:?}", output);
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        said.contains("Добавлено в избранное: 1, уже было: 1, пропущено: 1"),
+        "{said}"
+    );
+    assert!(
+        fixture
+            .read("search.log")
+            .ends_with("--\nhttps://soundcloud.com/Some-One/likes\n")
+    );
+    let kept = read();
+    let favorites = kept["favorites"].as_array().unwrap();
+    assert_eq!(favorites.len(), 2);
+    // What was a favorite keeps what was known of it; the new one follows.
+    assert_eq!(
+        (&favorites[0]["artist"], &favorites[0]["duration"]),
+        (&"Other".into(), &61.0.into())
+    );
+    assert_eq!(favorites[1]["url"], "https://soundcloud.com/artist/night");
+    assert_eq!(favorites[1]["artist"], "artist");
+    assert_eq!(kept["recent"][0]["title"], "Played");
+
+    // Asked again, there is nothing to add.
+    let output = import("Some-One", &[]);
+    assert!(output.status.success(), "{:?}", output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Добавлено в избранное: 0, уже было: 2")
+    );
+    assert_eq!(read()["favorites"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn import_keeps_what_arrived_before_a_failure_and_reports_it() {
+    let fixture = Fixture::new();
+    let library = fixture.0.join("library.json");
+    let import = |fail: &str, response: &str| {
+        fixture
+            .command()
+            .env("FAIL_SEARCH", fail)
+            .env("SEARCH_RESPONSE", response)
+            .args(["import", "someone", "--library"])
+            .arg(&library)
+            .output()
+            .unwrap()
+    };
+    // Nothing arrived: nothing is written.
+    let output = import("1", LIKES);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("429"));
+    assert!(!library.exists());
+    // A profile without likes is no failure, and no library is made for it.
+    let output = import("0", "");
+    assert!(output.status.success(), "{:?}", output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("нет лайков"));
+    assert!(!library.exists());
+    // The list broke off: what came is kept, and the run still fails.
+    let output = import("late", LIKES);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Добавлено в избранное: 2"));
+    let kept: serde_json::Value = serde_json::from_slice(&fs::read(&library).unwrap()).unwrap();
+    assert_eq!(kept["favorites"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn import_asks_nothing_for_a_bad_profile_or_a_damaged_library() {
+    let fixture = Fixture::new();
+    let library = fixture.0.join("library.json");
+    for profile in [
+        "",
+        "https://soundcloud.com/you/likes",
+        "https://soundcloud.com/artist/night",
+        "https://example.com/name",
+    ] {
+        let output = fixture
+            .command()
+            .args(["import", profile, "--library"])
+            .arg(&library)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{profile}");
+    }
+    fs::write(&library, "{broken").unwrap();
+    let output = fixture
+        .command()
+        .args(["import", "someone", "--library"])
+        .arg(&library)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("повреждён"));
+    assert_eq!(fs::read(&library).unwrap(), b"{broken");
+    assert!(!fixture.0.join("search.log").exists());
+}
+
 // A freshly copied executable is briefly busy while another test thread forks.
 fn output(command: &mut Command) -> std::process::Output {
     loop {

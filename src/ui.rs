@@ -3,11 +3,13 @@ use crate::{
     cache::{self, Cache},
     clean, clean_lines,
     config::{self, Settings},
-    lang, megabytes,
+    lang,
+    library::{self, Library},
+    megabytes,
     playback::{self, Origin, Playback},
     player::{self, Download},
     setup,
-    soundcloud::{Extractor, SoundCloud, Track},
+    soundcloud::{self, Extractor, SoundCloud, Track},
     theme::{self, Theme},
 };
 use crossterm::{
@@ -20,7 +22,6 @@ use crossterm::{
 };
 use ratatui::layout::Position;
 use ratatui::{prelude::*, widgets::*};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::{
     Arc,
@@ -29,7 +30,7 @@ use std::sync::{
 use std::{
     collections::{HashMap, VecDeque},
     fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal},
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
@@ -46,6 +47,15 @@ const TAGLINES: [&str; 4] = [
 
 // The mark that turns while something runs, ASCII like every other mark here.
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+// The drawings behind the list of tracks, by their names in the settings; the first is none.
+const BACKDROPS: [(&str, &str); 3] = [
+    ("none", ""),
+    ("reaper", include_str!("../backdrops/reaper")),
+    ("pentagram", include_str!("../backdrops/pentagram")),
+];
+
+// The name drawn large, a mark to a dot. The header shows it small, eight dots to a cell.
+const LOGO: &str = include_str!("../logo.txt");
 
 // Frames, buttons and marks are ASCII in every color scheme.
 const BORDER: symbols::border::Set = symbols::border::Set {
@@ -93,40 +103,6 @@ enum Found {
     Over(std::result::Result<(), String>),
 }
 
-#[derive(Default, Serialize, Deserialize)]
-#[serde(default)]
-struct Library {
-    favorites: Vec<Track>,
-    recent: Vec<Track>,
-}
-
-fn load_library(path: &PathBuf) -> Result<Library> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)
-            .map_err(|_| t!("Файл библиотеки повреждён; он не был перезаписан."))?),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Library::default()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn save_library(path: &PathBuf, library: &Library) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    let result = (|| -> Result<()> {
-        let mut file = fs::File::create(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(library)?)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    result
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Search,
@@ -138,6 +114,7 @@ enum View {
 #[derive(Clone, Copy, PartialEq)]
 enum Setting {
     Theme,
+    Backdrop,
     Language,
     Proxy,
     ProxyAddress,
@@ -146,10 +123,12 @@ enum Setting {
     SearchLimit,
     SeekStep,
     Volume,
+    Likes,
 }
 
-const SETTINGS: [Setting; 9] = [
+const SETTINGS: [Setting; 11] = [
     Setting::Theme,
+    Setting::Backdrop,
     Setting::Language,
     Setting::Proxy,
     Setting::ProxyAddress,
@@ -158,6 +137,7 @@ const SETTINGS: [Setting; 9] = [
     Setting::SearchLimit,
     Setting::SeekStep,
     Setting::Volume,
+    Setting::Likes,
 ];
 const SEEK_STEPS: [u16; 5] = [5, 10, 15, 30, 60];
 
@@ -165,6 +145,7 @@ impl Setting {
     fn name(self) -> &'static str {
         match self {
             Self::Theme => t!("Цветовая схема"),
+            Self::Backdrop => t!("Фоновый рисунок"),
             Self::Language => t!("Язык"),
             Self::Proxy => t!("Прокси"),
             Self::ProxyAddress => t!("Адрес прокси"),
@@ -173,6 +154,7 @@ impl Setting {
             Self::SearchLimit => t!("Результатов поиска"),
             Self::SeekStep => t!("Шаг перемотки"),
             Self::Volume => t!("Громкость при запуске"),
+            Self::Likes => t!("Лайки SoundCloud"),
         }
     }
     fn hint(self) -> &'static str {
@@ -180,6 +162,11 @@ impl Setting {
             Self::Theme => {
                 t!(
                     "Enter - список схем с предпросмотром, Left/Right - соседняя.\nterminal повторяет цвета терминала, mono обходится без цвета,\nостальные - темы Ghostty."
+                )
+            }
+            Self::Backdrop => {
+                t!(
+                    "Enter или Left/Right - сменить рисунок за списком треков.\nнет - список без рисунка."
                 )
             }
             Self::Language => {
@@ -208,6 +195,11 @@ impl Setting {
             Self::SearchLimit => t!("Left/Right - по 5, от 5 до 50 треков на один поиск."),
             Self::SeekStep => t!("Left/Right - 5, 10, 15, 30 или 60 секунд на одно нажатие."),
             Self::Volume => t!("Left/Right - по 5. Применяется при следующем запуске."),
+            Self::Likes => {
+                t!(
+                    "Enter - имя профиля или ссылка, ещё раз Enter - добавить его\nлайки в избранное. Лайки должны быть видны в профиле.\nПока список читается, Enter прерывает его."
+                )
+            }
         }
     }
 }
@@ -252,6 +244,15 @@ enum Action {
     Louder,
 }
 
+// The likes of a profile on their way into the favorites.
+struct Import {
+    profile: String,
+    tracks: Vec<Track>,
+    receiver: mpsc::Receiver<Found>,
+    cancel: Arc<AtomicBool>,
+    worker: std::thread::JoinHandle<()>,
+}
+
 // A track being downloaded into the cache without being played.
 struct Fetch {
     track: Track,
@@ -273,6 +274,8 @@ struct App {
     // The proxy that switching it on brings back, even if only a flag named it.
     address: Option<String>,
     theme: Theme,
+    // Whether the header may draw the logo: the console of Linux has no letters for it.
+    logo: bool,
     tagline: &'static str,
     // When the interface started, which is what the turning mark is timed by.
     since: Instant,
@@ -283,8 +286,11 @@ struct App {
     options: bool,
     setting: usize,
     setting_rows: Rect,
-    // The proxy address being typed.
+    // What is being typed into the current line: a proxy address or a profile.
     input: Option<String>,
+    import: Option<Import>,
+    // How the last import of this run ended, which its line shows until the next one.
+    imported: Option<String>,
     // As of `listed`: the tracks in the cache that are not among the favorites, which
     // the library shows after them, and the number and size of all that is in the cache.
     stored: Vec<Track>,
@@ -338,6 +344,7 @@ impl App {
             cache: session.cache,
             cache_dir: session.cache_dir,
             theme: Theme::load(&session.settings.theme),
+            logo: !std::env::var("TERM").is_ok_and(|term| term == "linux"),
             tagline: tagline(),
             since: Instant::now(),
             setup: None,
@@ -347,6 +354,8 @@ impl App {
             setting: 0,
             setting_rows: Rect::default(),
             input: None,
+            import: None,
+            imported: None,
             stored: vec![],
             stored_count: 0,
             stored_size: 0,
@@ -464,7 +473,7 @@ impl App {
         });
     }
     fn save(&mut self) {
-        if let Err(error) = save_library(&self.library_path, &self.library) {
+        if let Err(error) = library::save(&self.library_path, &self.library) {
             self.message = t!("Не удалось сохранить библиотеку: {}", error);
         }
     }
@@ -481,15 +490,23 @@ impl App {
         let switch = |on: bool| if on { t!("вкл") } else { t!("выкл") }.to_owned();
         match setting {
             Setting::Theme => self.theme.name.clone(),
+            Setting::Backdrop => match BACKDROPS[self.backdrop()].0 {
+                "reaper" => t!("жнец"),
+                "pentagram" => t!("пентаграмма"),
+                _ => t!("нет"),
+            }
+            .into(),
             Setting::Language => lang::current().name().into(),
             Setting::Proxy if self.proxy.is_none() && self.extractor().proxied() => {
                 t!("выкл, действует прокси из окружения").into()
             }
             Setting::Proxy => switch(self.proxy.is_some()),
-            Setting::ProxyAddress => match (&self.input, &self.address) {
-                (Some(input), _) => format!("{input}_"),
-                (None, Some(address)) => address.clone(),
-                (None, None) => t!("не задан").into(),
+            _ if self.input.is_some() && SETTINGS[self.setting] == setting => {
+                format!("{}_", self.input.as_deref().unwrap_or_default())
+            }
+            Setting::ProxyAddress => match &self.address {
+                Some(address) => address.clone(),
+                None => t!("не задан").into(),
             },
             Setting::Cache => switch(self.cache.is_some()),
             Setting::CacheLimit => match self.settings.cache_limit_mb {
@@ -499,6 +516,16 @@ impl App {
             Setting::SearchLimit => self.settings.search_limit.to_string(),
             Setting::SeekStep => t!("{} с", self.settings.seek_step),
             Setting::Volume => self.settings.volume.to_string(),
+            Setting::Likes => match (&self.import, &self.imported) {
+                (Some(import), _) => {
+                    t!("{}: получено {}", import.profile, import.tracks.len())
+                }
+                (None, Some(outcome)) => outcome.clone(),
+                (None, None) => match &self.settings.soundcloud_profile {
+                    Some(profile) => profile.clone(),
+                    None => t!("не задан").into(),
+                },
+            },
         }
     }
     fn set_theme(&mut self, name: &str) {
@@ -513,6 +540,13 @@ impl App {
         self.themes
             .iter()
             .position(|name| *name == self.settings.theme)
+            .unwrap_or(0)
+    }
+    // The place of the chosen drawing; a name that is not known shows none.
+    fn backdrop(&self) -> usize {
+        BACKDROPS
+            .iter()
+            .position(|(name, _)| *name == self.settings.backdrop)
             .unwrap_or(0)
     }
     fn move_setting(&mut self, delta: isize) {
@@ -545,6 +579,10 @@ impl App {
             }
             Setting::ProxyAddress => {
                 self.input = Some(self.address.clone().unwrap_or_else(|| config::TOR.into()));
+            }
+            Setting::Likes if self.import.is_some() => self.cancel_import(),
+            Setting::Likes => {
+                self.input = Some(self.settings.soundcloud_profile.clone().unwrap_or_default());
             }
             Setting::Cache => {
                 if self.cache.take().is_some() {
@@ -589,6 +627,11 @@ impl App {
                 self.set_theme(&name);
                 return;
             }
+            Setting::Backdrop => {
+                let count = BACKDROPS.len();
+                let next = (self.backdrop() + count).saturating_add_signed(isize::from(delta));
+                self.settings.backdrop = BACKDROPS[next % count].0.into();
+            }
             Setting::Language => {
                 let at = (lang::ALL.iter())
                     .position(|language| *language == lang::current())
@@ -601,7 +644,7 @@ impl App {
                 self.message = t!("Нажмите /, чтобы найти музыку. ? - все клавиши").into();
             }
             Setting::Proxy | Setting::Cache => return self.activate(),
-            Setting::ProxyAddress => return,
+            Setting::ProxyAddress | Setting::Likes => return,
             Setting::CacheLimit => {
                 self.settings.cache_limit_mb = step(self.settings.cache_limit_mb, 256, 1024 * 1024);
                 if let Some(cache) = &mut self.cache {
@@ -625,6 +668,111 @@ impl App {
             }
         }
         self.persist();
+    }
+    // Enter on what was typed into the current line.
+    fn submit(&mut self) {
+        match SETTINGS[self.setting] {
+            Setting::Likes => self.submit_profile(),
+            _ => self.submit_address(),
+        }
+    }
+    // Enter on the profile that was typed: its likes are read into the favorites.
+    fn submit_profile(&mut self) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        self.imported = None;
+        // An empty line forgets the profile and asks for nothing.
+        if input.trim().is_empty() {
+            self.settings.soundcloud_profile = None;
+            self.persist();
+            return;
+        }
+        let profile = match soundcloud::profile(&input) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.message = error.to_string();
+                self.input = Some(input);
+                return;
+            }
+        };
+        self.settings.soundcloud_profile = Some(profile.clone());
+        self.persist();
+        let (sender, receiver) = mpsc::channel();
+        let (binary, proxy, direct) = (self.yt_dlp.clone(), self.proxy.clone(), self.direct);
+        let cache = self
+            .cache
+            .as_ref()
+            .map(|cache| cache.extractor().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (stop, name) = (cancel.clone(), profile.clone());
+        let language = lang::current();
+        let worker = std::thread::spawn(move || {
+            // The errors of the listing are worded in this thread.
+            lang::set(language);
+            let result = SoundCloud::new(Extractor {
+                program: &binary,
+                proxy: proxy.as_deref(),
+                no_proxy: direct,
+                cache: cache.as_deref(),
+            })
+            .quiet()
+            .cancellable(&stop)
+            .likes(&name, |track| {
+                let _ = sender.send(Found::Track(track));
+            })
+            .map_err(|e| e.to_string());
+            let _ = sender.send(Found::Over(result));
+        });
+        self.import = Some(Import {
+            profile,
+            tracks: vec![],
+            receiver,
+            cancel,
+            worker,
+        });
+    }
+    // The worker kills yt-dlp; what it listed so far is dropped with it.
+    fn cancel_import(&mut self) {
+        if let Some(import) = self.import.take() {
+            import.cancel.store(true, Ordering::Relaxed);
+            self.imported = Some(t!("{}: прервано", import.profile));
+        }
+    }
+    // The likes that were listed join the favorites; `failure` is why the list broke off.
+    fn finish_import(&mut self, import: Import, failure: Option<String>) {
+        let _ = import.worker.join();
+        let merged = self.library.merge(import.tracks);
+        self.message = t!(
+            "Лайки {}: добавлено {}, уже было {}, пропущено {}",
+            import.profile,
+            merged.added,
+            merged.known,
+            merged.skipped
+        );
+        self.imported = Some(if failure.is_some() {
+            t!("{}: оборвалось, добавлено {}", import.profile, merged.added)
+        } else {
+            t!(
+                "{}: добавлено {}, уже было {}",
+                import.profile,
+                merged.added,
+                merged.known
+            )
+        });
+        // As far as a list came it is kept: asking again adds the rest.
+        if let Some(error) = failure {
+            self.message =
+                t!("Список лайков оборвался. e - подробности, Esc - закрыть окно").into();
+            self.last_error = Some(error);
+            self.details = true;
+            self.detail_scroll = 0;
+        }
+        if merged.added > 0 {
+            self.save();
+            // The favorites that are stored leave the other part of the library.
+            self.list_stored();
+        }
     }
     // Enter on the proxy address that was typed.
     fn submit_address(&mut self) {
@@ -1149,6 +1297,28 @@ impl App {
                 }
             }
         }
+        if let Some(mut import) = self.import.take() {
+            let mut over = None;
+            loop {
+                match import.receiver.try_recv() {
+                    Ok(Found::Track(track)) => import.tracks.push(track),
+                    Ok(Found::Over(result)) => {
+                        over = Some(result.err());
+                        break;
+                    }
+                    // The worker is gone without a word; nothing more will come.
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        over = Some(Some(t!("Чтение лайков прервано").into()));
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                }
+            }
+            match over {
+                Some(failure) => self.finish_import(import, failure),
+                None => self.import = Some(import),
+            }
+        }
         if let Some(fetch) = &mut self.fetch
             && let Some(saved) = match fetch.download.poll() {
                 Ok(status) => status.map(|status| status.success()),
@@ -1208,6 +1378,10 @@ impl Drop for App {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        if let Some(import) = self.import.take() {
+            import.cancel.store(true, Ordering::Relaxed);
+            let _ = import.worker.join();
+        }
     }
 }
 
@@ -1254,15 +1428,8 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(t!("Интерфейсу нужен интерактивный терминал. Для скриптов используйте search или play --first.").into());
     }
-    let path = library
-        .or_else(|| {
-            config::directory("XDG_DATA_HOME", ".local/share")
-                .map(|p| p.join("clicloud/library.json"))
-        })
-        .ok_or(t!(
-            "Не удалось определить путь библиотеки; укажите ui --library PATH"
-        ))?;
-    let library = load_library(&path)?;
+    let path = library::path(library, "ui")?;
+    let library = library::load(&path)?;
     let terminate = terminated()?;
     let mut app = App::new(session, path, library);
     app.setup = Setup::needed(&app.yt_dlp, &app.mpv);
@@ -1349,7 +1516,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                 if let Some(input) = &mut app.input {
                     match key.code {
                         KeyCode::Esc => app.input = None,
-                        KeyCode::Enter => app.submit_address(),
+                        KeyCode::Enter => app.submit(),
                         KeyCode::Backspace => {
                             input.pop();
                         }
@@ -1597,7 +1764,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(2),
+            // The first lines a screen has to spare go to the logo and the gap below it.
+            Constraint::Length(
+                2 + if app.logo {
+                    (size.height - 24).min(2)
+                } else {
+                    0
+                },
+            ),
             Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(7),
@@ -1655,7 +1829,56 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// A drawing made of marks, shrunk: every two marks across and four down become one
+/// cell, a letter of Braille with a dot for each of them that is not a space.
+fn dots(drawing: &str) -> Vec<String> {
+    const DOTS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+    let rows: Vec<&[u8]> = drawing.lines().map(str::as_bytes).collect();
+    let width = rows.iter().map(|row| row.len()).max().unwrap_or(0);
+    (rows.chunks(4))
+        .map(|rows| {
+            let cell = |left: usize| {
+                let mut dots = 0;
+                for (row, marks) in rows.iter().zip(DOTS) {
+                    for (mark, dot) in marks.into_iter().enumerate() {
+                        if row.get(left + mark).is_some_and(|mark| *mark != b' ') {
+                            dots |= dot;
+                        }
+                    }
+                }
+                // An empty cell is a space: some fonts draw the empty letter as rings.
+                (char::from_u32(0x2800 + dots).filter(|_| dots != 0)).unwrap_or(' ')
+            };
+            let line: String = (0..width).step_by(2).map(cell).collect();
+            line.trim_end().to_owned()
+        })
+        .collect()
+}
+
 fn draw_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    static SMALL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let logo = SMALL.get_or_init(|| dots(LOGO));
+    // A screen with a line to spare shows the logo, and what follows the name beside it.
+    if usize::from(area.height) >= logo.len() {
+        let width = logo.iter().map(|line| cells(line)).max().unwrap_or(0) as u16;
+        let last = logo.len().saturating_sub(1) as u16;
+        for (row, line) in logo.iter().enumerate() {
+            label(
+                frame,
+                Rect::new(area.x + 1, area.y + row as u16, area.width - 1, 1),
+                line.clone(),
+                theme.accent,
+            );
+        }
+        let beside = (area.x + width + 3).min(area.right());
+        label(
+            frame,
+            Rect::new(beside, area.y + last, area.right() - beside, 1),
+            format!("/ {}", app.tagline),
+            theme.muted,
+        );
+        return;
+    }
     let header = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(28)])
@@ -1794,7 +2017,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let selected = tracks.get(app.table.selected().unwrap_or(0)).copied();
     let evict =
         selected.is_some_and(|track| app.cache.as_ref().is_some_and(|c| c.contains(&track.url)));
-    if tracks.is_empty() {
+    let taken = if tracks.is_empty() {
         let message = match app.view {
             View::Search => {
                 t!(
@@ -1825,7 +2048,9 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 .block(block(title, theme)),
             center[0],
         );
+        0
     } else {
+        let count = tracks.len();
         let rows: Vec<Row> = tracks
             .iter()
             .enumerate()
@@ -1887,7 +2112,15 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             center[0].width.saturating_sub(2),
             center[0].height.saturating_sub(4),
         );
-    }
+        2 + (count.saturating_sub(app.table.offset()) as u16).min(app.rows.height)
+    };
+    draw_backdrop(
+        frame.buffer_mut(),
+        BACKDROPS[app.backdrop()].1,
+        center[0].inner(Margin::new(1, 1)),
+        taken,
+        theme.border,
+    );
     let buttons = buttons(center[1]);
     button(frame, app, buttons[0], t!("|> Играть"), Action::Play, false);
     button(
@@ -1924,6 +2157,36 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             Action::Download,
             false,
         );
+    }
+}
+
+// The drawing in the middle of the panel, in the cells nothing else has taken: the first
+// `taken` lines are the list's own, and a text below them keeps a margin on both sides.
+fn draw_backdrop(buffer: &mut Buffer, drawing: &str, area: Rect, taken: u16, style: Style) {
+    let lines: Vec<&str> = drawing.lines().collect();
+    let width = lines.iter().map(|line| line.len()).max().unwrap_or(0);
+    let left = i32::from(area.x) + (i32::from(area.width) - width as i32) / 2;
+    let top = i32::from(area.y) + (i32::from(area.height) - lines.len() as i32) / 2;
+    for y in area.y.saturating_add(taken)..area.bottom() {
+        let line = usize::try_from(i32::from(y) - top)
+            .ok()
+            .and_then(|line| lines.get(line));
+        let Some(line) = line else { continue };
+        let mut written = (area.x..area.right()).filter(|&x| buffer[(x, y)].symbol() != " ");
+        let first = written.next();
+        let text = first.map(|first| {
+            let last = written.next_back().unwrap_or(first);
+            i32::from(first) - 2..=i32::from(last) + 2
+        });
+        for (cell, symbol) in line.bytes().enumerate() {
+            let x = left + cell as i32;
+            let free = text.as_ref().is_none_or(|text| !text.contains(&x));
+            if symbol != b' ' && free && x >= i32::from(area.x) && x < i32::from(area.right()) {
+                buffer[(x as u16, y)]
+                    .set_char(char::from(symbol))
+                    .set_style(style);
+            }
+        }
     }
 }
 
@@ -2300,13 +2563,13 @@ mod tests {
             std::env::temp_dir().join(format!("clicloud-library-test-{}.json", std::process::id()));
         let mut app = app(path.clone());
         app.action(Action::Favorite);
-        let stored = load_library(&path).unwrap();
+        let stored = library::load(&path).unwrap();
         assert_eq!(stored.favorites.len(), 1);
         assert_eq!(stored.favorites[0].title, "Ночной эфир");
         app.action(Action::Favorite);
-        assert!(load_library(&path).unwrap().favorites.is_empty());
+        assert!(library::load(&path).unwrap().favorites.is_empty());
         fs::write(&path, "broken json").unwrap();
-        assert!(load_library(&path).is_err());
+        assert!(library::load(&path).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "broken json");
         fs::remove_file(path).unwrap();
     }
@@ -2424,11 +2687,13 @@ mod tests {
                             assert!(matches!(cell.bg, Color::Rgb(..)), "{at}");
                             assert!(matches!(cell.fg, Color::Rgb(..)), "{at}");
                         }
-                        // Letters of any language and its punctuation, but ASCII art.
+                        // Letters of any language and its punctuation, but ASCII art;
+                        // the logo alone is drawn in the dots of Braille.
                         assert!(
                             cell.symbol().chars().all(|c| c.is_ascii()
                                 || c.is_alphabetic()
-                                || ('\u{3000}'..='\u{303f}').contains(&c)),
+                                || ('\u{3000}'..='\u{303f}').contains(&c)
+                                || ('\u{2800}'..='\u{28ff}').contains(&c) && y < 4),
                             "{:?} in {at}",
                             cell.symbol()
                         );
@@ -2459,6 +2724,43 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn the_logo_is_shown_small_where_the_screen_has_a_line_for_it() {
+        // Eight marks to a cell: two across, four down, and nothing for a space.
+        assert_eq!(dots("MM\nMM\nMM\nMM"), ["\u{28ff}"]);
+        assert_eq!(
+            dots("M   M\n\n\n M  M\n M"),
+            ["\u{2881} \u{2841}", "\u{2808}"]
+        );
+        let small = dots(LOGO);
+        assert_eq!((small.len(), cells(&small[0])), (3, 36));
+        assert!(small.iter().all(|line| !line.contains('\u{2800}')));
+
+        let mut app = app(PathBuf::new());
+        app.logo = true;
+        // One that fits beside the logo on the narrowest screen: a longer one is cut.
+        app.tagline = TAGLINES[3];
+        let plain = screen(&mut app, 80, 24);
+        assert!(plain.contains(" CLICLOUD / ") && !plain.contains(&small[0]));
+        // One line to spare holds the logo; the next one parts it from the search.
+        for (height, search) in [(25, 4), (26, 5), (40, 5)] {
+            let text = screen(&mut app, 80, height);
+            let lines: Vec<&str> = text.lines().collect();
+            for (row, line) in small.iter().enumerate() {
+                assert!(
+                    lines[1 + row].starts_with(&format!("  {line}")),
+                    "{height}\n{text}"
+                );
+            }
+            assert!(lines[3].contains(&format!("/ {}", app.tagline)), "{text}");
+            assert!(lines[search].contains("+- / ПОИСК"), "{height}\n{text}");
+        }
+        // Where the letters of the logo are missing, the name stays spelled.
+        app.logo = false;
+        let spelled = screen(&mut app, 80, 40);
+        assert!(spelled.contains(" CLICLOUD / ") && !spelled.contains(&small[0]));
     }
 
     #[test]
@@ -2577,6 +2879,25 @@ mod tests {
         app.adjust(1);
         assert_eq!((app.settings.volume, app.volume), (75, 70.0));
 
+        // The drawing behind the list is changed in a circle, and taken away.
+        let drawn = |app: &mut App| screen(app, 120, 35).contains("DOOOO");
+        choose(&mut app, Setting::Backdrop);
+        assert_eq!(app.value(Setting::Backdrop), "жнец");
+        assert!(drawn(&mut app));
+        app.adjust(1);
+        assert_eq!(app.value(Setting::Backdrop), "пентаграмма");
+        assert!(!drawn(&mut app) && screen(&mut app, 120, 35).contains("\"-.-\""));
+        app.activate();
+        assert_eq!(app.value(Setting::Backdrop), "нет");
+        assert_eq!(config::load(Some(&file)).unwrap().backdrop, "none");
+        assert!(!drawn(&mut app) && !screen(&mut app, 120, 35).contains("\"-.-\""));
+        app.adjust(-1);
+        app.adjust(-1);
+        assert_eq!(app.settings.backdrop, "reaper");
+        for (_, drawing) in BACKDROPS {
+            assert!(drawing.is_ascii() && !drawing.contains('\t'));
+        }
+
         // The language changes at once, for the names of the settings too.
         choose(&mut app, Setting::Language);
         assert_eq!(app.value(Setting::Language), "Русский");
@@ -2669,6 +2990,181 @@ mod tests {
         assert!(saved.proxy.is_none() && !saved.proxy_enabled);
         fs::remove_file(file).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_likes_of_a_profile_join_the_favorites_from_the_settings() {
+        let stamp = std::process::id();
+        let path = std::env::temp_dir().join(format!("clicloud-likes-{stamp}.json"));
+        let file = std::env::temp_dir().join(format!("clicloud-likes-settings-{stamp}.json"));
+        let mut app = app(path.clone());
+        app.config = Some(file.clone());
+        app.library.favorites.push(track());
+        app.options = true;
+        app.setting = SETTINGS.len() - 1;
+        assert_eq!(app.value(Setting::Likes), "не задан");
+        let liked = |name: &str| {
+            Found::Track(Track {
+                title: name.into(),
+                artist: "someone".into(),
+                duration: None,
+                url: format!("https://soundcloud.com/someone/{name}"),
+            })
+        };
+        let listing = |app: &mut App| {
+            let (sender, receiver) = mpsc::channel();
+            app.import = Some(Import {
+                profile: "someone".into(),
+                tracks: vec![],
+                receiver,
+                cancel: Arc::new(AtomicBool::new(false)),
+                worker: std::thread::spawn(|| ()),
+            });
+            sender
+        };
+
+        // What is no profile stays in the line to be put right, and nothing is asked.
+        app.activate();
+        assert_eq!(app.input.as_deref(), Some(""));
+        app.input = Some("https://soundcloud.com/artist/night".into());
+        app.submit();
+        assert!(app.import.is_none() && app.message.contains("имя профиля"));
+        assert_eq!(
+            app.value(Setting::Likes),
+            "https://soundcloud.com/artist/night_"
+        );
+        // The address of the proxy is another line, with a text of its own.
+        assert_eq!(app.value(Setting::ProxyAddress), "не задан");
+        app.input = None;
+
+        // The line counts what arrives, and the favorites wait for the end of the list.
+        let sender = listing(&mut app);
+        sender.send(liked("one")).unwrap();
+        // The favorite under another spelling of its link, and a liked playlist.
+        sender
+            .send(Found::Track(Track {
+                url: "https://www.soundcloud.com/test/night?si=1".into(),
+                ..track()
+            }))
+            .unwrap();
+        sender.send(liked("sets")).unwrap();
+        app.tick();
+        assert_eq!(app.value(Setting::Likes), "someone: получено 3");
+        assert_eq!(app.library.favorites.len(), 1);
+        sender.send(liked("two")).unwrap();
+        sender.send(Found::Over(Ok(()))).unwrap();
+        app.tick();
+        assert!(app.import.is_none());
+        assert_eq!(
+            app.value(Setting::Likes),
+            "someone: добавлено 2, уже было 1"
+        );
+        assert_eq!(
+            app.message,
+            "Лайки someone: добавлено 2, уже было 1, пропущено 1"
+        );
+        let titles = |library: &Library| -> Vec<String> {
+            (library.favorites.iter())
+                .map(|track| track.title.clone())
+                .collect()
+        };
+        assert_eq!(titles(&app.library), ["Ночной эфир", "one", "two"]);
+        assert_eq!(titles(&library::load(&path).unwrap()), titles(&app.library));
+
+        // Enter on the line stops a list that is being read; nothing of it is kept.
+        let sender = listing(&mut app);
+        sender.send(liked("three")).unwrap();
+        app.tick();
+        let cancel = app.import.as_ref().unwrap().cancel.clone();
+        app.activate();
+        assert!(app.import.is_none() && cancel.load(Ordering::Relaxed));
+        assert_eq!(app.value(Setting::Likes), "someone: прервано");
+        assert_eq!(app.library.favorites.len(), 3);
+
+        // A list that broke off is kept as far as it came, and the reason is shown.
+        let sender = listing(&mut app);
+        sender.send(liked("three")).unwrap();
+        sender
+            .send(Found::Over(Err("HTTP Error 403".into())))
+            .unwrap();
+        app.tick();
+        assert_eq!(app.library.favorites.len(), 4);
+        assert_eq!(
+            app.value(Setting::Likes),
+            "someone: оборвалось, добавлено 1"
+        );
+        assert!(app.details && app.last_error.as_deref() == Some("HTTP Error 403"));
+        app.details = false;
+
+        // Typed and entered, the name is kept in the settings and yt-dlp is asked.
+        let lines = [
+            r#"{"title":"Four","url":"https://soundcloud.com/low-sea/four"}"#,
+            r#"{"title":"One","url":"https://soundcloud.com/someone/one"}"#,
+        ];
+        // The program notes what it was asked for in a file beside the library.
+        let asked = path.with_extension("args");
+        let program = script(
+            "likes",
+            &format!(
+                "printf '%s\\n' \"$*\" > '{}'\ncat <<'END'\n{}\nEND",
+                asked.display(),
+                lines.join("\n")
+            ),
+            &format!(
+                "echo %* > \"{}\"\necho {}\necho {}",
+                asked.display(),
+                lines[0],
+                lines[1]
+            ),
+        );
+        app.yt_dlp = program.to_string_lossy().into_owned();
+        app.activate();
+        app.input = Some(" @Some-One ".into());
+        app.submit();
+        assert!(app.input.is_none());
+        assert_eq!(app.value(Setting::Likes), "Some-One: получено 0");
+        for _ in 0..3000 {
+            app.tick();
+            if app.import.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.value(Setting::Likes),
+            "Some-One: добавлено 1, уже было 1"
+        );
+        assert_eq!(
+            (
+                app.library.favorites[4].artist.as_str(),
+                app.library.favorites[4].title.as_str()
+            ),
+            ("low sea", "Four")
+        );
+        let args = fs::read_to_string(&asked).unwrap();
+        assert!(
+            (args.trim_end()).ends_with("-- https://soundcloud.com/Some-One/likes"),
+            "{args}"
+        );
+        let saved = config::load(Some(&file)).unwrap();
+        assert_eq!(saved.soundcloud_profile.as_deref(), Some("Some-One"));
+
+        // The name comes back to be entered again; an empty line forgets it.
+        app.activate();
+        assert_eq!(app.input.as_deref(), Some("Some-One"));
+        app.input = Some(" ".into());
+        app.submit();
+        assert!(app.import.is_none() && app.settings.soundcloud_profile.is_none());
+        assert_eq!(app.value(Setting::Likes), "не задан");
+        assert!(
+            config::load(Some(&file))
+                .unwrap()
+                .soundcloud_profile
+                .is_none()
+        );
+        for path in [path, file, program, asked] {
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -2767,12 +3263,23 @@ mod tests {
             std::process::id(),
             if cfg!(windows) { ".cmd" } else { "" }
         ));
+        // Written by a child process: a descriptor open for writing in this one would be
+        // inherited by whatever another test thread starts, and the script could not be run.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::io::Write;
             let _ = cmd;
-            fs::write(&path, format!("#!/bin/sh\n{sh}\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut writer = std::process::Command::new("sh")
+                .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+                .arg(&path)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let source = format!("#!/bin/sh\n{sh}\n");
+            (writer.stdin.take().unwrap())
+                .write_all(source.as_bytes())
+                .unwrap();
+            assert!(writer.wait().unwrap().success());
         }
         #[cfg(not(unix))]
         {
@@ -3137,7 +3644,8 @@ exit /b 0"#,
                 }
                 text.push('\n');
             }
-            assert!(text.contains("CLICLOUD"));
+            // The name is there in letters, or drawn where the screen has a line for it.
+            assert!(text.contains("CLICLOUD") || text.contains(&dots(LOGO)[0]));
             if width >= 80 {
                 assert!(text.contains("Ночной эфир"));
                 assert!(text.contains("ПЛЕЕР"));

@@ -4,6 +4,7 @@
   "cache_enabled": true,
   "cache_limit_mb": 1024,
   "theme": "terminal",
+  "backdrop": "reaper",
   "language": "ru",
   "search_limit": 10,
   "seek_step": 10,

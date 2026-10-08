@@ -29,7 +29,7 @@ const LISTS: [&str; 11] = [
     "following",
     "comments",
 ];
-const SECTIONS: [&str; 10] = [
+pub const SECTIONS: [&str; 10] = [
     "discover", "search", "you", "stream", "charts", "stations", "tags", "people", "pages",
     "upload",
 ];
@@ -313,6 +313,11 @@ fn write_details(directory: &Path, key: &str, track: &Track) -> io::Result<()> {
     fs::write(directory.join(key), serde_json::to_vec(track)?)
 }
 
+/// The track at `url` as far as its link tells: who made it and what it is called.
+pub fn named(url: &str) -> Option<Track> {
+    key(url).and_then(|key| named_after(&key))
+}
+
 // The track behind a file name made by `key`, as far as the link tells.
 fn named_after(key: &str) -> Option<Track> {
     let mut parts = Vec::new();
@@ -416,7 +421,8 @@ mod tests {
     // Windows opens a directory only for a program that says it handles backups.
     fn age(path: &Path, when: SystemTime) {
         let mut options = fs::OpenOptions::new();
-        options.write(true);
+        // Unix opens a directory for reading only, which is enough to set its time.
+        options.read(true).write(cfg!(windows) || !path.is_dir());
         #[cfg(windows)]
         if path.is_dir() {
             use std::os::windows::fs::OpenOptionsExt;
