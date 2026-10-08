@@ -426,6 +426,9 @@ struct App {
     page_job: Option<(String, String, mpsc::Receiver<Page>)>,
     // The picture that was last drawn, as cells.
     drawn: Option<(String, u16, u16, Mode, String, Vec<cover::Cell>)>,
+    // The tracks that did not play when they were last tried in this run, by the names
+    // of their files.
+    broken: std::collections::HashSet<String>,
     // The devices mpv can play on, once it was asked.
     devices: Vec<(String, String)>,
     // The track that was last fetched ahead of its turn: one that fails is not asked for
@@ -450,6 +453,8 @@ struct App {
 
 impl App {
     fn new(session: Session, library_path: PathBuf, library: Library) -> Self {
+        // What was to play the last time waits to be played now.
+        let waiting: VecDeque<Track> = library.queue.iter().cloned().collect();
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
             worker: None,
@@ -496,7 +501,11 @@ impl App {
             searched: HashMap::new(),
             shown: None,
             trail: vec![],
-            queue: VecDeque::new(),
+            message: match waiting.len() {
+                0 => t!("Нажмите /, чтобы найти музыку. ? - все клавиши").into(),
+                count => t!("С прошлого раза в очереди треков: {}. n - включить", count),
+            },
+            queue: waiting,
             ahead: VecDeque::new(),
             source: vec![],
             previous: vec![],
@@ -510,6 +519,7 @@ impl App {
             scroll: 0,
             page_job: None,
             drawn: None,
+            broken: Default::default(),
             devices: vec![],
             fetched_ahead: None,
             query: String::new(),
@@ -518,7 +528,7 @@ impl App {
             filling: false,
             receiver: None,
             table: TableState::default().with_selected(0),
-            message: t!("Нажмите /, чтобы найти музыку. ? - все клавиши").into(),
+
             help: false,
             details: false,
             detail_scroll: 0,
@@ -688,6 +698,14 @@ impl App {
     fn save(&mut self) {
         // What another process wrote meanwhile is not written over.
         self.sync();
+        // What plays and what is ahead of it is kept for the next run, up to a point:
+        // a list may be thousands of tracks long.
+        self.library.queue = (self.current.iter())
+            .chain(&self.queue)
+            .chain(&self.ahead)
+            .take(500)
+            .cloned()
+            .collect();
         match library::save(&self.library_path, &self.library) {
             Ok(()) => {
                 self.base = self.library.clone();
@@ -1486,6 +1504,11 @@ impl App {
     fn failed(&mut self, error: String, details: Option<String>) {
         self.player = None;
         self.failures += 1;
+        // Marked in its lists until it plays: for this run, since the network may be
+        // the reason as well as the track.
+        if let Some(name) = self.current.as_ref().and_then(|t| cache::key(&t.url)) {
+            self.broken.insert(name);
+        }
         let mut report = error.clone();
         if let Some(track) = &self.current {
             report = format!("{} - {}\n{report}", track.artist, track.title);
@@ -2057,6 +2080,9 @@ impl App {
             let was_loaded = player.loaded;
             let result = player.tick();
             if !was_loaded && player.loaded {
+                if let Some(name) = self.current.as_ref().and_then(|t| cache::key(&t.url)) {
+                    self.broken.remove(&name);
+                }
                 // After a skip the notice about the failed track stays on screen.
                 if self.failures == 0 {
                     self.message = if player.origin == Origin::Cache {
@@ -2433,6 +2459,8 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
             _ => (),
         }
     }
+    // What plays and what is ahead of it is kept as it stands at the end of the run.
+    app.save();
     Ok(())
 }
 
@@ -2948,6 +2976,10 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 Row::new(vec![
                     if playing {
                         Cell::from("|>")
+                    } else if cache::key(&track.url).is_some_and(|name| app.broken.contains(&name))
+                    {
+                        // It did not play the last time it was tried.
+                        Cell::from("!!").style(theme.error)
                     } else {
                         Cell::from(format!("{:0digits$}", i + 1)).style(theme.muted)
                     },
@@ -4870,6 +4902,61 @@ esac"#,
         // A taller one shows them all.
         let text = screen(&mut app, 80, 30);
         assert!(text.contains(first) && text.contains(last) && app.setting_first == 0);
+    }
+
+    #[test]
+    fn what_was_to_play_is_kept_for_the_next_run_and_what_failed_is_marked() {
+        let path = std::env::temp_dir().join(format!("clicloud-kept-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut first = app(path.clone());
+        first.mpv = "clicloud-no-such-program".into();
+        first.current = Some(numbered(1));
+        first.queue.push_back(numbered(2));
+        first.ahead = [numbered(3), numbered(4)].into();
+        first.save();
+        // The next run has them in its queue, the track it stopped at first.
+        let kept = library::load(&path).unwrap();
+        let mut second = App::new(
+            Session {
+                yt_dlp: "yt-dlp".into(),
+                mpv: "clicloud-no-such-program".into(),
+                proxy: None,
+                direct: false,
+                cache: None,
+                cache_dir: None,
+                settings: Settings {
+                    theme: theme::MONO.into(),
+                    ..Settings::default()
+                },
+                config: None,
+            },
+            path.clone(),
+            kept,
+        );
+        let titles: Vec<&str> = second.queue.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["Title 1", "Title 2", "Title 3", "Title 4"]);
+        assert_eq!(
+            second.message,
+            "С прошлого раза в очереди треков: 4. n - включить"
+        );
+        assert!(second.current.is_none() && second.ahead.is_empty());
+
+        // A track that did not play is marked in its lists until it does.
+        second.results = second.queue.iter().cloned().collect();
+        second.current = Some(numbered(2));
+        second.queue.clear();
+        second.failed("boom".into(), None);
+        let text = screen(&mut second, 80, 30);
+        assert!(
+            text.contains("!!  Title 2") && text.contains("01  Title 1"),
+            "{text}"
+        );
+        assert!(!text.contains("02  Title 2"), "{text}");
+        // An empty queue is kept as empty.
+        second.current = None;
+        second.save();
+        assert!(library::load(&path).unwrap().queue.is_empty());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
