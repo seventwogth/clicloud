@@ -128,10 +128,11 @@ enum Setting {
     Volume,
     Normalize,
     Device,
+    Extractor,
     Likes,
 }
 
-const SETTINGS: [Setting; 14] = [
+const SETTINGS: [Setting; 15] = [
     Setting::Theme,
     Setting::Backdrop,
     Setting::Cover,
@@ -145,6 +146,7 @@ const SETTINGS: [Setting; 14] = [
     Setting::Volume,
     Setting::Normalize,
     Setting::Device,
+    Setting::Extractor,
     Setting::Likes,
 ];
 const SEEK_STEPS: [u16; 5] = [5, 10, 15, 30, 60];
@@ -165,6 +167,7 @@ impl Setting {
             Self::Volume => t!("Громкость при запуске"),
             Self::Normalize => t!("Ровная громкость"),
             Self::Device => t!("Аудиоустройство"),
+            Self::Extractor => "yt-dlp",
             Self::Likes => t!("Лайки SoundCloud"),
         }
     }
@@ -182,7 +185,7 @@ impl Setting {
             }
             Self::Cover => {
                 t!(
-                    "Enter или Left/Right - как рисовать обложку на вкладке трека (t):\nблоками или точками Брайля, в её цветах или в тонах схемы."
+                    "Enter или Left/Right - как рисовать обложку на вкладке трека (t):\nблоками или точками Брайля; в её цветах, в цветах или в тонах схемы."
                 )
             }
             Self::Language => {
@@ -219,6 +222,11 @@ impl Setting {
             Self::Device => {
                 t!(
                     "Enter или Left/Right - следующее из устройств, что видит mpv.\nавто оставляет выбор за ним. Действует сразу."
+                )
+            }
+            Self::Extractor => {
+                t!(
+                    "Enter - узнать версию; если yt-dlp скачан клиентом, взять свежий.\nПоставленный иначе обновляется тем же способом, что ставился."
                 )
             }
             Self::Likes => {
@@ -426,6 +434,10 @@ struct App {
     page_job: Option<(String, String, mpsc::Receiver<Page>)>,
     // The picture that was last drawn, as cells.
     drawn: Option<(String, u16, u16, Mode, String, Vec<cover::Cell>)>,
+    // A newer yt-dlp on its way, and what the line of the settings says of the last
+    // look at the one there is.
+    update: Option<mpsc::Receiver<std::result::Result<PathBuf, String>>>,
+    updated: Option<String>,
     // The tracks that did not play when they were last tried in this run, by the names
     // of their files.
     broken: std::collections::HashSet<String>,
@@ -520,6 +532,8 @@ impl App {
             page_job: None,
             drawn: None,
             broken: Default::default(),
+            update: None,
+            updated: None,
             devices: vec![],
             fetched_ahead: None,
             query: String::new(),
@@ -794,6 +808,8 @@ impl App {
             Setting::Cover => match Mode::parse(&self.settings.cover) {
                 Mode::Blocks => t!("цветные блоки"),
                 Mode::Braille => t!("цветной брайль"),
+                Mode::BlockScheme => t!("блоки в цветах схемы"),
+                Mode::BrailleScheme => t!("брайль в цветах схемы"),
                 Mode::BlockTones => t!("блоки в тонах"),
                 Mode::BrailleTones => t!("брайль в тонах"),
                 Mode::Off => t!("нет"),
@@ -826,6 +842,11 @@ impl App {
                 Some(device) => (self.devices.iter())
                     .find(|(name, described)| name == device && !described.is_empty())
                     .map_or_else(|| device.clone(), |(_, described)| described.clone()),
+            },
+            Setting::Extractor => match (&self.update, &self.updated) {
+                (Some(_), _) => t!("Скачиваю и проверяю...").into(),
+                (None, Some(said)) => said.clone(),
+                (None, None) => self.yt_dlp.clone(),
             },
             Setting::Likes => match (&self.import, &self.imported) {
                 (Some(import), _) => {
@@ -891,6 +912,7 @@ impl App {
             Setting::ProxyAddress => {
                 self.input = Some(self.address.clone().unwrap_or_else(|| config::TOR.into()));
             }
+            Setting::Extractor => self.update(),
             Setting::Likes if self.import.is_some() => self.cancel_import(),
             Setting::Likes => {
                 self.input = Some(self.settings.soundcloud_profile.clone().unwrap_or_default());
@@ -963,7 +985,7 @@ impl App {
                 self.message = t!("Нажмите /, чтобы найти музыку. ? - все клавиши").into();
             }
             Setting::Proxy | Setting::Cache => return self.activate(),
-            Setting::ProxyAddress | Setting::Likes => return,
+            Setting::ProxyAddress | Setting::Likes | Setting::Extractor => return,
             Setting::CacheLimit => {
                 self.settings.cache_limit_mb = step(self.settings.cache_limit_mb, 256, 1024 * 1024);
                 if let Some(cache) = &mut self.cache {
@@ -1011,6 +1033,33 @@ impl App {
             }
         }
         self.persist();
+    }
+    // Enter on the line of yt-dlp: its version, and a newer one where the client keeps it.
+    fn update(&mut self) {
+        if self.update.is_some() {
+            return;
+        }
+        let ours = setup::directory().filter(|directory| {
+            directory.join(setup::name()).as_path() == std::path::Path::new(&self.yt_dlp)
+        });
+        let Some(directory) = ours else {
+            // Whoever installed it knows how it is updated.
+            self.updated = Some(match crate::version(&self.yt_dlp) {
+                Ok(version) => t!("{}, поставлен не клиентом", clean(&version)),
+                Err(error) => clean(&error.to_string()),
+            });
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let proxy = self.proxy.clone();
+        let language = lang::current();
+        std::thread::spawn(move || {
+            // The errors of the download are worded in this thread.
+            lang::set(language);
+            let fetched = setup::install(proxy.as_deref(), &directory).map_err(|e| e.to_string());
+            let _ = sender.send(fetched);
+        });
+        self.update = Some(receiver);
     }
     // Enter on what was typed into the current line.
     fn submit(&mut self) {
@@ -2052,6 +2101,23 @@ impl App {
         }
         self.fetch_ahead();
         self.fetch_page();
+        if let Some(receiver) = &self.update {
+            let fetched = match receiver.try_recv() {
+                Ok(fetched) => Some(fetched),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(t!("Загрузка прервалась").into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(fetched) = fetched {
+                self.update = None;
+                self.updated = Some(match fetched.map(|_| crate::version(&self.yt_dlp)) {
+                    Ok(Ok(version)) => t!("обновлён: {}", clean(&version)),
+                    Ok(Err(error)) => clean(&error.to_string()),
+                    Err(error) => t!("Не вышло: {}", clean_lines(&error)),
+                });
+            }
+        }
         // An import from the command line writes the library while this one is open.
         if self.synced.elapsed() > Duration::from_secs(2) && self.sync() {
             self.list_stored();
@@ -3127,7 +3193,7 @@ fn draw_track(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                     (of, *wide, *high, *how, scheme) == (&name, columns, rows, mode, &theme.name)
                 });
                 if !fresh {
-                    let cells = cover.cells(columns.into(), rows.into(), mode, theme.palette());
+                    let cells = cover.cells(columns.into(), rows.into(), mode, &theme.palette());
                     app.drawn =
                         Some((name.clone(), columns, rows, mode, theme.name.clone(), cells));
                 }
@@ -4535,6 +4601,32 @@ esac"#,
     }
 
     #[test]
+    fn the_settings_tell_the_version_of_yt_dlp() {
+        let program = script("version", "echo 2099.01.01");
+        let mut app = app(PathBuf::new());
+        app.setting = SETTINGS
+            .iter()
+            .position(|s| *s == Setting::Extractor)
+            .unwrap();
+        assert_eq!(app.value(Setting::Extractor), "yt-dlp");
+        // One that the client did not fetch is only asked what it is.
+        app.yt_dlp = program.to_string_lossy().into_owned();
+        app.activate();
+        assert!(app.update.is_none());
+        assert_eq!(
+            app.value(Setting::Extractor),
+            "2099.01.01, поставлен не клиентом"
+        );
+        app.yt_dlp = "clicloud-no-such-program".into();
+        app.activate();
+        assert!(
+            app.value(Setting::Extractor)
+                .contains("clicloud-no-such-program")
+        );
+        fs::remove_file(program).unwrap();
+    }
+
+    #[test]
     fn mpv_is_told_how_to_sound_by_the_settings() {
         let file = std::env::temp_dir().join(format!("clicloud-sound-{}.json", std::process::id()));
         let player = script(
@@ -4755,6 +4847,14 @@ esac"#,
             (dark.0.as_str(), light.0.as_str(), light.1),
             (" ", "⣿", text_color)
         );
+        // Made of the colors of the scheme, the dark of the picture is its background
+        // and the light its text; dots are never the color of what is behind them.
+        app.settings.cover = "block-scheme".into();
+        let (dark, light) = colors(&mut app);
+        assert_eq!((dark.1, dark.2, light.1), (behind, behind, text_color));
+        app.settings.cover = "braille-scheme".into();
+        let (_, light) = colors(&mut app);
+        assert_eq!((light.0.as_str(), light.1), ("⣿", text_color));
         // A terminal of 256 colors gets the nearest of them.
         app.theme = Theme::with("Dracula", false);
         app.settings.cover = "blocks".into();
@@ -4771,7 +4871,7 @@ esac"#,
         // The settings go round the ways of drawing it.
         app.setting = SETTINGS.iter().position(|s| *s == Setting::Cover).unwrap();
         let mut seen = vec![];
-        for _ in 0..5 {
+        for _ in 0..7 {
             app.adjust(1);
             seen.push(app.value(Setting::Cover));
         }
@@ -4780,6 +4880,8 @@ esac"#,
             [
                 "цветные блоки",
                 "цветной брайль",
+                "блоки в цветах схемы",
+                "брайль в цветах схемы",
                 "блоки в тонах",
                 "брайль в тонах",
                 "нет"
@@ -4897,7 +4999,7 @@ esac"#,
             !text.contains(first) && text.contains(&format!("> {last}")),
             "{text}"
         );
-        assert_eq!(app.setting_first, 1);
+        assert_eq!(app.setting_first, SETTINGS.len() - 13);
         assert!(text.contains("Up/Down - выбор"), "{text}");
         // A taller one shows them all.
         let text = screen(&mut app, 80, 30);

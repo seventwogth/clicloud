@@ -418,7 +418,32 @@ impl Theme {
         } else {
             (marks, behind)
         };
+        // The colors of the scheme: what it gives the roles of the interface, once each.
+        let mut scheme: Vec<[u8; 3]> = Vec::new();
+        let named = (rgb(self.base.bg).is_some())
+            .then_some([
+                self.base.bg,
+                self.base.fg,
+                self.muted.fg,
+                self.border.fg,
+                self.accent.fg,
+                self.bar.fg,
+                self.playing.fg,
+                self.waiting.fg,
+                self.favorite.fg,
+                self.stored.fg,
+                self.error.fg,
+            ])
+            .into_iter()
+            .flatten();
+        for color in named.filter_map(rgb) {
+            let color = [color.0, color.1, color.2];
+            if !scheme.contains(&color) {
+                scheme.push(color);
+            }
+        }
         crate::cover::Palette {
+            scheme,
             colors: self.text.fg.is_some() || self.base.bg.is_some(),
             tones: ([dark.0, dark.1, dark.2], [light.0, light.1, light.2]),
             light_marks,
