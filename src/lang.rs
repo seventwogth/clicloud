@@ -540,9 +540,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "検索 (Enter で実行、Esc で中止)",
     ),
     (
-        "Поиск / библиотека / очередь / недавние / трек",
-        "Search / library / queue / recent / track",
-        "検索 / ライブラリ / キュー / 履歴 / 曲",
+        "Поиск, библиотека, очередь, недавние / трек",
+        "Search, library, queue, recent / the track",
+        "検索、ライブラリ、キュー、履歴 / 曲",
     ),
     (
         "Выбрать трек     Enter  Проиграть",
@@ -1019,16 +1019,34 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Скорость: x{}", "Speed: x{}", "速度: x{}"),
     ("Обложка", "Cover", "ジャケット"),
     (
-        "Enter или Left/Right - как рисовать обложку на экране трека (5):\nблоками или точками Брайля, в её цветах или в тонах схемы.",
-        "Enter or Left/Right - how the track screen (5) draws the cover:\nblocks or Braille dots, in its own colors or in tones of the scheme.",
-        "Enter か Left/Right - 曲の画面 (5) でのジャケットの描き方:\nブロックか点字、元の色か配色の濃淡で描きます。",
+        "Enter или Left/Right - как рисовать обложку на вкладке трека (t):\nблоками или точками Брайля, в её цветах или в тонах схемы.",
+        "Enter or Left/Right - how the tab of the track (t) draws the cover:\nblocks or Braille dots, in its own colors or in tones of the scheme.",
+        "Enter か Left/Right - 曲のタブ (t) でのジャケットの描き方:\nブロックか点字、元の色か配色の濃淡で描きます。",
     ),
     ("цветные блоки", "colored blocks", "カラーのブロック"),
     ("цветной брайль", "colored Braille", "カラーの点字"),
     ("блоки в тонах", "blocks in tones", "濃淡のブロック"),
     ("брайль в тонах", "Braille in tones", "濃淡の点字"),
     (" ТРЕК ", " TRACK ", " 曲 "),
-    ("5  Трек", "5  Track", "5  曲"),
+    ("Списки", "Lists", "一覧"),
+    ("Трек", "Track", "曲"),
+    ("Жанр", "Genre", "ジャンル"),
+    ("Дата", "Date", "日付"),
+    ("Слушали", "Plays", "再生"),
+    ("Лайки", "Likes", "いいね"),
+    ("Репосты", "Reposts", "リポスト"),
+    ("Комментарии", "Comments", "コメント"),
+    ("Теги", "Tags", "タグ"),
+    (
+        "сведений о треке нет",
+        "nothing is known of the track",
+        "この曲の情報はありません",
+    ),
+    (
+        "ищем сведения о треке...",
+        "looking the track up...",
+        "曲の情報を調べています...",
+    ),
     (
         "\n\nНичего не играет.\n\nEnter на треке в списке включает его.",
         "\n\nNothing is playing.\n\nEnter on a track in a list starts it.",
@@ -1036,6 +1054,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("ждём обложку", "cover is coming", "読み込み中..."),
     ("обложки нет", "no cover", "ジャケットなし"),
+    (
+        "С прошлого раза в очереди треков: {}. n - включить",
+        "Tracks in the queue from the last time: {}. n - play",
+        "前回のキューに {} 曲あります。n - 再生",
+    ),
 ];
 
 #[cfg(test)]
