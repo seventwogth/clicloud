@@ -6,7 +6,7 @@ use crate::{
     cover::{self, Cover, Mode},
     lang,
     library::{self, Library},
-    megabytes,
+    megabytes, pictured,
     playback::{self, Origin, Playback},
     player::{self, Download},
     setup,
@@ -2190,7 +2190,7 @@ impl App {
         let unknown = self.current.as_ref().is_some_and(|t| t.duration.is_none());
         let noted = self.player.as_mut().and_then(|player| {
             player.learn().or_else(|| {
-                (unknown && player.loaded && !player.receiving() && player.duration > 0.0)
+                (unknown && player.loaded && player.knows_length() && player.duration > 0.0)
                     .then_some(Details {
                         duration: Some(player.duration),
                         ..Details::default()
@@ -2476,7 +2476,11 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.filter.clear()
                         }
-                        KeyCode::Char(c) if !c.is_control() && app.filter.chars().count() < 200 => {
+                        KeyCode::Char(c)
+                            if !c.is_control()
+                                && !pictured(c)
+                                && app.filter.chars().count() < 200 =>
+                        {
                             app.filter.push(c)
                         }
                         _ => (),
@@ -2496,7 +2500,11 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.query.clear()
                         }
-                        KeyCode::Char(c) if !c.is_control() && app.query.chars().count() < 200 => {
+                        KeyCode::Char(c)
+                            if !c.is_control()
+                                && !pictured(c)
+                                && app.query.chars().count() < 200 =>
+                        {
                             app.query.push(c)
                         }
                         _ => (),
@@ -2527,7 +2535,9 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             input.clear()
                         }
-                        KeyCode::Char(c) if !c.is_control() && input.chars().count() < 200 => {
+                        KeyCode::Char(c)
+                            if !c.is_control() && !pictured(c) && input.chars().count() < 200 =>
+                        {
                             input.push(c)
                         }
                         _ => (),
@@ -2790,6 +2800,19 @@ fn time(value: f64) -> String {
     let seconds = value.max(0.0) as u64;
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
+/// How long the track is, for the times and the bar. Fed through a pipe, mpv calls
+/// the length of what it has demuxed the length of the track: that ends just past
+/// the position, so the bar stands almost full and the times read 1:10 / 1:11 of
+/// three minutes. What SoundCloud listed is used until mpv has the whole of it to
+/// look at; where neither is known, what mpv says is all there is.
+fn length(knows: bool, reported: f64, listed: f64) -> f64 {
+    match (knows && reported > 0.0, listed > 0.0) {
+        (true, _) => reported,
+        (false, true) => listed,
+        (false, false) => reported,
+    }
+}
+
 // The played and the remaining part of the bar and the times after it.
 // The bar of a track: what has played, what has arrived beyond that, the rest, and
 // the times after it.
@@ -3461,11 +3484,22 @@ fn draw_track(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 .filter(|(_, value)| !value.trim().is_empty())
                 .collect();
             let names = rows.iter().map(|(name, _)| cells(name)).max().unwrap_or(0);
+            // A value wider than the column was cut where the column ended, in the
+            // middle of a word; the tags of a track are long enough for that often.
+            // It runs on under itself instead, the place of the name left empty.
+            let room = usize::from(first).saturating_sub(names + 2).max(1);
             for (name, value) in rows {
-                facts.push(Line::from(vec![
-                    Span::styled(format!("{}  ", pad(name, names)), theme.muted),
-                    Span::styled(clean(&value), theme.text),
-                ]));
+                for (line, text) in wrap(&clean(&value), room).into_iter().enumerate() {
+                    let name = if line == 0 {
+                        pad(name, names)
+                    } else {
+                        " ".repeat(names)
+                    };
+                    facts.push(Line::from(vec![
+                        Span::styled(format!("{name}  "), theme.muted),
+                        Span::styled(text, theme.text),
+                    ]));
+                }
             }
             let width = usize::from(if two { words.width - first - 2 } else { first });
             for paragraph in details.description.as_deref().unwrap_or_default().lines() {
@@ -3688,12 +3722,7 @@ fn draw_player(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         };
         (
             player.position,
-            // While audio arrives, mpv reports the length of what it has got so far.
-            if player.duration > 0.0 && !(player.receiving() && listed > 0.0) {
-                player.duration
-            } else {
-                listed
-            },
+            length(player.knows_length(), player.duration, listed),
             state,
             style,
         )
@@ -5730,6 +5759,79 @@ exit /b 1"#,
         app.action(Action::Evict);
         assert_eq!(app.message, "Этого трека нет в кеше");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_length_of_a_piped_track_is_the_one_soundcloud_listed() {
+        // Reading a pipe, mpv has demuxed 71 seconds of a track of 165 and calls
+        // that the length. The bar would stand almost full at 1:10 of 1:11.
+        assert_eq!(length(false, 71.0, 165.0), 165.0);
+        // Seeing the whole file, mpv is the better witness: a list may be wrong,
+        // and a track stored by its link alone is listed with no length at all.
+        assert_eq!(length(true, 165.0, 160.0), 165.0);
+        assert_eq!(length(true, 165.0, 0.0), 165.0);
+        // Where nothing was listed, what mpv says is all there is.
+        assert_eq!(length(false, 71.0, 0.0), 71.0);
+        // Before mpv says anything, the listed length already draws the bar.
+        assert_eq!(length(true, 0.0, 165.0), 165.0);
+        assert_eq!(length(true, 0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn a_long_row_of_facts_runs_on_instead_of_being_cut() {
+        lang::set(Lang::Russian);
+        let mut app = app(PathBuf::new());
+        app.current = Some(track());
+        app.track_open = true;
+        let name = cache::key(&track().url).unwrap();
+        app.covers.insert(name.clone(), None);
+        app.told.insert(
+            name,
+            Some(Details {
+                tags: Some(vec![
+                    "haunted mound".into(),
+                    "witch house".into(),
+                    "memphis".into(),
+                    "phonk".into(),
+                    "drain".into(),
+                    "sematary".into(),
+                ]),
+                ..Details::default()
+            }),
+        );
+        let text = screen(&mut app, 80, 24);
+        // The whole row is there, the last of it as much as the first: before, the
+        // line stopped where the column did, in the middle of a word.
+        for tag in [
+            "haunted mound",
+            "witch house",
+            "memphis",
+            "phonk",
+            "sematary",
+        ] {
+            assert!(text.contains(tag), "{tag}\n{text}");
+        }
+        // It runs on under itself, so the name stands by the first line alone.
+        assert_eq!(text.matches("Теги").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn pictures_are_left_out_of_what_is_drawn() {
+        // A crown after a title, a fleur-de-lis around a name, a flag, a face built
+        // of several signs with a joiner: each of them shifts the columns after it.
+        assert_eq!(clean("Raging Wolf \u{1f451}"), "Raging Wolf ");
+        assert_eq!(clean("\u{269c}\u{fe0f}REFLEXO\u{269c}\u{fe0f}"), "REFLEXO");
+        assert_eq!(clean("\u{1f1ef}\u{1f1f5} phonk"), " phonk");
+        assert_eq!(clean("a\u{1f468}\u{200d}\u{1f4bb}b"), "ab");
+        assert_eq!(clean("1\u{fe0f}\u{20e3}"), "1");
+        // Letters of every alphabet stay, and so do the signs the interface draws
+        // with: the arrows of its hints, its dashes, the dots and blocks of a cover.
+        let kept = "Ночной эфир - 夜の放送 \u{2190}\u{2192} \u{2014} \u{28ff}\u{2588}";
+        assert_eq!(clean(kept), kept);
+        // Control sequences go as they went before, and the line breaks that the
+        // multi-line gate keeps are kept.
+        assert_eq!(clean("a\u{1b}[31mb"), "a[31mb");
+        assert_eq!(clean_lines("a\nb\u{1f451}"), "a\nb");
     }
 
     #[test]

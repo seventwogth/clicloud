@@ -232,6 +232,14 @@ impl Playback {
         }
     }
 
+    /// Whether the length mpv reports is the whole track's. Fed through a pipe it
+    /// knows only what it has demuxed and calls that the length, so the length runs
+    /// along just ahead of the playback; a stored file and a stream mpv fetches
+    /// itself it sees whole from the start.
+    pub fn knows_length(&self) -> bool {
+        matches!(self.origin, Origin::Cache | Origin::Url)
+    }
+
     pub fn send(&mut self, command: Value) -> Result<()> {
         let socket = self.socket.as_mut().ok_or(t!("Плеер ещё подключается"))?;
         let mut bytes = serde_json::to_vec(&json!({"command": command}))?;
@@ -460,6 +468,25 @@ $server.Dispose()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_whole_file_tells_its_length() {
+        let directory =
+            std::env::temp_dir().join(format!("clicloud-length-test-{}", std::process::id()));
+        let mut player = Playback::idle(directory, 70.0);
+        // Through a pipe mpv reads a stream with no end in sight: what it calls the
+        // length is only what it has demuxed, and it grows along with the playback.
+        for origin in [Origin::Download, Origin::Pipe] {
+            player.origin = origin;
+            assert!(!player.knows_length(), "{origin:?}");
+        }
+        // A stored file it reads whole, and a stream it fetches itself comes with
+        // its length in the manifest.
+        for origin in [Origin::Cache, Origin::Url] {
+            player.origin = origin;
+            assert!(player.knows_length(), "{origin:?}");
+        }
+    }
 
     #[test]
     fn the_end_of_a_file_that_another_follows_is_not_the_end() {

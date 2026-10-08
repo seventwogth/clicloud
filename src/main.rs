@@ -520,15 +520,41 @@ fn choose(count: usize) -> Result<Option<usize>> {
     }
 }
 
-// Remote metadata must not inject terminal control sequences.
+/// Whether `c` is drawn as a picture instead of a letter: an emoji, one of the marks
+/// that join or reshape them, or a symbol asked to appear as one. Terminals disagree
+/// on how many cells such a sign takes, and where their count and ours differ, all
+/// that follows it on the line stands in the wrong place.
+fn pictured(c: char) -> bool {
+    matches!(
+        c as u32,
+        // Emoji proper: faces, objects, the skin tones and the letters of flags.
+        0x1F000..=0x1FAFF
+        // Older symbols and dingbats shown as emoji: sun, crown, aeroplane.
+        | 0x2600..=0x27BF
+        // Arrows and stars of the same kind.
+        | 0x2B00..=0x2BFF
+        // The selectors that ask for the picture rather than the letter.
+        | 0xFE00..=0xFE0F
+        // The joiner that makes one emoji out of several.
+        | 0x200D
+        // The ring that turns a digit into a key cap.
+        | 0x20E3
+    )
+}
+
+// Remote metadata must not inject terminal control sequences, and must not break the
+// columns with pictures either.
 fn clean(value: &str) -> String {
-    value.chars().filter(|c| !c.is_control()).collect()
+    value
+        .chars()
+        .filter(|c| !c.is_control() && !pictured(*c))
+        .collect()
 }
 
 // Same for multi-line error text: line breaks are kept.
 fn clean_lines(value: &str) -> String {
     value
         .chars()
-        .filter(|c| *c == '\n' || !c.is_control())
+        .filter(|c| *c == '\n' || (!c.is_control() && !pictured(*c)))
         .collect()
 }
