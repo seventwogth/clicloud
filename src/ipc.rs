@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 #[cfg(unix)]
 type Stream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
-type Stream = std::fs::File;
+use windows_pipe::Stream;
 
 /// Where mpv is told to listen, in the form that `--input-ipc-server` takes.
 pub struct Address(std::ffi::OsString);
@@ -107,9 +107,102 @@ fn open(address: &Address) -> io::Result<Stream> {
 
 #[cfg(windows)]
 fn open(address: &Address) -> io::Result<Stream> {
-    // Opening the pipe by its name is how a client joins it; it must be there already.
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(address.as_os_str())
+    Stream::open(address.as_os_str())
+}
+
+#[cfg(windows)]
+mod windows_pipe {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::{ERROR_BROKEN_PIPE, ERROR_IO_PENDING, HANDLE},
+        Storage::FileSystem::{FILE_FLAG_OVERLAPPED, ReadFile, WriteFile},
+        System::{
+            IO::{GetOverlappedResult, OVERLAPPED},
+            Threading::CreateEventW,
+        },
+    };
+
+    pub struct Stream(std::fs::File);
+
+    impl Stream {
+        pub fn open(address: &OsStr) -> io::Result<Self> {
+            // Synchronous Windows handles serialize reads and writes even across
+            // duplicates: an idle read would prevent sending mpv its next command.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .open(address)
+                .map(Self)
+        }
+
+        pub fn try_clone(&self) -> io::Result<Self> {
+            self.0.try_clone().map(Self)
+        }
+
+        fn transfer(
+            &self,
+            start: impl FnOnce(HANDLE, *mut OVERLAPPED, *mut u32) -> i32,
+        ) -> io::Result<usize> {
+            // SAFETY: no security attributes or name; the returned handle is owned
+            // here and kept alive until this operation has completed.
+            let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if event.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: CreateEventW succeeded and ownership has not been transferred.
+            let event = unsafe { OwnedHandle::from_raw_handle(event) };
+            let mut overlapped = OVERLAPPED {
+                hEvent: event.as_raw_handle(),
+                ..Default::default()
+            };
+            let mut count = 0;
+            let handle = self.0.as_raw_handle();
+            if start(handle, &mut overlapped, &mut count) == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+                    return Err(error);
+                }
+                // SAFETY: handle, buffer (borrowed by the caller), OVERLAPPED and
+                // event all remain alive. Wait for completion before releasing any
+                // of them. Each direction uses its own event and OVERLAPPED.
+                if unsafe { GetOverlappedResult(handle, &overlapped, &mut count, 1) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(count as usize)
+        }
+    }
+
+    impl Read for Stream {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let length = buffer.len().min(u32::MAX as usize) as u32;
+            let result = self.transfer(|handle, overlapped, count| {
+                // SAFETY: writable buffer spans length bytes and stays borrowed
+                // until transfer has waited for this read to finish.
+                unsafe { ReadFile(handle, buffer.as_mut_ptr(), length, count, overlapped) }
+            });
+            match result {
+                Err(error) if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => Ok(0),
+                other => other,
+            }
+        }
+    }
+
+    impl Write for Stream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let length = buffer.len().min(u32::MAX as usize) as u32;
+            self.transfer(|handle, overlapped, count| {
+                // SAFETY: readable buffer spans length bytes and stays borrowed
+                // until transfer has waited for this write to finish.
+                unsafe { WriteFile(handle, buffer.as_ptr(), length, count, overlapped) }
+            })
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 }

@@ -231,6 +231,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "url",
+ "windows-sys",
 ]
 
 [[package]]

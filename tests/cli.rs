@@ -39,7 +39,8 @@ impl Fixture {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
-        let fixture = Self(root);
+        // macOS exposes the same temporary directory through /var and /private/var.
+        let fixture = Self(root.canonicalize().unwrap());
         fs::write(fixture.0.join("config.json"), r#"{"language":"ru"}"#).unwrap();
         fixture.script(
             "yt-dlp",

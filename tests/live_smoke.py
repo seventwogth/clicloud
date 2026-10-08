@@ -25,7 +25,7 @@ def run(command, env, timeout=150):
             process.communicate()
         raise RuntimeError(f"Live command timed out after {timeout}s") from None
     if process.returncode:
-        raise RuntimeError(f"Live command exited {process.returncode}:\n{stderr[-3000:]}")
+        raise RuntimeError(f"Live command exited {process.returncode}:\n{stdout[-3000:]}\n{stderr[-3000:]}")
     return stdout, stderr
 
 

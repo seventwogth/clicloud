@@ -23,8 +23,10 @@ jobs:
           sudo systemctl start tinyproxy
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
-      - run: cargo +stable build --locked
+      - id: build
+        run: cargo +stable build --locked
       - name: Direct search, playback and offline cache
         run: python tests/live_smoke.py
       - name: Search and playback through HTTP proxy
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python tests/live_smoke.py --proxy http://127.0.0.1:8888
