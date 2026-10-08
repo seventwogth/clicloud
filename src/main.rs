@@ -111,7 +111,10 @@ fn main() -> ExitCode {
             if let Some(player::Interrupted(signal)) = error.downcast_ref() {
                 return ExitCode::from(128 + *signal as u8);
             }
-            eprintln!("{}", t!("Ошибка: {}", clean_lines(&error.to_string())));
+            // Written without a panic where nobody is left to read it: a terminal
+            // that was closed takes the place for errors along.
+            let said = t!("Ошибка: {}", clean_lines(&error.to_string()));
+            let _ = writeln!(io::stderr(), "{said}");
             ExitCode::FAILURE
         }
     }
@@ -339,7 +342,10 @@ fn run(cli: Cli) -> Result<()> {
                 &url,
                 found.as_ref(),
                 cache.as_ref(),
-                settings.sound(),
+                player::Sound {
+                    plugin: player::media_keys(&settings.media_keys).as_deref(),
+                    ..settings.sound()
+                },
             )?;
         }
         Action::Import {

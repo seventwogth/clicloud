@@ -164,7 +164,7 @@ if os.environ.get("MPV_LINGER"):
             read_until(lambda: json.loads(settings.read_text() or "{}").get("search_limit") == 15)
             # The last line of the settings brings the likes of a profile into the favorites:
             # the one that is a favorite already stays single, the playlist is left out.
-            os.write(master, b"jjjjjj\r@someone\r")
+            os.write(master, b"jjjjjjj\r@someone\r")
             library = root / "library.json"
             read_until(lambda: len(json.loads(library.read_text())["favorites"]) == 2)
             assert json.loads(settings.read_text())["soundcloud_profile"] == "someone"
@@ -197,7 +197,39 @@ if os.environ.get("MPV_LINGER"):
             os.close(slave)
 
 
+def hangup():
+    # The window of the terminal is closed: the interface must end, not go round and
+    # round on a terminal that is gone.
+    with tempfile.TemporaryDirectory(prefix="cc-", dir="/tmp") as directory:
+        root = Path(directory)
+        (root / "config.json").write_text("{}")
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+        process = subprocess.Popen(["target/debug/clicloud", "--no-proxy", "--no-cache",
+                                    "--yt-dlp", "/bin/true", "--mpv", "/bin/true",
+                                    "--config", str(root / "config.json"),
+                                    "ui", "--library", str(root / "library.json")],
+                                   stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+        try:
+            deadline = time.time() + 5
+            seen = b""
+            while "ПОИСК".encode() not in seen and time.time() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    seen += os.read(master, 65536)
+            os.close(master)
+            process.wait(timeout=5)
+            assert process.returncode == 0, process.returncode
+            print("PASS: a closed terminal ends the interface")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+                raise AssertionError("The interface outlived its terminal")
+
+
 if __name__ == "__main__":
     run()
     run(proxy=True)
     run(terminate=True)
+    hangup()

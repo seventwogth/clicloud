@@ -11,6 +11,7 @@
   "volume": 70,
   "cover": "blocks",
   "normalize": false,
+  "media_keys": "auto",
   "shuffle": false,
   "repeat": "off"
 }

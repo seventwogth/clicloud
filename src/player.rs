@@ -41,6 +41,36 @@ pub struct Sound<'a> {
     pub normalize: bool,
     /// The device to play on, by the name mpv knows it by; None leaves it to mpv.
     pub device: Option<&'a str>,
+    /// The plugin that lets the media keys of the desktop reach mpv, where it is used.
+    pub plugin: Option<&'a Path>,
+}
+
+/// Where the plugin is that makes mpv known to the desktop as a player, so that its
+/// media keys and its panel reach it: mpv-mpris, which the packages of Linux put in
+/// one of a few places. `wanted` is the setting: `auto` looks there, `off` wants
+/// none, anything else names the file.
+pub fn media_keys(wanted: &str) -> Option<PathBuf> {
+    let found = |path: PathBuf| path.is_file().then_some(path);
+    match wanted {
+        "off" | "none" | "" => None,
+        "auto" => {
+            let own = crate::config::directory("XDG_CONFIG_HOME", ".config")
+                .map(|directory| directory.join("mpv/scripts/mpris.so"));
+            [
+                "/usr/lib/mpv-mpris/mpris.so",
+                "/usr/lib64/mpv-mpris/mpris.so",
+                "/usr/local/lib/mpv-mpris/mpris.so",
+                "/usr/lib/x86_64-linux-gnu/mpv-mpris/mpris.so",
+                "/usr/lib/aarch64-linux-gnu/mpv-mpris/mpris.so",
+                "/etc/mpv/scripts/mpris.so",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .chain(own)
+            .find_map(found)
+        }
+        file => found(PathBuf::from(file)),
+    }
 }
 
 // One loudness for every track, by the measure that broadcasters use.
@@ -55,6 +85,11 @@ pub fn mpv(executable: &str, sound: Sound) -> Command {
     }
     if let Some(device) = sound.device {
         command.arg(format!("--audio-device={device}"));
+    }
+    if let Some(plugin) = sound.plugin {
+        let mut script = std::ffi::OsString::from("--script=");
+        script.push(plugin);
+        command.arg(script);
     }
     command
 }
@@ -544,13 +579,23 @@ mod tests {
             Sound {
                 normalize: true,
                 device: Some("alsa"),
+                plugin: Some(Path::new("/lib/mpris.so")),
             },
         );
         let args: Vec<_> = loud
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args[3..], [LOUDNESS, "--audio-device=alsa"]);
+        assert_eq!(
+            args[3..],
+            [LOUDNESS, "--audio-device=alsa", "--script=/lib/mpris.so"]
+        );
+        // The plugin for the media keys: none where it is not wanted or not there.
+        let here = std::env::current_exe().unwrap();
+        assert_eq!(media_keys(&here.to_string_lossy()), Some(here));
+        for wanted in ["off", "none", "", "/clicloud/no/such/mpris.so"] {
+            assert!(media_keys(wanted).is_none(), "{wanted}");
+        }
         assert_eq!(mpv("mpv", Sound::default()).get_args().count(), 3);
     }
 

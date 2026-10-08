@@ -1080,6 +1080,18 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "{}、クライアント以外が導入",
     ),
     ("обновлён: {}", "updated: {}", "更新しました: {}"),
+    ("Медиаклавиши", "Media keys", "メディアキー"),
+    (
+        "Enter - включить или выключить: пауза, стоп и соседние треки с\nклавиатуры и из панели, через плагин mpv-mpris. Со следующего трека.",
+        "Enter - switch on or off: pause, stop and the tracks around from\nthe keyboard and the panel, by the plugin mpv-mpris. From the next.",
+        "Enter - オンとオフ: キーボードやパネルから一時停止、停止、\n前後の曲。mpv-mpris プラグインを使います。次の曲から有効。",
+    ),
+    ("вкл: {}", "on: {}", "オン: {}"),
+    (
+        "вкл, но плагин mpv-mpris не найден",
+        "on, but the plugin mpv-mpris is not found",
+        "オン (mpv-mpris プラグインが見つかりません)",
+    ),
 ];
 
 #[cfg(test)]

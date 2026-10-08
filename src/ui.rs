@@ -127,11 +127,12 @@ enum Setting {
     Volume,
     Normalize,
     Device,
+    MediaKeys,
     Extractor,
     Likes,
 }
 
-const SETTINGS: [Setting; 15] = [
+const SETTINGS: [Setting; 16] = [
     Setting::Theme,
     Setting::Backdrop,
     Setting::Cover,
@@ -145,6 +146,7 @@ const SETTINGS: [Setting; 15] = [
     Setting::Volume,
     Setting::Normalize,
     Setting::Device,
+    Setting::MediaKeys,
     Setting::Extractor,
     Setting::Likes,
 ];
@@ -166,6 +168,7 @@ impl Setting {
             Self::Volume => t!("Громкость при запуске"),
             Self::Normalize => t!("Ровная громкость"),
             Self::Device => t!("Аудиоустройство"),
+            Self::MediaKeys => t!("Медиаклавиши"),
             Self::Extractor => "yt-dlp",
             Self::Likes => t!("Лайки SoundCloud"),
         }
@@ -221,6 +224,11 @@ impl Setting {
             Self::Device => {
                 t!(
                     "Enter или Left/Right - следующее из устройств, что видит mpv.\nавто оставляет выбор за ним. Действует сразу."
+                )
+            }
+            Self::MediaKeys => {
+                t!(
+                    "Enter - включить или выключить: пауза, стоп и соседние треки с\nклавиатуры и из панели, через плагин mpv-mpris. Со следующего трека."
                 )
             }
             Self::Extractor => {
@@ -433,6 +441,8 @@ struct App {
     page_job: Option<(String, String, mpsc::Receiver<Page>)>,
     // The picture that was last drawn, as cells.
     drawn: Option<(String, u16, u16, Mode, String, Vec<cover::Cell>)>,
+    // The plugin that lets the media keys of the desktop reach mpv, where it is used.
+    plugin: Option<PathBuf>,
     // A newer yt-dlp on its way, and what the line of the settings says of the last
     // look at the one there is.
     update: Option<mpsc::Receiver<std::result::Result<PathBuf, String>>>,
@@ -466,6 +476,7 @@ impl App {
     fn new(session: Session, library_path: PathBuf, library: Library) -> Self {
         // What was to play the last time waits to be played now.
         let waiting: VecDeque<Track> = library.queue.iter().cloned().collect();
+        let plugin = player::media_keys(&session.settings.media_keys);
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
             worker: None,
@@ -531,6 +542,7 @@ impl App {
             page_job: None,
             drawn: None,
             broken: Default::default(),
+            plugin,
             update: None,
             updated: None,
             devices: vec![],
@@ -842,6 +854,11 @@ impl App {
                     .find(|(name, described)| name == device && !described.is_empty())
                     .map_or_else(|| device.clone(), |(_, described)| described.clone()),
             },
+            Setting::MediaKeys => match (&self.plugin, self.settings.media_keys.as_str()) {
+                (_, "off" | "none" | "") => switch(false),
+                (Some(plugin), _) => t!("вкл: {}", clean(&plugin.to_string_lossy())),
+                (None, _) => t!("вкл, но плагин mpv-mpris не найден").into(),
+            },
             Setting::Extractor => match (&self.update, &self.updated) {
                 (Some(_), _) => t!("Скачиваю и проверяю...").into(),
                 (None, Some(said)) => said.clone(),
@@ -1007,6 +1024,11 @@ impl App {
                 self.settings.volume = step(u64::from(self.settings.volume), 5, 100) as u8;
             }
             Setting::Normalize => self.settings.normalize = !self.settings.normalize,
+            Setting::MediaKeys => {
+                let off = matches!(self.settings.media_keys.as_str(), "off" | "none" | "");
+                self.settings.media_keys = if off { "auto" } else { "off" }.into();
+                self.plugin = player::media_keys(&self.settings.media_keys);
+            }
             Setting::Device => {
                 // mpv is asked once what it can play on; its own choice is the first.
                 if self.devices.is_empty() {
@@ -1464,7 +1486,10 @@ impl App {
             self.extractor(),
             &track,
             self.cache.as_ref(),
-            self.settings.sound(),
+            player::Sound {
+                plugin: self.plugin.as_deref(),
+                ..self.settings.sound()
+            },
             self.volume,
             self.speed,
         ) {
@@ -2161,12 +2186,32 @@ impl App {
             }
             self.volume = player.volume;
             let (advanced, astray) = (player.advanced(), player.astray());
+            let (wandered, halted) = (player.wandered(), player.halted());
             let outcome = match result {
                 Ok(over) => Ok(over),
                 Err(error) => Err((error.to_string(), player.details())),
             };
+            // The media keys of the desktop reach mpv, not the client: stopped by
+            // them, it is gone, and no track has failed.
+            if halted {
+                self.player = None;
+                self.message = t!("Воспроизведение остановлено").into();
+                return;
+            }
             if advanced {
                 self.advanced();
+                if let (Some(player), Some(track)) = (&mut self.player, &self.current) {
+                    player.name(track);
+                }
+            }
+            // Sent back by them, it plays a file of its own choosing: the track before
+            // is started the way the key for it would, or the current one again.
+            if wandered {
+                return match (self.previous.is_empty(), self.current.clone()) {
+                    (false, _) => self.action(Action::Previous),
+                    (true, Some(track)) => self.start(track),
+                    (true, None) => (),
+                };
             }
             if astray && let Some(track) = self.current.clone() {
                 // It plays what was to follow before that was changed: start over.
@@ -2243,6 +2288,47 @@ fn terminated() -> Result<Arc<AtomicBool>> {
     Ok(Arc::new(AtomicBool::new(false)))
 }
 
+// What a wait for the terminal ended with.
+#[derive(PartialEq)]
+enum Waited {
+    /// Nothing came in the time given.
+    Quiet,
+    /// There is something to read.
+    Ready,
+    /// The terminal is gone: its window was closed.
+    Gone,
+}
+
+// Waits for the keys of the terminal for at most `time`, by asking the system.
+#[cfg(unix)]
+fn waited(time: Duration) -> Waited {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let input = io::stdin();
+    let mut asked = [PollFd::new(&input, PollFlags::IN)];
+    let time = Timespec {
+        tv_sec: time.as_secs() as i64,
+        tv_nsec: time.subsec_nanos().into(),
+    };
+    let gone = PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL;
+    match poll(&mut asked, Some(&time)) {
+        Ok(_) if asked[0].revents().intersects(gone) => Waited::Gone,
+        Ok(ready) if ready > 0 => Waited::Ready,
+        // A signal cut the wait short: the loop looks at what it was about.
+        _ => Waited::Quiet,
+    }
+}
+
+// Windows tells of its console through crossterm alone, which does not go round on a
+// console that is gone the way it does on a terminal of Unix.
+#[cfg(not(unix))]
+fn waited(time: Duration) -> Waited {
+    match event::poll(time) {
+        Ok(true) => Waited::Ready,
+        Ok(false) => Waited::Quiet,
+        Err(_) => Waited::Gone,
+    }
+}
+
 pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(t!("Интерфейсу нужен интерактивный терминал. Для скриптов используйте search или play --first.").into());
@@ -2250,6 +2336,18 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     let path = library::path(library, "ui")?;
     let library = library::load(&path)?;
     let terminate = terminated()?;
+    // The last resort: asked to end and still there a few seconds later, the loop is
+    // stuck on a terminal that is gone, and what it started is gone with that.
+    let asked = terminate.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if asked.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(5));
+                std::process::exit(1);
+            }
+        }
+    });
     let mut app = App::new(session, path, library);
     app.setup = Setup::needed(&app.yt_dlp, &app.mpv);
     app.warm();
@@ -2263,17 +2361,47 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
         previous_hook(info);
     }));
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut gone = false;
+    // What the terminal is asked for fails when its window was closed in that very
+    // instant: that is the end of the run, not an error to report to nobody.
+    macro_rules! alive {
+        ($asked:expr) => {
+            match $asked {
+                Ok(answer) => answer,
+                Err(_) if waited(Duration::ZERO) == Waited::Gone => {
+                    gone = true;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+    }
     loop {
         // Leave through the normal path so that Drop stops mpv and removes its directory.
         if terminate.load(Ordering::Relaxed) {
             break;
         }
         app.tick();
-        terminal.draw(|frame| draw(frame, &mut app))?;
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
+        alive!(terminal.draw(|frame| draw(frame, &mut app)));
+        // A terminal that was closed counts as something to read, and crossterm goes
+        // round and round on it without an end. So the wait for keys is our own, and
+        // crossterm is asked only for what is there, on a terminal that is still there.
+        if waited(Duration::ZERO) == Waited::Gone {
+            gone = true;
+            break;
         }
-        match event::read()? {
+        if !alive!(event::poll(Duration::ZERO)) {
+            match waited(Duration::from_millis(100)) {
+                Waited::Gone => {
+                    gone = true;
+                    break;
+                }
+                Waited::Quiet => continue,
+                Waited::Ready if !alive!(event::poll(Duration::ZERO)) => continue,
+                Waited::Ready => (),
+            }
+        }
+        match alive!(event::read()) {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     break;
@@ -2540,6 +2668,10 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     }
     // What plays and what is ahead of it is kept as it stands at the end of the run.
     app.save();
+    // A terminal that is gone has no cursor to bring back, and saying so to it fails.
+    if gone {
+        std::mem::forget(terminal);
+    }
     Ok(())
 }
 
@@ -4649,6 +4781,42 @@ exit /b 1"#,
             fs::remove_file(file).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_media_keys_of_the_desktop_are_let_through_where_the_plugin_is() {
+        let mut app = app(PathBuf::new());
+        app.setting = SETTINGS
+            .iter()
+            .position(|s| *s == Setting::MediaKeys)
+            .unwrap();
+        // Wanted and not installed, which is how most machines are.
+        app.plugin = None;
+        assert_eq!(
+            app.value(Setting::MediaKeys),
+            "вкл, но плагин mpv-mpris не найден"
+        );
+        app.activate();
+        assert_eq!(
+            (
+                app.settings.media_keys.as_str(),
+                app.value(Setting::MediaKeys)
+            ),
+            ("off", "выкл".into())
+        );
+        assert!(app.plugin.is_none());
+        // A file named in the settings is the plugin, wherever it is.
+        let here = std::env::current_exe().unwrap();
+        app.settings.media_keys = here.to_string_lossy().into_owned();
+        app.plugin = player::media_keys(&app.settings.media_keys);
+        assert_eq!(
+            app.value(Setting::MediaKeys),
+            format!("вкл: {}", here.display())
+        );
+        app.adjust(1);
+        assert_eq!(app.settings.media_keys, "off");
+        app.adjust(1);
+        assert_eq!(app.settings.media_keys, "auto");
     }
 
     #[test]
