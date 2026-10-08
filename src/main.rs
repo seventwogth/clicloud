@@ -22,7 +22,7 @@ use std::process::{Command, ExitCode};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser)]
-#[command(version, about = "Search and play SoundCloud in the terminal")]
+#[command(version, about = "Search and play music in the terminal")]
 struct Cli {
     /// Path to yt-dlp
     #[arg(long, global = true, env = "CLICLOUD_YT_DLP", default_value_t = default_yt_dlp())]

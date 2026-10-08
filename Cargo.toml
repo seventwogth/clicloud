@@ -3,7 +3,7 @@ name = "clicloud"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "SoundCloud search and playback in the terminal"
+description = "Music search and playback in the terminal"
 license = "MIT"
 
 [dependencies]
