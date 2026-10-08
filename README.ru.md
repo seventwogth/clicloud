@@ -1,12 +1,12 @@
-```text
-  .g8"""bgd `7MMF'      `7MMF' .g8"""bgd `7MMF'        .g8""8q. `7MMF'   `7MF'`7MM"""Yb.
+<div align="center"><pre>
+  .g8"""bgd `7MMF'      `7MMF' .g8"""bgd `7MMF'        .g8""8q. `7MMF'   `7MF'`7MM"""Yb.&nbsp;&nbsp;
 .dP'     `M   MM          MM .dP'     `M   MM        .dP'    `YM. MM       M    MM    `Yb.
 dM'       `   MM          MM dM'       `   MM        dM'      `MM MM       M    MM     `Mb
 MM            MM          MM MM            MM        MM        MM MM       M    MM      MM
 MM.           MM      ,   MM MM.           MM      , MM.      ,MP MM       M    MM     ,MP
 `Mb.     ,'   MM     ,M   MM `Mb.     ,'   MM     ,M `Mb.    ,dP' YM.     ,M    MM    ,dP'
-  `"bmmmd'  .JMMmmmmMMM .JMML. `"bmmmd'  .JMMmmmmMMM   `"bmmd"'    `bmmmmd"'  .JMMmmmdP'
-```
+  `"bmmmd'  .JMMmmmmMMM .JMML. `"bmmmd'  .JMMmmmmMMM   `"bmmd"'    `bmmmmd"'  .JMMmmmdP'&nbsp;&nbsp;
+</pre></div>
 
 [English](README.md) | Русский
 
