@@ -580,7 +580,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Previous / next track",
         "前の曲 / 次の曲",
     ),
-    ("Перемотка", "Seek", "シーク"),
+    (
+        "Перемотка        , .  Медленнее / быстрее",
+        "Seek             , .  Slower / faster",
+        "シーク           , .  遅く / 速く",
+    ),
     (
         "Громкость    s  Стоп    q  Выход",
         "Volume       s  Stop    q  Quit",
@@ -860,9 +864,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("Получено: {}", "Received: {}", "取得済み: {}"),
     (
-        "В профиле нет лайков.",
-        "The profile has no likes.",
-        "このプロフィールにいいねはありません。",
+        "В списке нет треков.",
+        "The list has no tracks.",
+        "この一覧に曲はありません。",
     ),
     (
         "Было бы добавлено: {}, уже в избранном: {}, пропущено: {}",
@@ -912,6 +916,107 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Reading the likes was interrupted",
         "いいねの読み込みが中断されました",
     ),
+    ("вперемешку", "shuffled", "シャッフル"),
+    ("по порядку", "in order", "順番どおり"),
+    ("без повтора", "no repeat", "リピートなし"),
+    ("повтор списка", "repeat the list", "リストをリピート"),
+    ("повтор трека", "repeat the track", "1曲リピート"),
+    ("Порядок: {}", "Order: {}", "再生順: {}"),
+    ("Повтор: {}", "Repeat: {}", "リピート: {}"),
+    (
+        " ФИЛЬТР БИБЛИОТЕКИ   Enter - оставить, Esc - сбросить ",
+        " LIBRARY FILTER   Enter - keep, Esc - clear ",
+        " ライブラリの絞り込み   Enter - 確定、Esc - 解除 ",
+    ),
+    (
+        "\n\nПо этому фильтру ничего нет.\n\nEsc - сбросить фильтр.",
+        "\n\nNothing matches this filter.\n\nEsc - clear the filter.",
+        "\n\nこの条件に合う曲はありません。\n\nEsc - 絞り込みを解除",
+    ),
+    (
+        "Листать список   Home End  К краям списка",
+        "Page the list    Home End  To its ends",
+        "ページ送り       Home End  先頭 / 末尾",
+    ),
+    (
+        "Фильтр библиотеки (Esc сбрасывает)",
+        "Filter the library (Esc clears)",
+        "ライブラリを絞り込む (Esc で解除)",
+    ),
+    (
+        "Вперемешку / повтор: нет, список, трек",
+        "Shuffle / repeat: off, list, track",
+        "シャッフル / リピート: なし、リスト、1曲",
+    ),
+    (
+        "Читаю список {}…",
+        "Reading the list {}…",
+        "一覧 {} を読み込み中…",
+    ),
+    (
+        "Читаю список... Esc - отмена",
+        "Reading the list... Esc - cancel",
+        "一覧を読み込み中... Esc - 中止",
+    ),
+    (
+        "Раньше ничего не открывалось",
+        "Nothing was open before this",
+        "これより前の一覧はありません",
+    ),
+    (
+        "У этой ссылки нет страницы автора",
+        "This link has no page of an author",
+        "このリンクに作者のページはありません",
+    ),
+    (
+        "Станция есть только у отдельного трека",
+        "Only a single track has a station",
+        "ステーションは曲にしかありません",
+    ),
+    (
+        "В избранное добавлено: {}, уже было: {}",
+        "Added to the favorites: {}, already there: {}",
+        "お気に入りに追加: {}、登録済み: {}",
+    ),
+    (
+        " АВТОР {} | {} | [ ] - раздел ",
+        " AUTHOR {} | {} | [ ] - section ",
+        " 作者 {} | {} | [ ] - セクション ",
+    ),
+    ("треки", "tracks", "曲"),
+    ("альбомы", "albums", "アルバム"),
+    ("плейлисты", "playlists", "プレイリスト"),
+    ("репосты", "reposts", "リポスト"),
+    ("лайки", "likes", "いいね"),
+    (
+        "Похожие треки / автор   [ ]  Его разделы",
+        "Similar tracks / author  [ ]  Sections",
+        "似た曲 / 作者            [ ]  セクション",
+    ),
+    (
+        "Весь список в избранное / назад к списку",
+        "All of the list to favorites / list before",
+        "一覧をすべてお気に入りへ / 前の一覧へ",
+    ),
+    ("Ровная громкость", "Even loudness", "音量をそろえる"),
+    ("Аудиоустройство", "Audio device", "オーディオ機器"),
+    (
+        "Enter - включить или выключить: тихие и громкие треки\nприводятся к одной громкости. Действует со следующего трека.",
+        "Enter - switch on or off: quiet and loud tracks are brought\nto one loudness. Applies from the next track.",
+        "Enter - オンとオフ: 小さい曲と大きい曲の音量を\nそろえます。次の曲から有効になります。",
+    ),
+    (
+        "Enter или Left/Right - следующее из устройств, что видит mpv.\nавто оставляет выбор за ним. Действует сразу.",
+        "Enter or Left/Right - the next of the devices that mpv sees.\nauto leaves the choice to it. Applies at once.",
+        "Enter か Left/Right - mpv が見つけた次の機器に切り替えます。\n自動は mpv に任せます。すぐに有効になります。",
+    ),
+    ("авто", "auto", "自動"),
+    (
+        "mpv не назвал ни одного устройства",
+        "mpv named no device",
+        "mpv から機器の一覧を取得できません",
+    ),
+    ("Скорость: x{}", "Speed: x{}", "速度: x{}"),
 ];
 
 #[cfg(test)]

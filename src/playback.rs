@@ -4,7 +4,7 @@ use crate::{
     cache::Cache,
     ipc,
     player::{self, Download},
-    soundcloud::{self, Extractor, Track},
+    soundcloud::{self, Details, Extractor, Track},
 };
 use serde_json::{Value, json};
 use std::{
@@ -41,12 +41,24 @@ pub struct Playback {
     started: Instant,
     pub position: f64,
     pub duration: f64,
+    /// How far the audio that has arrived reaches, in seconds; 0 until mpv tells.
+    pub buffered: f64,
+    pub speed: f64,
     pub paused: bool,
     pub volume: f64,
     pub loaded: bool,
     eof: bool,
     error: Option<String>,
     log: Vec<String>,
+    // Where the yt-dlp that feeds the player notes what it learns of the track.
+    noted: Option<PathBuf>,
+    // The stored file that mpv was told to play after the current one, and whether it
+    // has gone on to it: the same player then plays the next track without a gap.
+    appended: Option<PathBuf>,
+    advanced: bool,
+    // The file mpv is to name as the one it plays now, and whether it named another.
+    expected: Option<PathBuf>,
+    astray: bool,
 }
 
 impl Playback {
@@ -63,12 +75,19 @@ impl Playback {
             started: Instant::now(),
             position: 0.0,
             duration: 0.0,
+            buffered: 0.0,
+            speed: 1.0,
             paused: false,
             volume,
             loaded: false,
             eof: false,
             error: None,
             log: Vec::new(),
+            noted: None,
+            appended: None,
+            advanced: false,
+            expected: None,
+            astray: false,
         }
     }
 
@@ -77,7 +96,9 @@ impl Playback {
         extractor: Extractor,
         track: &Track,
         cache: Option<&Cache>,
+        sound: player::Sound,
         volume: f64,
+        speed: f64,
     ) -> Result<Self> {
         let url = track.url.as_str();
         soundcloud::validate_url(url)?;
@@ -85,16 +106,20 @@ impl Playback {
         let log = fs::File::create(player.directory.join("error.log"))?;
         let mut listen = std::ffi::OsString::from("--input-ipc-server=");
         listen.push(player.address.as_os_str());
-        let mut command = player::mpv(mpv);
+        player.speed = speed;
+        let mut command = player::mpv(mpv, sound);
         command
             .args([
                 "--no-terminal",
                 "--input-terminal=no",
                 "--idle=no",
                 "--volume-max=100",
+                // The file that follows is opened before the current one ends.
+                "--prefetch-playlist=yes",
             ])
             .arg(listen)
             .arg(format!("--volume={volume}"))
+            .arg(format!("--speed={speed}"))
             .stdout(Stdio::null())
             .stderr(log.try_clone()?);
         if let Some(file) = cache.and_then(|cache| cache.find(url)) {
@@ -106,6 +131,7 @@ impl Playback {
         } else if let Some(mut partial) = cache.map(|cache| cache.store(url)).transpose()?.flatten()
         {
             partial.describe(track);
+            player.noted = Some(partial.directory().to_owned());
             player.origin = Origin::Download;
             let mut source = player::downloader(extractor, url, partial.directory(), false, true);
             source.stderr(log);
@@ -113,6 +139,7 @@ impl Playback {
             player::from_pipe(&mut command, Stdio::piped());
         } else if extractor.proxy.is_some() {
             player.origin = Origin::Pipe;
+            player.noted = Some(player.directory.clone());
             let mut source = player::downloader(extractor, url, &player.directory, false, false)
                 .stderr(log)
                 .spawn()
@@ -131,6 +158,40 @@ impl Playback {
         }
         player.child = Some(child);
         Ok(player)
+    }
+
+    /// Tells mpv which stored file plays after the current one, or that none does. It
+    /// goes on to that file by itself, as the next track of an album should start.
+    pub fn follow(&mut self, next: Option<&Path>) {
+        if self.appended.as_deref() == next || self.socket.is_none() || self.eof {
+            return;
+        }
+        // Clearing leaves the file that plays and takes what was to follow it.
+        let cleared =
+            self.appended.take().is_none() || self.send(json!(["playlist-clear"])).is_ok();
+        if let (true, Some(next)) = (cleared, next)
+            && (self.send(json!(["loadfile", next, "append"]))).is_ok()
+        {
+            self.appended = Some(next.to_owned());
+        }
+    }
+
+    /// Whether mpv has gone on to the file that was to follow, told once.
+    pub fn advanced(&mut self) -> bool {
+        std::mem::take(&mut self.advanced)
+    }
+
+    /// Whether mpv plays another file than the one it was last told to go on to: what
+    /// followed was changed in the instant it went on. Told once.
+    pub fn astray(&mut self) -> bool {
+        std::mem::take(&mut self.astray)
+    }
+
+    /// What yt-dlp has noted of the track it fetches for this player, told once.
+    pub fn learn(&mut self) -> Option<Details> {
+        let details = Details::read(self.noted.as_ref()?)?;
+        self.noted = None;
+        Some(details)
     }
 
     /// Audio is still arriving: mpv then only knows the length of what it has got.
@@ -161,10 +222,16 @@ impl Playback {
         if self.socket.is_none() {
             if let Ok(socket) = ipc::Connection::connect(&self.address) {
                 self.socket = Some(socket);
-                for (id, name) in ["time-pos", "duration", "pause", "volume"]
-                    .iter()
-                    .enumerate()
-                {
+                let observed = [
+                    "time-pos",
+                    "duration",
+                    "pause",
+                    "volume",
+                    "speed",
+                    "demuxer-cache-time",
+                    "path",
+                ];
+                for (id, name) in observed.iter().enumerate() {
                     self.send(json!(["observe_property", id + 1, name]))?;
                 }
                 self.send(json!(["request_log_messages", "error"]))?;
@@ -212,6 +279,15 @@ impl Playback {
     fn event(&mut self, event: Value) {
         match event["event"].as_str() {
             Some("file-loaded") => self.loaded = true,
+            // The end of a file that another one follows is not the end of the player.
+            Some("end-file") if event["reason"] == "eof" && self.appended.is_some() => {
+                self.expected = self.appended.take();
+                self.advanced = true;
+                self.origin = Origin::Cache;
+                self.noted = None;
+                self.loaded = false;
+                (self.position, self.duration, self.buffered) = (0.0, 0.0, 0.0);
+            }
             Some("end-file") => {
                 self.eof = event["reason"] == "eof";
                 if event["reason"] == "error" {
@@ -245,6 +321,16 @@ impl Playback {
                 Some("duration") => self.duration = event["data"].as_f64().unwrap_or(self.duration),
                 Some("pause") => self.paused = event["data"].as_bool().unwrap_or(false),
                 Some("volume") => self.volume = event["data"].as_f64().unwrap_or(self.volume),
+                Some("speed") => self.speed = event["data"].as_f64().unwrap_or(self.speed),
+                Some("path") => {
+                    if let (Some(path), Some(expected)) = (event["data"].as_str(), &self.expected) {
+                        self.astray = Path::new(path) != expected;
+                        self.expected = None;
+                    }
+                }
+                Some("demuxer-cache-time") => {
+                    self.buffered = event["data"].as_f64().unwrap_or(self.buffered)
+                }
                 _ => (),
             },
             _ => (),
@@ -321,6 +407,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_end_of_a_file_that_another_follows_is_not_the_end() {
+        let directory =
+            std::env::temp_dir().join(format!("clicloud-follow-test-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let mut player = Playback::idle(directory.clone(), 70.0);
+        let next = directory.join("next");
+        let ended = json!({"event": "end-file", "reason": "eof"});
+        // Not connected yet, mpv cannot be told what follows.
+        player.follow(Some(&next));
+        assert!(player.appended.is_none());
+
+        player.appended = Some(next.clone());
+        player.origin = Origin::Download;
+        player.event(json!({"event": "property-change", "name": "time-pos", "data": 90.0}));
+        player
+            .event(json!({"event": "property-change", "name": "demuxer-cache-time", "data": 95.0}));
+        player.event(json!({"event": "property-change", "name": "speed", "data": 1.5}));
+        assert_eq!((player.buffered, player.speed), (95.0, 1.5));
+        player.event(ended.clone());
+        assert!(player.advanced() && !player.advanced());
+        assert!(!player.eof && !player.loaded && player.origin == Origin::Cache);
+        assert_eq!((player.position, player.buffered), (0.0, 0.0));
+        // mpv names the file it went on to: the expected one, and nothing is amiss.
+        player.event(json!({"event": "property-change", "name": "path", "data": next.to_str()}));
+        assert!(!player.astray());
+        // Nothing follows that one, so its end is the end.
+        player.event(ended.clone());
+        assert!(player.eof && !player.advanced());
+
+        // Another file than the one it was last told of: what followed was changed in
+        // the instant it went on, and it plays what was to follow before.
+        player.eof = false;
+        player.appended = Some(next.clone());
+        player.event(ended);
+        player.event(json!({"event": "property-change", "name": "path", "data": "/other"}));
+        assert!(player.advanced() && player.astray() && !player.astray());
+        // A failure is still a failure, whatever follows.
+        player.appended = Some(next);
+        player.event(json!({"event": "end-file", "reason": "error"}));
+        assert!(!player.advanced() && player.error.is_some());
+        drop(player);
+        assert!(!directory.exists());
+    }
+
+    #[test]
     fn error_details_combine_downloader_output_and_player_log() {
         let directory =
             std::env::temp_dir().join(format!("clicloud-playback-test-{}", std::process::id()));
@@ -382,8 +513,16 @@ mod tests {
             no_proxy: true,
             cache: None,
         };
-        let mut player =
-            Playback::start(&executable.to_string_lossy(), extractor, &track, None, 70.0).unwrap();
+        let mut player = Playback::start(
+            &executable.to_string_lossy(),
+            extractor,
+            &track,
+            None,
+            player::Sound::default(),
+            70.0,
+            1.0,
+        )
+        .unwrap();
         // Starting a shell and PowerShell takes a while, and a loaded machine more.
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {

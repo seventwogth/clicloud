@@ -14,6 +14,51 @@ pub struct Track {
     pub url: String,
 }
 
+/// What yt-dlp tells of a track when it fetches it, which is more than the list of a
+/// profile does: there a track has a title and a link, and its maker is a guess.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Details {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub duration: Option<f64>,
+}
+
+impl Details {
+    /// The file that a download notes them in, in the directory it runs in.
+    pub const FILE: &'static str = "details.json";
+    /// What makes yt-dlp write that file: a line of JSON, with null for what it lacks.
+    pub const ARGUMENTS: [&'static str; 5] = [
+        "--output-na-placeholder",
+        "null",
+        "--print-to-file",
+        r#"{"title":%(title)j,"artist":%(uploader)j,"duration":%(duration)j}"#,
+        Self::FILE,
+    ];
+
+    /// The details noted in `directory`; None until yt-dlp has looked the track up.
+    pub fn read(directory: &Path) -> Option<Self> {
+        let text = std::fs::read(directory.join(Self::FILE)).ok()?;
+        let line = text.split(|byte| *byte == b'\n').next()?;
+        let details: Self = serde_json::from_slice(line).ok()?;
+        (details.title.is_some() || details.artist.is_some() || details.duration.is_some())
+            .then_some(details)
+    }
+
+    /// Puts what is known in place of what `track` had.
+    pub fn apply(&self, track: &mut Track) {
+        let named = |name: &Option<String>| name.clone().filter(|name| !name.trim().is_empty());
+        if let Some(title) = named(&self.title) {
+            track.title = title;
+        }
+        if let Some(artist) = named(&self.artist) {
+            track.artist = artist;
+        }
+        if let Some(duration) = self.duration.filter(|d| d.is_finite() && *d > 0.0) {
+            track.duration = Some(duration);
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct SearchResponse {
     entries: Vec<Option<Entry>>,
@@ -104,6 +149,28 @@ impl<'a> SoundCloud<'a> {
         Ok(tracks)
     }
 
+    /// Answers what was typed: a link to SoundCloud is opened, anything else is
+    /// searched for. `limit` is the most that is taken of either.
+    pub fn ask(&self, question: &str, limit: u16, found: impl FnMut(Track)) -> Result<()> {
+        match page(question) {
+            Some(_) => self.open(question, Some(limit), found),
+            None => self.stream(question, limit.clamp(1, 50) as u8, found),
+        }
+    }
+
+    /// The tracks behind a link: those of a playlist, of a page of a profile, of the
+    /// station of a track, or the one track that the link names. A page that lists
+    /// playlists hands them over as tracks whose links lead to them.
+    pub fn open(&self, link: &str, limit: Option<u16>, found: impl FnMut(Track)) -> Result<()> {
+        let (page, link) = page(link).ok_or(t!("Ожидается HTTP(S)-ссылка SoundCloud."))?;
+        if !self.quiet {
+            eprintln!("{}", t!("Читаю список {}…", link));
+        }
+        // A page tells the title and the link of each track at once. A playlist tells
+        // links alone, and not even those of all its tracks, so each is looked up.
+        self.list(&link, page == Page::Listing, limit, found)
+    }
+
     /// Searches, handing over each track as yt-dlp finds it, so that a list can fill
     /// while the rest of the results are still on their way.
     pub fn stream(&self, query: &str, limit: u8, found: impl FnMut(Track)) -> Result<()> {
@@ -114,7 +181,7 @@ impl<'a> SoundCloud<'a> {
         if !self.quiet {
             eprintln!("{}", t!("Поиск в SoundCloud…"));
         }
-        self.list(&format!("scsearch{limit}:{query}"), found)
+        self.list(&format!("scsearch{limit}:{query}"), true, None, found)
     }
 
     /// The tracks that a profile has liked, the latest first, handed over as yt-dlp
@@ -128,15 +195,39 @@ impl<'a> SoundCloud<'a> {
         if !self.quiet {
             eprintln!("{}", t!("Читаю лайки профиля {}…", name));
         }
-        self.list(&format!("https://soundcloud.com/{name}/likes"), found)
+        self.list(
+            &format!("https://soundcloud.com/{name}/likes"),
+            true,
+            None,
+            found,
+        )
     }
 
-    // Asks yt-dlp for the tracks of `target`, a search or a page, one per line.
-    fn list(&self, target: &str, mut found: impl FnMut(Track)) -> Result<()> {
+    // Asks yt-dlp for the tracks of `target`, a search or a page, one per line. `flat`
+    // takes what the list itself tells of each; otherwise every track is looked up,
+    // which costs a request apiece and tells all of it but where the audio is.
+    fn list(
+        &self,
+        target: &str,
+        flat: bool,
+        limit: Option<u16>,
+        mut found: impl FnMut(Track),
+    ) -> Result<()> {
         let mut command = self.extractor.command();
+        if flat {
+            command.arg("--flat-playlist");
+        } else {
+            command.args([
+                "--ignore-no-formats-error",
+                "--extractor-args",
+                "soundcloud:formats=none",
+            ]);
+        }
+        if let Some(limit) = limit {
+            command.args(["--playlist-end", &limit.max(1).to_string()]);
+        }
         command
             .args([
-                "--flat-playlist",
                 // One track per line, written as it is found instead of at the end.
                 "--dump-json",
                 "--lazy-playlist",
@@ -272,10 +363,106 @@ fn track(entry: Entry) -> Option<Track> {
             .artist
             .or(entry.uploader)
             .or_else(|| crate::cache::named(&url).map(|track| track.artist))
+            // A playlist that a page lists is named after the profile it belongs to.
+            .or_else(|| owner(&url).map(|(profile, _)| profile.replace(['-', '_'], " ")))
             .unwrap_or_else(|| t!("Неизвестный исполнитель").into()),
         duration: entry.duration,
         url,
     })
+}
+
+/// What a link to SoundCloud leads to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Page {
+    /// One track, which is played.
+    Track,
+    /// A playlist or an album.
+    Set,
+    /// A list that SoundCloud hands out in pages: of a profile, of a station, of what
+    /// goes with a track.
+    Listing,
+}
+
+/// The sections of a profile that list music, as its address names them.
+pub const SECTIONS: [&str; 5] = ["tracks", "albums", "sets", "reposts", "likes"];
+
+// The parts of the address of a page of SoundCloud; None for any other text.
+fn parts(link: &str) -> Option<Vec<String>> {
+    let link = link.trim();
+    let link = match link.split_once("://") {
+        Some(_) => link.to_owned(),
+        None => format!("https://{link}"),
+    };
+    let url = Url::parse(&link).ok()?;
+    let host = url.host_str()?;
+    if !matches!(url.scheme(), "https" | "http")
+        || !matches!(
+            host,
+            "soundcloud.com" | "www.soundcloud.com" | "m.soundcloud.com"
+        )
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let parts: Vec<String> = (url.path_segments()?)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// What `link` leads to, and the link as SoundCloud spells it; None for a text that is
+/// no link to a track or to a list of them, which is then a question to search for.
+pub fn page(link: &str) -> Option<(Page, String)> {
+    let parts = parts(link)?;
+    let names: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let page = match names[..] {
+        ["stations", "track", _, _] => Page::Listing,
+        [section, ..] if crate::cache::SECTIONS.contains(&section) => return None,
+        [_] => Page::Listing,
+        [_, "sets", _] | [_, "sets", _, _] => Page::Set,
+        [_, list] if crate::cache::LISTS.contains(&list) => Page::Listing,
+        [_, _] => Page::Track,
+        [_, _, "recommended" | "albums" | "sets"] => Page::Listing,
+        [_, _, secret] if secret.starts_with("s-") => Page::Track,
+        _ => return None,
+    };
+    Some((page, format!("https://soundcloud.com/{}", parts.join("/"))))
+}
+
+/// The station of the track at `url`: that track and the ones SoundCloud plays after it.
+pub fn station(url: &str) -> Option<String> {
+    match (page(url)?, parts(url)?) {
+        ((Page::Track, _), parts) => Some(format!(
+            "https://soundcloud.com/stations/track/{}/{}",
+            parts[0], parts[1]
+        )),
+        _ => None,
+    }
+}
+
+/// The profile that the page at `url` belongs to and the section of it that the page
+/// is, by its place in `SECTIONS`; None for a page that belongs to no profile.
+pub fn owner(url: &str) -> Option<(String, Option<usize>)> {
+    let parts = parts(url)?;
+    page(url)?;
+    if parts[0] == "stations" {
+        return None;
+    }
+    let section = match &parts[1..] {
+        [section] => SECTIONS.iter().position(|name| name == section),
+        _ => None,
+    };
+    Some((parts[0].clone(), section))
+}
+
+/// The link to a section of a profile.
+pub fn section(profile: &str, section: usize) -> String {
+    format!(
+        "https://soundcloud.com/{profile}/{}",
+        SECTIONS[section % SECTIONS.len()]
+    )
 }
 
 /// The name a profile has in its address, read from the name itself, `@name`, or a
@@ -394,8 +581,10 @@ mod tests {
         // A liked playlist is read as well; whoever keeps tracks leaves it out.
         let list =
             br#"{"_type":"url","title":"Album","url":"https://soundcloud.com/a/sets/album"}"#;
+        assert_eq!(parse_line(list).unwrap()[0].artist, "a");
+        let station = br#"{"title":"Station","url":"https://soundcloud.com/stations/track/a/b"}"#;
         assert_eq!(
-            parse_line(list).unwrap()[0].artist,
+            parse_line(station).unwrap()[0].artist,
             "Неизвестный исполнитель"
         );
     }
@@ -436,6 +625,152 @@ mod tests {
             let error = profile(input).expect_err(input).to_string();
             assert!(error.contains("раздел сайта"), "{input}: {error}");
         }
+    }
+
+    #[test]
+    fn details_of_a_download_replace_what_a_link_told() {
+        let directory =
+            std::env::temp_dir().join(format!("clicloud-details-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        assert!(Details::read(&directory).is_none());
+        let file = directory.join(Details::FILE);
+        // Nothing is known while the line is being written, or where yt-dlp knew nothing.
+        for unknown in [
+            "",
+            "{\"title\":\"Rem",
+            r#"{"title":null,"artist":null,"duration":null}"#,
+        ] {
+            std::fs::write(&file, unknown).unwrap();
+            assert!(Details::read(&directory).is_none(), "{unknown}");
+        }
+        std::fs::write(
+            &file,
+            "{\"title\":\"Remote Viewing\",\"artist\":\"low_sea\",\"duration\":196.645}\nmore\n",
+        )
+        .unwrap();
+        let details = Details::read(&directory).unwrap();
+        let mut track = Track {
+            title: "Remote Viewing".into(),
+            artist: "low sea".into(),
+            duration: None,
+            url: "https://soundcloud.com/low-sea/remote-viewing".into(),
+        };
+        details.apply(&mut track);
+        assert_eq!(
+            (track.artist.as_str(), track.duration),
+            ("low_sea", Some(196.645))
+        );
+        // What yt-dlp lacks leaves what was there.
+        let partly = Details {
+            title: Some(" ".into()),
+            artist: None,
+            duration: Some(0.0),
+        };
+        partly.apply(&mut track);
+        assert_eq!(
+            (track.title.as_str(), track.artist.as_str(), track.duration),
+            ("Remote Viewing", "low_sea", Some(196.645))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tells_what_a_link_leads_to() {
+        let at = |link: &str| page(link).map(|(page, _)| page);
+        for (link, expected) in [
+            (
+                "https://soundcloud.com/low-sea/remote-viewing",
+                Some(Page::Track),
+            ),
+            (
+                "https://soundcloud.com/low-sea/remote-viewing/s-AbC12",
+                Some(Page::Track),
+            ),
+            ("soundcloud.com/low-sea/sets/an-album", Some(Page::Set)),
+            (
+                "https://soundcloud.com/low-sea/sets/private/s-AbC12",
+                Some(Page::Set),
+            ),
+            ("https://soundcloud.com/low-sea", Some(Page::Listing)),
+            (
+                "https://m.soundcloud.com/low-sea/tracks",
+                Some(Page::Listing),
+            ),
+            ("https://soundcloud.com/low-sea/sets", Some(Page::Listing)),
+            ("https://soundcloud.com/low-sea/likes", Some(Page::Listing)),
+            (
+                "https://soundcloud.com/low-sea/remote-viewing/recommended",
+                Some(Page::Listing),
+            ),
+            (
+                "https://soundcloud.com/stations/track/low-sea/remote-viewing",
+                Some(Page::Listing),
+            ),
+            // A question to search for, whatever it looks like.
+            ("low sea", None),
+            ("low-sea/remote-viewing", None),
+            ("https://example.com/low-sea/remote-viewing", None),
+            ("https://soundcloud.com.evil.test/a/b", None),
+            ("https://soundcloud.com/", None),
+            ("https://soundcloud.com/discover", None),
+            ("https://soundcloud.com/you/likes", None),
+            ("https://soundcloud.com/a/b/c/d/e", None),
+            ("https://on.soundcloud.com/abc", None),
+        ] {
+            assert_eq!(at(link), expected, "{link}");
+        }
+        // The link is spelled one way, without what a browser added to it.
+        assert_eq!(
+            page(" http://www.soundcloud.com/low-sea/sets/an-album/?si=1#t=3 ")
+                .unwrap()
+                .1,
+            "https://soundcloud.com/low-sea/sets/an-album"
+        );
+        assert_eq!(
+            station("https://soundcloud.com/low-sea/remote-viewing?si=1").as_deref(),
+            Some("https://soundcloud.com/stations/track/low-sea/remote-viewing")
+        );
+        assert!(station("https://soundcloud.com/low-sea/sets/an-album").is_none());
+        assert!(station("https://soundcloud.com/low-sea").is_none());
+        // Whose page it is, and which of the sections of the profile.
+        for (link, expected) in [
+            (
+                "https://soundcloud.com/low-sea/remote-viewing",
+                Some(("low-sea", None)),
+            ),
+            (
+                "https://soundcloud.com/low-sea/sets/an-album",
+                Some(("low-sea", None)),
+            ),
+            ("https://soundcloud.com/low-sea", Some(("low-sea", None))),
+            (
+                "https://soundcloud.com/low-sea/tracks",
+                Some(("low-sea", Some(0))),
+            ),
+            (
+                "https://soundcloud.com/low-sea/likes",
+                Some(("low-sea", Some(4))),
+            ),
+            (
+                "https://soundcloud.com/stations/track/low-sea/remote-viewing",
+                None,
+            ),
+            ("low sea", None),
+        ] {
+            let found = owner(link);
+            let found = found
+                .as_ref()
+                .map(|(name, section)| (name.as_str(), *section));
+            assert_eq!(found, expected, "{link}");
+        }
+        assert_eq!(
+            section("low-sea", 1),
+            "https://soundcloud.com/low-sea/albums"
+        );
+        assert_eq!(
+            section("low-sea", 5),
+            "https://soundcloud.com/low-sea/tracks"
+        );
     }
 
     #[test]

@@ -8,5 +8,8 @@
   "language": "ru",
   "search_limit": 10,
   "seek_step": 10,
-  "volume": 70
+  "volume": 70,
+  "normalize": false,
+  "shuffle": false,
+  "repeat": "off"
 }
