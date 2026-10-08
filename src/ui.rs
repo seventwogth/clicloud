@@ -2272,6 +2272,35 @@ fn tagline() -> &'static str {
     TAGLINES[seed % TAGLINES.len()]
 }
 
+// What a wait for the terminal ended with.
+#[derive(PartialEq)]
+enum Waited {
+    /// Nothing came in the time given.
+    Quiet,
+    /// There is something to read.
+    Ready,
+    /// The terminal is gone: its window was closed.
+    Gone,
+}
+
+// Waits for the keys of the terminal for at most `time`, by asking the system.
+fn waited(time: Duration) -> Waited {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let input = io::stdin();
+    let mut asked = [PollFd::new(&input, PollFlags::IN)];
+    let time = Timespec {
+        tv_sec: time.as_secs() as i64,
+        tv_nsec: time.subsec_nanos().into(),
+    };
+    let gone = PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL;
+    match poll(&mut asked, Some(&time)) {
+        Ok(_) if asked[0].revents().intersects(gone) => Waited::Gone,
+        Ok(ready) if ready > 0 => Waited::Ready,
+        // A signal cut the wait short: the loop looks at what it was about.
+        _ => Waited::Quiet,
+    }
+}
+
 pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(t!("Интерфейсу нужен интерактивный терминал. Для скриптов используйте search или play --first.").into());
@@ -2282,6 +2311,18 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     for signal in [SIGTERM, SIGHUP, SIGINT] {
         signal_hook::flag::register(signal, terminate.clone())?;
     }
+    // The last resort: asked to end and still there a few seconds later, the loop is
+    // stuck on a terminal that is gone, and what it started is gone with that.
+    let asked = terminate.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if asked.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(5));
+                std::process::exit(1);
+            }
+        }
+    });
     let mut app = App::new(session, path, library);
     app.setup = Setup::needed(&app.yt_dlp, &app.mpv);
     app.warm();
@@ -2295,17 +2336,47 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
         previous_hook(info);
     }));
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut gone = false;
+    // What the terminal is asked for fails when its window was closed in that very
+    // instant: that is the end of the run, not an error to report to nobody.
+    macro_rules! alive {
+        ($asked:expr) => {
+            match $asked {
+                Ok(answer) => answer,
+                Err(_) if waited(Duration::ZERO) == Waited::Gone => {
+                    gone = true;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+    }
     loop {
         // Leave through the normal path so that Drop stops mpv and removes its directory.
         if terminate.load(Ordering::Relaxed) {
             break;
         }
         app.tick();
-        terminal.draw(|frame| draw(frame, &mut app))?;
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
+        alive!(terminal.draw(|frame| draw(frame, &mut app)));
+        // A terminal that was closed counts as something to read, and crossterm goes
+        // round and round on it without an end. So the wait for keys is our own, and
+        // crossterm is asked only for what is there, on a terminal that is still there.
+        if waited(Duration::ZERO) == Waited::Gone {
+            gone = true;
+            break;
         }
-        match event::read()? {
+        if !alive!(event::poll(Duration::ZERO)) {
+            match waited(Duration::from_millis(100)) {
+                Waited::Gone => {
+                    gone = true;
+                    break;
+                }
+                Waited::Quiet => continue,
+                Waited::Ready if !alive!(event::poll(Duration::ZERO)) => continue,
+                Waited::Ready => (),
+            }
+        }
+        match alive!(event::read()) {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     break;
@@ -2572,6 +2643,10 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     }
     // What plays and what is ahead of it is kept as it stands at the end of the run.
     app.save();
+    // A terminal that is gone has no cursor to bring back, and saying so to it fails.
+    if gone {
+        std::mem::forget(terminal);
+    }
     Ok(())
 }
 
