@@ -9,7 +9,7 @@ use crate::{
     playback::{self, Origin, Playback},
     player::{self, Download},
     setup,
-    soundcloud::{Extractor, SoundCloud, Track},
+    soundcloud::{self, Extractor, SoundCloud, Track},
     theme::{self, Theme},
 };
 use crossterm::{
@@ -121,9 +121,10 @@ enum Setting {
     SearchLimit,
     SeekStep,
     Volume,
+    Likes,
 }
 
-const SETTINGS: [Setting; 10] = [
+const SETTINGS: [Setting; 11] = [
     Setting::Theme,
     Setting::Backdrop,
     Setting::Language,
@@ -134,6 +135,7 @@ const SETTINGS: [Setting; 10] = [
     Setting::SearchLimit,
     Setting::SeekStep,
     Setting::Volume,
+    Setting::Likes,
 ];
 const SEEK_STEPS: [u16; 5] = [5, 10, 15, 30, 60];
 
@@ -150,6 +152,7 @@ impl Setting {
             Self::SearchLimit => t!("Результатов поиска"),
             Self::SeekStep => t!("Шаг перемотки"),
             Self::Volume => t!("Громкость при запуске"),
+            Self::Likes => t!("Лайки SoundCloud"),
         }
     }
     fn hint(self) -> &'static str {
@@ -190,6 +193,11 @@ impl Setting {
             Self::SearchLimit => t!("Left/Right - по 5, от 5 до 50 треков на один поиск."),
             Self::SeekStep => t!("Left/Right - 5, 10, 15, 30 или 60 секунд на одно нажатие."),
             Self::Volume => t!("Left/Right - по 5. Применяется при следующем запуске."),
+            Self::Likes => {
+                t!(
+                    "Enter - имя профиля или ссылка, ещё раз Enter - добавить его\nлайки в избранное. Лайки должны быть видны в профиле.\nПока список читается, Enter прерывает его."
+                )
+            }
         }
     }
 }
@@ -234,6 +242,15 @@ enum Action {
     Louder,
 }
 
+// The likes of a profile on their way into the favorites.
+struct Import {
+    profile: String,
+    tracks: Vec<Track>,
+    receiver: mpsc::Receiver<Found>,
+    cancel: Arc<AtomicBool>,
+    worker: std::thread::JoinHandle<()>,
+}
+
 // A track being downloaded into the cache without being played.
 struct Fetch {
     track: Track,
@@ -265,8 +282,11 @@ struct App {
     options: bool,
     setting: usize,
     setting_rows: Rect,
-    // The proxy address being typed.
+    // What is being typed into the current line: a proxy address or a profile.
     input: Option<String>,
+    import: Option<Import>,
+    // How the last import of this run ended, which its line shows until the next one.
+    imported: Option<String>,
     // As of `listed`: the tracks in the cache that are not among the favorites, which
     // the library shows after them, and the number and size of all that is in the cache.
     stored: Vec<Track>,
@@ -329,6 +349,8 @@ impl App {
             setting: 0,
             setting_rows: Rect::default(),
             input: None,
+            import: None,
+            imported: None,
             stored: vec![],
             stored_count: 0,
             stored_size: 0,
@@ -474,10 +496,12 @@ impl App {
                 t!("выкл, действует прокси из окружения").into()
             }
             Setting::Proxy => switch(self.proxy.is_some()),
-            Setting::ProxyAddress => match (&self.input, &self.address) {
-                (Some(input), _) => format!("{input}_"),
-                (None, Some(address)) => address.clone(),
-                (None, None) => t!("не задан").into(),
+            _ if self.input.is_some() && SETTINGS[self.setting] == setting => {
+                format!("{}_", self.input.as_deref().unwrap_or_default())
+            }
+            Setting::ProxyAddress => match &self.address {
+                Some(address) => address.clone(),
+                None => t!("не задан").into(),
             },
             Setting::Cache => switch(self.cache.is_some()),
             Setting::CacheLimit => match self.settings.cache_limit_mb {
@@ -487,6 +511,16 @@ impl App {
             Setting::SearchLimit => self.settings.search_limit.to_string(),
             Setting::SeekStep => t!("{} с", self.settings.seek_step),
             Setting::Volume => self.settings.volume.to_string(),
+            Setting::Likes => match (&self.import, &self.imported) {
+                (Some(import), _) => {
+                    t!("{}: получено {}", import.profile, import.tracks.len())
+                }
+                (None, Some(outcome)) => outcome.clone(),
+                (None, None) => match &self.settings.soundcloud_profile {
+                    Some(profile) => profile.clone(),
+                    None => t!("не задан").into(),
+                },
+            },
         }
     }
     fn set_theme(&mut self, name: &str) {
@@ -540,6 +574,10 @@ impl App {
             }
             Setting::ProxyAddress => {
                 self.input = Some(self.address.clone().unwrap_or_else(|| config::TOR.into()));
+            }
+            Setting::Likes if self.import.is_some() => self.cancel_import(),
+            Setting::Likes => {
+                self.input = Some(self.settings.soundcloud_profile.clone().unwrap_or_default());
             }
             Setting::Cache => {
                 if self.cache.take().is_some() {
@@ -601,7 +639,7 @@ impl App {
                 self.message = t!("Нажмите /, чтобы найти музыку. ? - все клавиши").into();
             }
             Setting::Proxy | Setting::Cache => return self.activate(),
-            Setting::ProxyAddress => return,
+            Setting::ProxyAddress | Setting::Likes => return,
             Setting::CacheLimit => {
                 self.settings.cache_limit_mb = step(self.settings.cache_limit_mb, 256, 1024 * 1024);
                 if let Some(cache) = &mut self.cache {
@@ -625,6 +663,111 @@ impl App {
             }
         }
         self.persist();
+    }
+    // Enter on what was typed into the current line.
+    fn submit(&mut self) {
+        match SETTINGS[self.setting] {
+            Setting::Likes => self.submit_profile(),
+            _ => self.submit_address(),
+        }
+    }
+    // Enter on the profile that was typed: its likes are read into the favorites.
+    fn submit_profile(&mut self) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        self.imported = None;
+        // An empty line forgets the profile and asks for nothing.
+        if input.trim().is_empty() {
+            self.settings.soundcloud_profile = None;
+            self.persist();
+            return;
+        }
+        let profile = match soundcloud::profile(&input) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.message = error.to_string();
+                self.input = Some(input);
+                return;
+            }
+        };
+        self.settings.soundcloud_profile = Some(profile.clone());
+        self.persist();
+        let (sender, receiver) = mpsc::channel();
+        let (binary, proxy, direct) = (self.yt_dlp.clone(), self.proxy.clone(), self.direct);
+        let cache = self
+            .cache
+            .as_ref()
+            .map(|cache| cache.extractor().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (stop, name) = (cancel.clone(), profile.clone());
+        let language = lang::current();
+        let worker = std::thread::spawn(move || {
+            // The errors of the listing are worded in this thread.
+            lang::set(language);
+            let result = SoundCloud::new(Extractor {
+                program: &binary,
+                proxy: proxy.as_deref(),
+                no_proxy: direct,
+                cache: cache.as_deref(),
+            })
+            .quiet()
+            .cancellable(&stop)
+            .likes(&name, |track| {
+                let _ = sender.send(Found::Track(track));
+            })
+            .map_err(|e| e.to_string());
+            let _ = sender.send(Found::Over(result));
+        });
+        self.import = Some(Import {
+            profile,
+            tracks: vec![],
+            receiver,
+            cancel,
+            worker,
+        });
+    }
+    // The worker kills yt-dlp; what it listed so far is dropped with it.
+    fn cancel_import(&mut self) {
+        if let Some(import) = self.import.take() {
+            import.cancel.store(true, Ordering::Relaxed);
+            self.imported = Some(t!("{}: прервано", import.profile));
+        }
+    }
+    // The likes that were listed join the favorites; `failure` is why the list broke off.
+    fn finish_import(&mut self, import: Import, failure: Option<String>) {
+        let _ = import.worker.join();
+        let merged = self.library.merge(import.tracks);
+        self.message = t!(
+            "Лайки {}: добавлено {}, уже было {}, пропущено {}",
+            import.profile,
+            merged.added,
+            merged.known,
+            merged.skipped
+        );
+        self.imported = Some(if failure.is_some() {
+            t!("{}: оборвалось, добавлено {}", import.profile, merged.added)
+        } else {
+            t!(
+                "{}: добавлено {}, уже было {}",
+                import.profile,
+                merged.added,
+                merged.known
+            )
+        });
+        // As far as a list came it is kept: asking again adds the rest.
+        if let Some(error) = failure {
+            self.message =
+                t!("Список лайков оборвался. e - подробности, Esc - закрыть окно").into();
+            self.last_error = Some(error);
+            self.details = true;
+            self.detail_scroll = 0;
+        }
+        if merged.added > 0 {
+            self.save();
+            // The favorites that are stored leave the other part of the library.
+            self.list_stored();
+        }
     }
     // Enter on the proxy address that was typed.
     fn submit_address(&mut self) {
@@ -1149,6 +1292,28 @@ impl App {
                 }
             }
         }
+        if let Some(mut import) = self.import.take() {
+            let mut over = None;
+            loop {
+                match import.receiver.try_recv() {
+                    Ok(Found::Track(track)) => import.tracks.push(track),
+                    Ok(Found::Over(result)) => {
+                        over = Some(result.err());
+                        break;
+                    }
+                    // The worker is gone without a word; nothing more will come.
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        over = Some(Some(t!("Чтение лайков прервано").into()));
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                }
+            }
+            match over {
+                Some(failure) => self.finish_import(import, failure),
+                None => self.import = Some(import),
+            }
+        }
         if let Some(fetch) = &mut self.fetch
             && let Some(saved) = match fetch.download.poll() {
                 Ok(status) => status.map(|status| status.success()),
@@ -1207,6 +1372,10 @@ impl Drop for App {
         self.cancel.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(import) = self.import.take() {
+            import.cancel.store(true, Ordering::Relaxed);
+            let _ = import.worker.join();
         }
     }
 }
@@ -1328,7 +1497,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                 if let Some(input) = &mut app.input {
                     match key.code {
                         KeyCode::Esc => app.input = None,
-                        KeyCode::Enter => app.submit_address(),
+                        KeyCode::Enter => app.submit(),
                         KeyCode::Backspace => {
                             input.pop();
                         }
@@ -2710,6 +2879,175 @@ mod tests {
     }
 
     #[test]
+    fn the_likes_of_a_profile_join_the_favorites_from_the_settings() {
+        let stamp = std::process::id();
+        let path = std::env::temp_dir().join(format!("clicloud-likes-{stamp}.json"));
+        let file = std::env::temp_dir().join(format!("clicloud-likes-settings-{stamp}.json"));
+        let mut app = app(path.clone());
+        app.config = Some(file.clone());
+        app.library.favorites.push(track());
+        app.options = true;
+        app.setting = SETTINGS.len() - 1;
+        assert_eq!(app.value(Setting::Likes), "не задан");
+        let liked = |name: &str| {
+            Found::Track(Track {
+                title: name.into(),
+                artist: "someone".into(),
+                duration: None,
+                url: format!("https://soundcloud.com/someone/{name}"),
+            })
+        };
+        let listing = |app: &mut App| {
+            let (sender, receiver) = mpsc::channel();
+            app.import = Some(Import {
+                profile: "someone".into(),
+                tracks: vec![],
+                receiver,
+                cancel: Arc::new(AtomicBool::new(false)),
+                worker: std::thread::spawn(|| ()),
+            });
+            sender
+        };
+
+        // What is no profile stays in the line to be put right, and nothing is asked.
+        app.activate();
+        assert_eq!(app.input.as_deref(), Some(""));
+        app.input = Some("https://soundcloud.com/artist/night".into());
+        app.submit();
+        assert!(app.import.is_none() && app.message.contains("имя профиля"));
+        assert_eq!(
+            app.value(Setting::Likes),
+            "https://soundcloud.com/artist/night_"
+        );
+        // The address of the proxy is another line, with a text of its own.
+        assert_eq!(app.value(Setting::ProxyAddress), "не задан");
+        app.input = None;
+
+        // The line counts what arrives, and the favorites wait for the end of the list.
+        let sender = listing(&mut app);
+        sender.send(liked("one")).unwrap();
+        // The favorite under another spelling of its link, and a liked playlist.
+        sender
+            .send(Found::Track(Track {
+                url: "https://www.soundcloud.com/test/night?si=1".into(),
+                ..track()
+            }))
+            .unwrap();
+        sender.send(liked("sets")).unwrap();
+        app.tick();
+        assert_eq!(app.value(Setting::Likes), "someone: получено 3");
+        assert_eq!(app.library.favorites.len(), 1);
+        sender.send(liked("two")).unwrap();
+        sender.send(Found::Over(Ok(()))).unwrap();
+        app.tick();
+        assert!(app.import.is_none());
+        assert_eq!(
+            app.value(Setting::Likes),
+            "someone: добавлено 2, уже было 1"
+        );
+        assert_eq!(
+            app.message,
+            "Лайки someone: добавлено 2, уже было 1, пропущено 1"
+        );
+        let titles = |library: &Library| -> Vec<String> {
+            (library.favorites.iter())
+                .map(|track| track.title.clone())
+                .collect()
+        };
+        assert_eq!(titles(&app.library), ["Ночной эфир", "one", "two"]);
+        assert_eq!(titles(&library::load(&path).unwrap()), titles(&app.library));
+
+        // Enter on the line stops a list that is being read; nothing of it is kept.
+        let sender = listing(&mut app);
+        sender.send(liked("three")).unwrap();
+        app.tick();
+        let cancel = app.import.as_ref().unwrap().cancel.clone();
+        app.activate();
+        assert!(app.import.is_none() && cancel.load(Ordering::Relaxed));
+        assert_eq!(app.value(Setting::Likes), "someone: прервано");
+        assert_eq!(app.library.favorites.len(), 3);
+
+        // A list that broke off is kept as far as it came, and the reason is shown.
+        let sender = listing(&mut app);
+        sender.send(liked("three")).unwrap();
+        sender
+            .send(Found::Over(Err("HTTP Error 403".into())))
+            .unwrap();
+        app.tick();
+        assert_eq!(app.library.favorites.len(), 4);
+        assert_eq!(
+            app.value(Setting::Likes),
+            "someone: оборвалось, добавлено 1"
+        );
+        assert!(app.details && app.last_error.as_deref() == Some("HTTP Error 403"));
+        app.details = false;
+
+        // Typed and entered, the name is kept in the settings and yt-dlp is asked.
+        let lines = [
+            r#"{"title":"Four","url":"https://soundcloud.com/low-sea/four"}"#,
+            r#"{"title":"One","url":"https://soundcloud.com/someone/one"}"#,
+        ];
+        // The program notes what it was asked for in a file beside the library.
+        let asked = path.with_extension("args");
+        let program = script(
+            "likes",
+            &format!(
+                "printf '%s\\n' \"$*\" > '{}'\ncat <<'END'\n{}\nEND",
+                asked.display(),
+                lines.join("\n")
+            ),
+        );
+        app.yt_dlp = program.to_string_lossy().into_owned();
+        app.activate();
+        app.input = Some(" @Some-One ".into());
+        app.submit();
+        assert!(app.input.is_none());
+        assert_eq!(app.value(Setting::Likes), "Some-One: получено 0");
+        for _ in 0..3000 {
+            app.tick();
+            if app.import.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.value(Setting::Likes),
+            "Some-One: добавлено 1, уже было 1"
+        );
+        assert_eq!(
+            (
+                app.library.favorites[4].artist.as_str(),
+                app.library.favorites[4].title.as_str()
+            ),
+            ("low sea", "Four")
+        );
+        let args = fs::read_to_string(&asked).unwrap();
+        assert!(
+            (args.trim_end()).ends_with("-- https://soundcloud.com/Some-One/likes"),
+            "{args}"
+        );
+        let saved = config::load(Some(&file)).unwrap();
+        assert_eq!(saved.soundcloud_profile.as_deref(), Some("Some-One"));
+
+        // The name comes back to be entered again; an empty line forgets it.
+        app.activate();
+        assert_eq!(app.input.as_deref(), Some("Some-One"));
+        app.input = Some(" ".into());
+        app.submit();
+        assert!(app.import.is_none() && app.settings.soundcloud_profile.is_none());
+        assert_eq!(app.value(Setting::Likes), "не задан");
+        assert!(
+            config::load(Some(&file))
+                .unwrap()
+                .soundcloud_profile
+                .is_none()
+        );
+        for path in [path, file, program, asked] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn library_holds_favorites_and_stored_tracks() {
         let root = std::env::temp_dir().join(format!("clicloud-ui-stored-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -2797,11 +3135,22 @@ mod tests {
         assert_eq!(bar(1.0, 2.0, 3), "[] 0:01 / 0:02");
     }
 
+    // Written by a child process: a descriptor open for writing in this one would be
+    // inherited by whatever another test thread starts, and the script could not be run.
     fn script(name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
         let path = std::env::temp_dir().join(format!("clicloud-{name}-{}", std::process::id()));
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let source = format!("#!/bin/sh\n{body}\n");
+        (writer.stdin.take().unwrap())
+            .write_all(source.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
         path
     }
 
