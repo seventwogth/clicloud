@@ -36,6 +36,12 @@ pub const SECTIONS: [&str; 10] = [
     "discover", "search", "you", "stream", "charts", "stations", "tags", "people", "pages",
     "upload",
 ];
+// Windows keeps these names for devices, whatever the extension and the letter case,
+// so a file cannot be called one of them; such a part of a link is escaped instead.
+const DEVICES: [&str; 22] = [
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
 
 pub struct Cache {
     root: PathBuf,
@@ -328,7 +334,8 @@ impl Drop for Partial {
     }
 }
 
-fn private_directory(path: &Path) -> io::Result<()> {
+/// A directory that only its owner may look into, made with its parents.
+pub fn private_directory(path: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     // What was listened to is nobody else's business.
@@ -412,7 +419,8 @@ fn sweep(partial: &Path) {
 
 /// A file name for the track at `url`; None unless the link names exactly one track.
 /// Distinct tracks get distinct names: the parts are escaped and joined by a dot.
-/// Two spellings of a link to the same track give the same name.
+/// Two spellings of a link to the same track give the same name. Upper case is escaped
+/// as well, so that the names also differ where the file system ignores it.
 pub fn key(url: &str) -> Option<String> {
     let url = Url::parse(url).ok()?;
     let host = url.host_str()?;
@@ -441,8 +449,12 @@ pub fn key(url: &str) -> Option<String> {
         if index > 0 {
             key.push('.');
         }
+        // A device name counts up to the first dot, so only the first part can spell one.
+        let device = index == 0 && DEVICES.iter().any(|name| part.eq_ignore_ascii_case(name));
         for byte in part.bytes() {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            let plain =
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_');
+            if plain && !device {
                 key.push(char::from(byte));
             } else {
                 key.push_str(&format!("~{byte:02x}"));
@@ -462,6 +474,23 @@ mod tests {
             std::env::temp_dir().join(format!("clicloud-cache-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    // Windows opens a directory only for a program that says it handles backups.
+    fn age(path: &Path, when: SystemTime) {
+        let mut options = fs::OpenOptions::new();
+        // Unix opens a directory for reading only, which is enough to set its time.
+        options.read(true).write(cfg!(windows) || !path.is_dir());
+        #[cfg(windows)]
+        if path.is_dir() {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        options.open(path).unwrap().set_modified(when).unwrap();
     }
 
     fn download(cache: &Cache, url: &str, bytes: &[u8]) {
@@ -529,7 +558,7 @@ mod tests {
 
         assert!(cache.remove(&learned.url).unwrap() && !cache.remove(&learned.url).unwrap());
         assert!(!cache.remove("https://soundcloud.com/a/sets/b").unwrap());
-        assert!(!root.join("tracks/Alpha_x.night-drive~2520a").exists());
+        assert!(!root.join("tracks/~41lpha_x.night-drive~2520a").exists());
         assert_eq!(cache.tracks().len(), 1);
         // Eviction takes the details along.
         download(&cache, "https://soundcloud.com/c/big", &[0; 12]);
@@ -600,18 +629,28 @@ mod tests {
                 "http://www.soundcloud.com/artist/night/?si=1&utm_source=x#t=10",
                 Some("artist.night"),
             ),
+            // Upper case is escaped: a file system that ignores it tells these apart.
             (
                 "https://m.soundcloud.com/Artist_1/a-b",
-                Some("Artist_1.a-b"),
+                Some("~41rtist_1.a-b"),
             ),
             (
                 "https://soundcloud.com/artist/night/s-AbC12",
-                Some("artist.night.s-AbC12"),
+                Some("artist.night.s-~41b~4312"),
             ),
+            ("https://soundcloud.com/test/night", Some("test.night")),
+            ("https://soundcloud.com/Test/Night", Some("~54est.~4eight")),
+            // A name that Windows keeps for a device is escaped where it would count.
+            ("https://soundcloud.com/con/radio", Some("~63~6f~6e.radio")),
+            ("https://soundcloud.com/NUL/x", Some("~4e~55~4c.x")),
+            ("https://soundcloud.com/com1/z", Some("~63~6f~6d~31.z")),
+            ("https://soundcloud.com/conx/radio", Some("conx.radio")),
+            // Only the first part can spell one: the rest follow a dot.
+            ("https://soundcloud.com/artist/nul", Some("artist.nul")),
             // No two links share a name, whatever their characters.
             ("https://soundcloud.com/a.b/c", Some("a~2eb.c")),
             ("https://soundcloud.com/a/b.c", Some("a.b~2ec")),
-            ("https://soundcloud.com/a/%D0%B0", Some("a.~25D0~25B0")),
+            ("https://soundcloud.com/a/%D0%B0", Some("a.~25~440~25~420")),
             ("https://soundcloud.com/artist", None),
             ("https://soundcloud.com/artist/sets/album", None),
             ("https://soundcloud.com/artist/sets", None),
@@ -626,6 +665,17 @@ mod tests {
         }
         let long = format!("https://soundcloud.com/a/{}", "b".repeat(250));
         assert!(key(&long).is_none());
+        // Every name a link gets is one that every file system of ours can hold.
+        for url in [
+            "https://soundcloud.com/Test/Night",
+            "https://soundcloud.com/con/radio",
+            "https://soundcloud.com/NUL/x",
+        ] {
+            let name = key(url).unwrap();
+            assert_eq!(name, name.to_lowercase(), "{url}");
+            let stem = name.split('.').next().unwrap();
+            assert!(!DEVICES.contains(&stem), "{url}");
+        }
     }
 
     #[test]
@@ -675,18 +725,16 @@ mod tests {
         let root = directory("evict");
         let cache = Cache::open(root.clone(), 25).unwrap();
         let url = |name: &str| format!("https://soundcloud.com/artist/{name}");
-        let age = |name: &str, seconds: u64| {
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .open(root.join("audio").join(format!("artist.{name}")))
-                .unwrap();
-            file.set_modified(SystemTime::now() - Duration::from_secs(seconds))
-                .unwrap();
+        let older = |name: &str, seconds: u64| {
+            age(
+                &root.join("audio").join(format!("artist.{name}")),
+                SystemTime::now() - Duration::from_secs(seconds),
+            )
         };
         download(&cache, &url("old"), &[0; 10]);
-        age("old", 300);
+        older("old", 300);
         download(&cache, &url("older"), &[0; 10]);
-        age("older", 600);
+        older("older", 600);
         // Playing a track makes it the most recent one.
         assert!(cache.find(&url("older")).is_some());
         download(&cache, &url("new"), &[0; 10]);
@@ -726,10 +774,7 @@ mod tests {
         for path in [&stale, &fresh] {
             fs::create_dir_all(path).unwrap();
         }
-        fs::File::open(&stale)
-            .unwrap()
-            .set_modified(SystemTime::now() - STALE * 2)
-            .unwrap();
+        age(&stale, SystemTime::now() - STALE * 2);
         let partial = cache.store("https://soundcloud.com/a/b").unwrap().unwrap();
         assert!(!stale.exists() && fresh.exists() && partial.directory().exists());
         drop(partial);

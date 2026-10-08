@@ -27,6 +27,20 @@ jobs:
       # Fake yt-dlp and mpv: no network, audio device or real player needed.
       - run: python3 tests/tui_smoke.py
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # The fake mpv of the pipe test is a batch file; cli.rs and tui_smoke.py need a shell.
+      - run: cargo test --locked
+      - run: cargo build --locked
+
   msrv:
     runs-on: ubuntu-latest
     steps:

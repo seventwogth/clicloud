@@ -4,14 +4,13 @@ mod lang;
 mod cache;
 mod config;
 mod cover;
+mod ipc;
 mod library;
-#[cfg(unix)]
 mod playback;
 mod player;
 mod setup;
 mod soundcloud;
 mod theme;
-#[cfg(unix)]
 mod ui;
 
 use cache::Cache;
@@ -167,7 +166,13 @@ fn local_yt_dlp() -> Option<std::path::PathBuf> {
     if target.file_name()? != "target" {
         return None;
     }
-    let local = target.parent()?.join(".tools/venv/bin/yt-dlp");
+    // A virtual environment of Windows keeps its programs in another place, under
+    // another name; the one of this project is where its README puts it.
+    let tools = target.parent()?.join(".tools").join("venv");
+    #[cfg(windows)]
+    let local = tools.join("Scripts").join("yt-dlp.exe");
+    #[cfg(not(windows))]
+    let local = tools.join("bin").join("yt-dlp");
     executable(&local).then_some(local)
 }
 
@@ -254,27 +259,19 @@ fn run(cli: Cli) -> Result<()> {
     };
     let provider = SoundCloud::new(extractor);
     match cli.command.unwrap_or(Action::Ui { library: None }) {
-        Action::Ui { library } => {
-            #[cfg(unix)]
-            ui::run(
-                ui::Session {
-                    yt_dlp: cli.yt_dlp,
-                    mpv: cli.mpv,
-                    proxy,
-                    direct: cli.no_proxy,
-                    cache,
-                    cache_dir,
-                    settings,
-                    config: config::path(cli.config.as_ref()),
-                },
-                library,
-            )?;
-            #[cfg(not(unix))]
-            {
-                let _ = library;
-                return Err(t!("TUI пока поддерживается на Unix.").into());
-            }
-        }
+        Action::Ui { library } => ui::run(
+            ui::Session {
+                yt_dlp: cli.yt_dlp,
+                mpv: cli.mpv,
+                proxy,
+                direct: cli.no_proxy,
+                cache,
+                cache_dir,
+                settings,
+                config: config::path(cli.config.as_ref()),
+            },
+            library,
+        )?,
         Action::Search { query, limit, json } => {
             // A link to a playlist or to a page of a profile is opened, not searched for.
             let mut tracks = Vec::new();

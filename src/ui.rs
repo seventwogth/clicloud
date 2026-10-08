@@ -24,7 +24,6 @@ use crossterm::{
 use ratatui::layout::Position;
 use ratatui::{prelude::*, widgets::*};
 use serde_json::json;
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -2272,6 +2271,23 @@ fn tagline() -> &'static str {
     TAGLINES[seed % TAGLINES.len()]
 }
 
+// A signal leaves the interface through its own path, so that mpv is stopped and the
+// terminal restored. Windows has no such signals; there Ctrl+C arrives as a key below.
+#[cfg(unix)]
+fn terminated() -> Result<Arc<AtomicBool>> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let flag = Arc::new(AtomicBool::new(false));
+    for signal in [SIGTERM, SIGHUP, SIGINT] {
+        signal_hook::flag::register(signal, flag.clone())?;
+    }
+    Ok(flag)
+}
+
+#[cfg(not(unix))]
+fn terminated() -> Result<Arc<AtomicBool>> {
+    Ok(Arc::new(AtomicBool::new(false)))
+}
+
 // What a wait for the terminal ended with.
 #[derive(PartialEq)]
 enum Waited {
@@ -2284,6 +2300,7 @@ enum Waited {
 }
 
 // Waits for the keys of the terminal for at most `time`, by asking the system.
+#[cfg(unix)]
 fn waited(time: Duration) -> Waited {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
     let input = io::stdin();
@@ -2301,16 +2318,24 @@ fn waited(time: Duration) -> Waited {
     }
 }
 
+// Windows tells of its console through crossterm alone, which does not go round on a
+// console that is gone the way it does on a terminal of Unix.
+#[cfg(not(unix))]
+fn waited(time: Duration) -> Waited {
+    match event::poll(time) {
+        Ok(true) => Waited::Ready,
+        Ok(false) => Waited::Quiet,
+        Err(_) => Waited::Gone,
+    }
+}
+
 pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(t!("Интерфейсу нужен интерактивный терминал. Для скриптов используйте search или play --first.").into());
     }
     let path = library::path(library, "ui")?;
     let library = library::load(&path)?;
-    let terminate = Arc::new(AtomicBool::new(false));
-    for signal in [SIGTERM, SIGHUP, SIGINT] {
-        signal_hook::flag::register(signal, terminate.clone())?;
-    }
+    let terminate = terminated()?;
     // The last resort: asked to end and still there a few seconds later, the loop is
     // stuck on a terminal that is gone, and what it started is gone with that.
     let asked = terminate.clone();
@@ -4443,6 +4468,12 @@ mod tests {
                 asked.display(),
                 lines.join("\n")
             ),
+            &format!(
+                "echo %* > \"{}\"\necho {}\necho {}",
+                asked.display(),
+                lines[0],
+                lines[1]
+            ),
         );
         app.yt_dlp = program.to_string_lossy().into_owned();
         app.activate();
@@ -4534,6 +4565,38 @@ mod tests {
   echo '{"title":"Second","uploader":"Other","duration":62,"webpage_url":"https://soundcloud.com/other/second"}';;
 *) echo "ERROR: unexpected $*" >&2; exit 1;;
 esac"#,
+            // A batch file has no `case`: the kind of the list first, then the page.
+            r#"echo %*| findstr /c:"--flat-playlist" >nul
+if errorlevel 1 goto full
+echo %*| findstr /e /c:"/stations/track/test/night" >nul
+if not errorlevel 1 goto station
+echo %*| findstr /e /c:"/other/tracks" >nul
+if not errorlevel 1 goto tracks
+echo %*| findstr /e /c:"/other/albums" >nul
+if not errorlevel 1 goto albums
+goto unexpected
+:full
+echo %*| findstr /c:"soundcloud:formats=none" >nul
+if errorlevel 1 goto unexpected
+echo %*| findstr /e /c:"/other/sets/album" >nul
+if errorlevel 1 goto unexpected
+echo {"title":"First","uploader":"Other","duration":61,"webpage_url":"https://soundcloud.com/other/first"}
+echo {"title":"Second","uploader":"Other","duration":62,"webpage_url":"https://soundcloud.com/other/second"}
+exit /b 0
+:station
+echo {"title":"Night","url":"https://soundcloud.com/test/night"}
+echo {"title":"Far","url":"https://soundcloud.com/other/far"}
+exit /b 0
+:tracks
+echo {"title":"Far","url":"https://soundcloud.com/other/far"}
+echo {"title":"Near","url":"https://soundcloud.com/other/near"}
+exit /b 0
+:albums
+echo {"title":"Album","url":"https://soundcloud.com/other/sets/album"}
+exit /b 0
+:unexpected
+echo ERROR: unexpected %* 1>&2
+exit /b 1"#,
         );
         let path = std::env::temp_dir().join(format!("clicloud-pages-{}.json", std::process::id()));
         let mut app = app(path.clone());
@@ -4648,8 +4711,14 @@ esac"#,
     fn the_next_track_is_fetched_ahead_and_the_player_goes_on_to_it() {
         let root = std::env::temp_dir().join(format!("clicloud-ahead-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let extractor = script("ahead-fetch", "printf audio");
-        let player = script("ahead-player", "exec sleep 30");
+        // `set /p` writes without a line break and leaves a status of failure behind,
+        // having read nothing: the exit says how the download went.
+        let extractor = script(
+            "ahead-fetch",
+            "printf audio",
+            "<nul set /p =audio\nexit /b 0",
+        );
+        let player = idle("ahead-player");
         let library = root.with_extension("json");
         let mut app = app(library.clone());
         app.cache = Some(Cache::open(root.clone(), 0).unwrap());
@@ -4666,27 +4735,33 @@ esac"#,
         app.fetch_ahead();
         assert!(app.fetch.is_none(), "{}", app.message);
         assert!(app.message.contains("Загрузка трека"), "{}", app.message);
-        for _ in 0..500 {
-            app.tick();
-            if stored(&app, 1) {
-                break;
+        // The stand-in for mpv never answers, and a player that does not answer within
+        // seconds has failed: on a loaded machine that is sooner than a download ends.
+        // So no player is waited on here. The track is stored the way `d` stores one
+        // and started from the cache, and the player is put away before the next wait.
+        let wait = |app: &mut App, done: &dyn Fn(&App) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !done(app) && Instant::now() < deadline {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        };
+        app.player = None;
+        app.download(vec![numbered(1)]);
+        wait(&mut app, &|app| {
+            app.fetch.is_none() && app.pending.is_empty()
+        });
         assert!(stored(&app, 1) && !stored(&app, 2));
+        app.start(numbered(1));
+        assert!(app.message.contains("Трек из кеша"), "{}", app.message);
         // All of it is there and it plays: the one after it is fetched, quietly.
         app.player.as_mut().unwrap().loaded = true;
         app.message = "playing".into();
         app.fetch_ahead();
         assert!(app.fetch.as_ref().is_some_and(|fetch| fetch.ahead));
         assert_eq!(app.fetch.as_ref().unwrap().track.title, "Title 2");
-        for _ in 0..500 {
-            if app.fetch.is_none() {
-                break;
-            }
-            app.tick();
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        app.player = None;
+        wait(&mut app, &|app| app.fetch.is_none());
         assert!(stored(&app, 2) && !stored(&app, 3));
         assert_eq!(app.message, "playing");
 
@@ -4697,6 +4772,8 @@ esac"#,
         assert_eq!(app.previous.last().unwrap().title, "Title 1");
         assert_eq!(app.ahead.len(), 1);
         // A track that could not be fetched ahead is not asked for on every tick.
+        app.start(numbered(2));
+        app.player.as_mut().unwrap().loaded = true;
         app.yt_dlp = "clicloud-no-such-program".into();
         app.fetch_ahead();
         app.fetch_ahead();
@@ -4758,7 +4835,7 @@ esac"#,
 
     #[test]
     fn the_settings_tell_the_version_of_yt_dlp() {
-        let program = script("version", "echo 2099.01.01");
+        let program = script("version", "echo 2099.01.01", "echo 2099.01.01");
         let mut app = app(PathBuf::new());
         app.setting = SETTINGS
             .iter()
@@ -4788,6 +4865,7 @@ esac"#,
         let player = script(
             "sound-player",
             "echo 'List of detected audio devices:'\necho \"  'auto' (Autoselect device)\"\necho \"  'pipewire' (Default (pipewire))\"\necho \"  'alsa/card' (Card)\"",
+            "echo List of detected audio devices:\necho   'auto' (Autoselect device)\necho   'pipewire' (Default (pipewire))\necho   'alsa/card' (Card)",
         );
         let mut app = app(PathBuf::new());
         app.config = Some(file.clone());
@@ -5219,7 +5297,7 @@ esac"#,
 
     #[test]
     fn a_list_plays_on_from_the_track_that_was_started() {
-        let player = script("order-player", "exec sleep 30");
+        let player = idle("order-player");
         let file = std::env::temp_dir().join(format!("clicloud-order-{}.json", std::process::id()));
         let mut app = app(PathBuf::new());
         app.config = Some(file.clone());
@@ -5606,23 +5684,47 @@ esac"#,
         assert_eq!(bar(1.0, 2.0, 3), "[] 0:01 / 0:02");
     }
 
-    // Written by a child process: a descriptor open for writing in this one would be
-    // inherited by whatever another test thread starts, and the script could not be run.
-    fn script(name: &str, body: &str) -> PathBuf {
-        use std::io::Write;
-        let path = std::env::temp_dir().join(format!("clicloud-{name}-{}", std::process::id()));
-        let mut writer = std::process::Command::new("sh")
-            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
-            .arg(&path)
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let source = format!("#!/bin/sh\n{body}\n");
-        (writer.stdin.take().unwrap())
-            .write_all(source.as_bytes())
-            .unwrap();
-        assert!(writer.wait().unwrap().success());
+    // A stand-in for an external program. What such a program is written in differs:
+    // `sh` on Unix, `cmd` on Windows, where the name must also say so.
+    fn script(name: &str, sh: &str, cmd: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "clicloud-{name}-{}{}",
+            std::process::id(),
+            if cfg!(windows) { ".cmd" } else { "" }
+        ));
+        // Written by a child process: a descriptor open for writing in this one would be
+        // inherited by whatever another test thread starts, and the script could not be run.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            let _ = cmd;
+            let mut writer = std::process::Command::new("sh")
+                .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+                .arg(&path)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let source = format!("#!/bin/sh\n{sh}\n");
+            (writer.stdin.take().unwrap())
+                .write_all(source.as_bytes())
+                .unwrap();
+            assert!(writer.wait().unwrap().success());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = sh;
+            // A batch file is read line by line, and cmd loses a block of its own
+            // unless every line ends the way it expects, however this file is checked out.
+            let body = cmd.replace("\r\n", "\n").replace('\n', "\r\n");
+            fs::write(&path, format!("@echo off\r\n{body}\r\n")).unwrap();
+        }
         path
+    }
+
+    // A program that does nothing until it is stopped. `ping` is how a batch file
+    // waits; it keeps none of the inherited pipes, so stopping it is not waited for.
+    fn idle(name: &str) -> PathBuf {
+        script(name, "exec sleep 30", "ping -n 31 127.0.0.1 >nul 2>&1")
     }
 
     #[test]
@@ -5801,7 +5903,7 @@ esac"#,
 
     #[test]
     fn escape_cancels_a_running_search() {
-        let extractor = script("slow-search", "exec sleep 30");
+        let extractor = idle("slow-search");
         let mut app = app(PathBuf::new());
         app.yt_dlp = extractor.to_string_lossy().into_owned();
         app.search();
@@ -5822,7 +5924,7 @@ esac"#,
 
     #[test]
     fn failed_track_skips_to_the_next_until_too_many_fail_in_a_row() {
-        let player = script("idle-player", "exec sleep 30");
+        let player = idle("idle-player");
         let library =
             std::env::temp_dir().join(format!("clicloud-skip-test-{}.json", std::process::id()));
         let mut app = app(library.clone());
@@ -5866,6 +5968,15 @@ esac"#,
         let extractor = script(
             "fetch",
             r#"case "$*" in *broken*) echo 'ERROR: gone' >&2; exit 1;; esac; printf audio"#,
+            // `set /p` is how a batch file writes without a line break of its own, and
+            // the last status is the one of `findstr` until the exit below says otherwise.
+            r#"echo %*| findstr /c:broken >nul
+if not errorlevel 1 (
+echo ERROR: gone 1>&2
+exit /b 1
+)
+<nul set /p =audio
+exit /b 0"#,
         );
         let mut app = app(PathBuf::new());
         app.action(Action::Download);

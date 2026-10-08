@@ -620,11 +620,6 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "キャッシュ: {}\n保存済みの曲: {}, {} {}",
     ),
     (
-        "TUI пока поддерживается на Unix.",
-        "The interface is only supported on Unix so far.",
-        "この画面は今のところ Unix のみ対応です。",
-    ),
-    (
         "Для выбора нужен терминал. Используйте --first или ссылку SoundCloud.",
         "Choosing needs a terminal. Use --first or a SoundCloud link.",
         "選択には端末が必要です。--first か SoundCloud のリンクを使ってください。",
@@ -740,6 +735,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Плеер ещё подключается",
         "The player is still connecting",
         "プレーヤーに接続中です",
+    ),
+    (
+        "Связь с плеером прервана",
+        "The connection to the player is broken",
+        "プレーヤーとの接続が切れました",
     ),
     (
         "mpv не открыл IPC-соединение за 5 секунд",

@@ -1,15 +1,14 @@
-//! Managed mpv process and its local JSON IPC connection (Unix).
+//! Managed mpv process and its local JSON IPC connection.
 use crate::{
     Result,
     cache::Cache,
+    ipc,
     player::{self, Download},
     soundcloud::{self, Details, Extractor, Track},
 };
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::{Read, Write},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Child, Stdio},
     time::{Duration, Instant},
@@ -35,7 +34,8 @@ pub struct Playback {
     source: Option<Child>,
     download: Option<Download>,
     pub origin: Origin,
-    socket: Option<UnixStream>,
+    socket: Option<ipc::Connection>,
+    address: ipc::Address,
     directory: PathBuf,
     buffer: Vec<u8>,
     started: Instant,
@@ -74,6 +74,7 @@ impl Playback {
             download: None,
             origin: Origin::Url,
             socket: None,
+            address: ipc::Address::new(&directory),
             directory,
             buffer: Vec::new(),
             started: Instant::now(),
@@ -111,6 +112,8 @@ impl Playback {
         soundcloud::validate_url(url)?;
         let mut player = Self::idle(player::scratch_directory()?, volume);
         let log = fs::File::create(player.directory.join("error.log"))?;
+        let mut listen = std::ffi::OsString::from("--input-ipc-server=");
+        listen.push(player.address.as_os_str());
         player.speed = speed;
         let mut command = player::mpv(mpv, sound);
         command
@@ -122,10 +125,7 @@ impl Playback {
                 // The file that follows is opened before the current one ends.
                 "--prefetch-playlist=yes",
             ])
-            .arg(format!(
-                "--input-ipc-server={}",
-                player.directory.join("ipc").display()
-            ))
+            .arg(listen)
             .arg(format!("--volume={volume}"))
             .arg(format!("--speed={speed}"))
             // What the desktop shows of the player: mpv would name the file otherwise.
@@ -236,7 +236,9 @@ impl Playback {
         let socket = self.socket.as_mut().ok_or(t!("Плеер ещё подключается"))?;
         let mut bytes = serde_json::to_vec(&json!({"command": command}))?;
         bytes.push(b'\n');
-        socket.write_all(&bytes)?;
+        socket
+            .send(&bytes)
+            .map_err(|_| t!("Связь с плеером прервана"))?;
         Ok(())
     }
 
@@ -248,8 +250,7 @@ impl Playback {
             None => None,
         };
         if self.socket.is_none() {
-            if let Ok(socket) = UnixStream::connect(self.directory.join("ipc")) {
-                socket.set_nonblocking(true)?;
+            if let Ok(socket) = ipc::Connection::connect(&self.address) {
                 self.socket = Some(socket);
                 let observed = [
                     "time-pos",
@@ -268,16 +269,8 @@ impl Playback {
                 return Err(t!("mpv не открыл IPC-соединение за 5 секунд").into());
             }
         }
-        let mut bytes = [0; 8192];
         if let Some(socket) = &mut self.socket {
-            loop {
-                match socket.read(&mut bytes) {
-                    Ok(0) => break,
-                    Ok(n) => self.buffer.extend_from_slice(&bytes[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            socket.receive(&mut self.buffer)?;
         }
         while let Some(end) = self.buffer.iter().position(|b| *b == b'\n') {
             let line: Vec<_> = self.buffer.drain(..=end).collect();
@@ -433,6 +426,37 @@ impl Drop for Playback {
     }
 }
 
+// A stand-in for mpv that answers on a named pipe, as mpv does under Windows. It is
+// told where to listen the way mpv is, and writes the commands it is given next to
+// itself, so that the test can see that the interface spoke to it.
+#[cfg(all(test, windows))]
+const FAKE_MPV: &str = r#"$ErrorActionPreference = 'Stop'
+$address = $args | Where-Object { $_ -like '--input-ipc-server=*' }
+$name = ($address -replace '.*=', '')
+$name = $name.Substring($name.LastIndexOf('\') + 1)
+function Send-Line($stream, $text) {
+    $bytes = [Text.Encoding]::ASCII.GetBytes($text + "`n")
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush()
+}
+$server = New-Object System.IO.Pipes.NamedPipeServerStream($name,
+    [System.IO.Pipes.PipeDirection]::InOut, 1, [System.IO.Pipes.PipeTransmissionMode]::Byte,
+    [System.IO.Pipes.PipeOptions]::None, 4096, 4096)
+$server.WaitForConnection()
+$reader = New-Object System.IO.StreamReader($server, [Text.Encoding]::ASCII)
+Send-Line $server '{"event":"file-loaded"}'
+$log = Join-Path $PSScriptRoot 'commands.log'
+do {
+    $line = $reader.ReadLine()
+    Add-Content -Path $log -Value $line
+} while ($line -notlike '*request_log_messages*')
+Send-Line $server '{"event":"property-change","name":"duration","data":123.5}'
+Send-Line $server '{"event":"property-change","name":"time-pos","data":1.5}'
+Send-Line $server '{"event":"end-file","reason":"eof"}'
+$server.WaitForPipeDrain()
+$server.Dispose()
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +548,73 @@ mod tests {
         assert_eq!(player.log[0], format!("mpv: line {LOG_LINES}"));
         drop(player);
         assert!(!directory.exists());
+    }
+
+    // What tests/tui_smoke.py does over a Unix socket; here the player is reached
+    // through a named pipe instead, which is the only road Windows has.
+    #[cfg(windows)]
+    #[test]
+    fn a_player_is_driven_through_a_named_pipe() {
+        let directory =
+            std::env::temp_dir().join(format!("clicloud-pipe-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let script = directory.join("mpv.ps1");
+        let executable = directory.join("mpv.cmd");
+        let log = directory.join("commands.log");
+        let fake = FAKE_MPV.replace("\r\n", "\n").replace('\n', "\r\n");
+        fs::write(&script, fake).unwrap();
+        fs::write(
+            &executable,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\" %*\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        let track = Track {
+            title: "Ночной эфир".into(),
+            artist: "Test artist".into(),
+            duration: None,
+            url: "https://soundcloud.com/test/night".into(),
+        };
+        let extractor = Extractor {
+            program: "yt-dlp",
+            proxy: None,
+            no_proxy: true,
+            cache: None,
+        };
+        let mut player = Playback::start(
+            &executable.to_string_lossy(),
+            extractor,
+            &track,
+            None,
+            player::Sound::default(),
+            70.0,
+            1.0,
+        )
+        .unwrap();
+        // Starting a shell and PowerShell takes a while, and a loaded machine more.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match player.tick() {
+                Ok(true) => break,
+                Ok(false) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                Ok(false) => panic!("the player never reached the end of the track"),
+                Err(error) => panic!("{error}\n{}", player.details().unwrap_or_default()),
+            }
+        }
+        assert!(player.loaded);
+        assert_eq!((player.duration, player.position), (123.5, 1.5));
+        // The interface asks to hear about what it draws as soon as it is connected.
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(
+            commands.contains(r#"["observe_property",1,"time-pos"]"#),
+            "{commands}"
+        );
+        drop(player);
+        let _ = fs::remove_dir_all(directory);
     }
 }
