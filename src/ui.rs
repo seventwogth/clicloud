@@ -55,6 +55,9 @@ const BACKDROPS: [(&str, &str); 3] = [
     ("pentagram", include_str!("../backdrops/pentagram")),
 ];
 
+// The name drawn large, a mark to a dot. The header shows it small, eight dots to a cell.
+const LOGO: &str = include_str!("../logo.txt");
+
 // Frames, buttons and marks are ASCII in every color scheme.
 const BORDER: symbols::border::Set = symbols::border::Set {
     top_left: "+",
@@ -272,6 +275,8 @@ struct App {
     // The proxy that switching it on brings back, even if only a flag named it.
     address: Option<String>,
     theme: Theme,
+    // Whether the header may draw the logo: the console of Linux has no letters for it.
+    logo: bool,
     tagline: &'static str,
     // When the interface started, which is what the turning mark is timed by.
     since: Instant,
@@ -340,6 +345,7 @@ impl App {
             cache: session.cache,
             cache_dir: session.cache_dir,
             theme: Theme::load(&session.settings.theme),
+            logo: !std::env::var("TERM").is_ok_and(|term| term == "linux"),
             tagline: tagline(),
             since: Instant::now(),
             setup: None,
@@ -1745,7 +1751,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(2),
+            // The first lines a screen has to spare go to the logo and the gap below it.
+            Constraint::Length(
+                2 + if app.logo {
+                    (size.height - 24).min(2)
+                } else {
+                    0
+                },
+            ),
             Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(7),
@@ -1803,7 +1816,56 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// A drawing made of marks, shrunk: every two marks across and four down become one
+/// cell, a letter of Braille with a dot for each of them that is not a space.
+fn dots(drawing: &str) -> Vec<String> {
+    const DOTS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+    let rows: Vec<&[u8]> = drawing.lines().map(str::as_bytes).collect();
+    let width = rows.iter().map(|row| row.len()).max().unwrap_or(0);
+    (rows.chunks(4))
+        .map(|rows| {
+            let cell = |left: usize| {
+                let mut dots = 0;
+                for (row, marks) in rows.iter().zip(DOTS) {
+                    for (mark, dot) in marks.into_iter().enumerate() {
+                        if row.get(left + mark).is_some_and(|mark| *mark != b' ') {
+                            dots |= dot;
+                        }
+                    }
+                }
+                // An empty cell is a space: some fonts draw the empty letter as rings.
+                (char::from_u32(0x2800 + dots).filter(|_| dots != 0)).unwrap_or(' ')
+            };
+            let line: String = (0..width).step_by(2).map(cell).collect();
+            line.trim_end().to_owned()
+        })
+        .collect()
+}
+
 fn draw_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    static SMALL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let logo = SMALL.get_or_init(|| dots(LOGO));
+    // A screen with a line to spare shows the logo, and what follows the name beside it.
+    if usize::from(area.height) >= logo.len() {
+        let width = logo.iter().map(|line| cells(line)).max().unwrap_or(0) as u16;
+        let last = logo.len().saturating_sub(1) as u16;
+        for (row, line) in logo.iter().enumerate() {
+            label(
+                frame,
+                Rect::new(area.x + 1, area.y + row as u16, area.width - 1, 1),
+                line.clone(),
+                theme.accent,
+            );
+        }
+        let beside = (area.x + width + 3).min(area.right());
+        label(
+            frame,
+            Rect::new(beside, area.y + last, area.right() - beside, 1),
+            format!("/ {}", app.tagline),
+            theme.muted,
+        );
+        return;
+    }
     let header = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(28)])
@@ -2612,11 +2674,13 @@ mod tests {
                             assert!(matches!(cell.bg, Color::Rgb(..)), "{at}");
                             assert!(matches!(cell.fg, Color::Rgb(..)), "{at}");
                         }
-                        // Letters of any language and its punctuation, but ASCII art.
+                        // Letters of any language and its punctuation, but ASCII art;
+                        // the logo alone is drawn in the dots of Braille.
                         assert!(
                             cell.symbol().chars().all(|c| c.is_ascii()
                                 || c.is_alphabetic()
-                                || ('\u{3000}'..='\u{303f}').contains(&c)),
+                                || ('\u{3000}'..='\u{303f}').contains(&c)
+                                || ('\u{2800}'..='\u{28ff}').contains(&c) && y < 4),
                             "{:?} in {at}",
                             cell.symbol()
                         );
@@ -2647,6 +2711,43 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn the_logo_is_shown_small_where_the_screen_has_a_line_for_it() {
+        // Eight marks to a cell: two across, four down, and nothing for a space.
+        assert_eq!(dots("MM\nMM\nMM\nMM"), ["\u{28ff}"]);
+        assert_eq!(
+            dots("M   M\n\n\n M  M\n M"),
+            ["\u{2881} \u{2841}", "\u{2808}"]
+        );
+        let small = dots(LOGO);
+        assert_eq!((small.len(), cells(&small[0])), (3, 36));
+        assert!(small.iter().all(|line| !line.contains('\u{2800}')));
+
+        let mut app = app(PathBuf::new());
+        app.logo = true;
+        // One that fits beside the logo on the narrowest screen: a longer one is cut.
+        app.tagline = TAGLINES[3];
+        let plain = screen(&mut app, 80, 24);
+        assert!(plain.contains(" CLICLOUD / ") && !plain.contains(&small[0]));
+        // One line to spare holds the logo; the next one parts it from the search.
+        for (height, search) in [(25, 4), (26, 5), (40, 5)] {
+            let text = screen(&mut app, 80, height);
+            let lines: Vec<&str> = text.lines().collect();
+            for (row, line) in small.iter().enumerate() {
+                assert!(
+                    lines[1 + row].starts_with(&format!("  {line}")),
+                    "{height}\n{text}"
+                );
+            }
+            assert!(lines[3].contains(&format!("/ {}", app.tagline)), "{text}");
+            assert!(lines[search].contains("+- / ПОИСК"), "{height}\n{text}");
+        }
+        // Where the letters of the logo are missing, the name stays spelled.
+        app.logo = false;
+        let spelled = screen(&mut app, 80, 40);
+        assert!(spelled.contains(" CLICLOUD / ") && !spelled.contains(&small[0]));
     }
 
     #[test]
@@ -3491,7 +3592,8 @@ mod tests {
                 }
                 text.push('\n');
             }
-            assert!(text.contains("CLICLOUD"));
+            // The name is there in letters, or drawn where the screen has a line for it.
+            assert!(text.contains("CLICLOUD") || text.contains(&dots(LOGO)[0]));
             if width >= 80 {
                 assert!(text.contains("Ночной эфир"));
                 assert!(text.contains("ПЛЕЕР"));

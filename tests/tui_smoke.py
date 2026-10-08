@@ -115,7 +115,8 @@ if os.environ.get("MPV_LINGER"):
             return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
         try:
-            read_until(lambda: b"CLICLOUD" in output)
+            # The name is drawn, not spelled, on a screen this tall; the search box is always there.
+            read_until(lambda: "ПОИСК".encode() in output)
             # Esc kills a hanging search; the next one must then run normally.
             search_pid = root / "search.pid"
             (root / "slow").touch()
