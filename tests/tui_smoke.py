@@ -33,6 +33,10 @@ def run(proxy=False, terminate=False):
 import json, os, sys, time
 if "--output" in sys.argv:
     sys.stdout.buffer.write(b"mock-audio")
+elif sys.argv[-1] == "https://soundcloud.com/someone/likes":
+    # The likes of a profile: a line for each, and no word of who made the track.
+    for name in ("test/night", "low-sea/remote-viewing", "low-sea/sets/album"):
+        print(json.dumps({"title": "Liked", "url": "https://soundcloud.com/" + name}))
 else:
     if os.path.exists(os.environ["SLOW_SEARCH"]):
         open(os.environ["SEARCH_PID"], "w").write(str(os.getpid()))
@@ -153,16 +157,23 @@ if os.environ.get("MPV_LINGER"):
             os.write(master, b"ojjjjjjj\x1b[C")
             settings = root / "config.json"
             read_until(lambda: json.loads(settings.read_text() or "{}").get("search_limit") == 15)
-            os.write(master, b"q")
+            # The last line of the settings brings the likes of a profile into the favorites:
+            # the one that is a favorite already stays single, the playlist is left out.
+            os.write(master, b"jjj\r@someone\r")
+            library = root / "library.json"
+            read_until(lambda: len(json.loads(library.read_text())["favorites"]) == 2)
+            assert json.loads(settings.read_text())["soundcloud_profile"] == "someone"
+            os.write(master, b"\x1bq")
             process.wait(timeout=5)
             assert process.returncode == 0
             assert termios.tcgetattr(slave) == before, "Terminal mode was not restored"
             saved = json.loads((root / "library.json").read_text())
-            assert len(saved["favorites"]) == 1 and len(saved["recent"]) == 1
+            assert len(saved["favorites"]) == 2 and len(saved["recent"]) == 1
+            assert saved["favorites"][1]["artist"] == "low sea"
             assert not list(temporary.iterdir()), "IPC directory was not removed"
             assert not (root / "home-cache").exists(), "The cache directory flag was ignored"
             print("PASS: TUI search and its cancel, favorites, queue, IPC controls, cache, settings,",
-                  "terminal cleanup; proxy=", proxy)
+                  "likes of a profile, terminal cleanup; proxy=", proxy)
         finally:
             if process.poll() is None:
                 process.kill()

@@ -875,6 +875,43 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "お気に入りに追加: {}、登録済み: {}、スキップ: {}",
     ),
     ("Библиотека: {}", "Library: {}", "ライブラリ: {}"),
+    (
+        "Лайки SoundCloud",
+        "SoundCloud likes",
+        "SoundCloud のいいね",
+    ),
+    (
+        "Enter - имя профиля или ссылка, ещё раз Enter - добавить его\nлайки в избранное. Лайки должны быть видны в профиле.\nПока список читается, Enter прерывает его.",
+        "Enter - a profile name or a link, Enter again - add its likes\nto the favorites. The likes must be visible in the profile.\nWhile the list is being read, Enter stops it.",
+        "Enter - プロフィール名かリンク、もう一度 Enter でいいねを\nお気に入りに追加。いいねは公開されている必要があります。\n読み込み中に Enter を押すと中断します。",
+    ),
+    ("{}: получено {}", "{}: received {}", "{}: {} 件取得"),
+    ("{}: прервано", "{}: stopped", "{}: 中断しました"),
+    (
+        "{}: добавлено {}, уже было {}",
+        "{}: added {}, already there {}",
+        "{}: 追加 {}、登録済み {}",
+    ),
+    (
+        "{}: оборвалось, добавлено {}",
+        "{}: broke off, added {}",
+        "{}: 途中で失敗、追加 {}",
+    ),
+    (
+        "Лайки {}: добавлено {}, уже было {}, пропущено {}",
+        "Likes of {}: added {}, already there {}, skipped {}",
+        "{} のいいね: 追加 {}、登録済み {}、スキップ {}",
+    ),
+    (
+        "Список лайков оборвался. e - подробности, Esc - закрыть окно",
+        "The list of likes broke off. e - details, Esc - close the window",
+        "いいねの一覧が途中で失敗しました。e - 詳細、Esc - 閉じる",
+    ),
+    (
+        "Чтение лайков прервано",
+        "Reading the likes was interrupted",
+        "いいねの読み込みが中断されました",
+    ),
 ];
 
 #[cfg(test)]
