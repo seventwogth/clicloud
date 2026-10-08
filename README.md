@@ -1,18 +1,25 @@
 # clicloud
 
-CLI-клиент на Rust для поиска и прослушивания SoundCloud. Поиск и загрузку
-аудио выполняет `yt-dlp`, воспроизведение — `mpv`. Прослушанные треки остаются
-в кеше на диске: во второй раз они начинаются сразу и играют без сети.
+English | [Русский](README.ru.md)
 
-## Установка
+A terminal client for SoundCloud, written in Rust: search, listen, keep a
+library. `yt-dlp` does the searching and fetches the audio, `mpv` plays it.
+Tracks you have played stay in a cache on disk: the second time they start at
+once and play without a network.
 
-Нужны Rust/Cargo 1.88+ (edition 2024), `yt-dlp` не старше 2023.01 (поиск
-использует `--lazy-playlist`) и `mpv` с поддержкой встроенного `ytdl_hook`
-(обычная сборка с Lua).
+The interface speaks Russian, English and Japanese. It starts in Russian: press
+`o`, go down to the fourth line (it reads «Язык») and press `Enter`, or put
+`"language": "en"` in the settings file.
 
-Ставьте `yt-dlp` через pip/pipx/uv, а не одним файлом с GitHub: сборка
-PyInstaller распаковывается при каждом запуске и стартует около 1.6 секунды
-против 0.4 у установки из пакета - а стартует она на каждый поиск.
+## Installation
+
+You need Rust/Cargo 1.88+ (edition 2024), `yt-dlp` no older than 2023.01 (the
+search uses `--lazy-playlist`) and `mpv` with its built-in `ytdl_hook` (the
+usual build with Lua).
+
+Install `yt-dlp` with pip, pipx or uv rather than as the single file from
+GitHub: the PyInstaller build unpacks itself on every start and takes about
+1.6 seconds against 0.4 for a packaged install, and it starts on every search.
 
 Manjaro/Arch Linux:
 
@@ -28,21 +35,21 @@ pipx install yt-dlp
 pipx ensurepath
 ```
 
-После обновления PATH откройте новый терминал. Сборка клиента:
+Open a new terminal after PATH has changed. Build the client:
 
 ```sh
 cargo build --release
 ./target/release/clicloud doctor
 ```
 
-Бинарник находится в `target/release/clicloud`. При желании установить в PATH:
+The binary is `target/release/clicloud`. To put it on PATH:
 
 ```sh
 cargo install --path . --locked
 ```
 
-Для локальной установки yt-dlp без изменений системного Python можно
-использовать `uv`:
+For a yt-dlp of the project's own, without touching the system Python, `uv`
+will do:
 
 ```sh
 uv venv .tools/venv
@@ -50,33 +57,35 @@ uv pip install --python .tools/venv/bin/python yt-dlp
 export CLICLOUD_YT_DLP="$PWD/.tools/venv/bin/yt-dlp"
 ```
 
-Каталог `.tools` исключён из Git. mpv устанавливается отдельно.
-Бинарник из каталога `target` проекта (`cargo run`, `./target/release/clicloud`)
-сам находит `.tools/venv/bin/yt-dlp` этого проекта, если `yt-dlp` отсутствует
-в PATH. Текущий каталог при этом не важен и не просматривается. Установленному
-через `cargo install` нужен `yt-dlp` в PATH, `--yt-dlp` или `CLICLOUD_YT_DLP`.
-Явный `--yt-dlp` или `CLICLOUD_YT_DLP` имеет приоритет над автоматическим выбором.
+The `.tools` directory is ignored by Git. mpv is installed separately. A binary
+run from the project's `target` directory (`cargo run`,
+`./target/release/clicloud`) finds `.tools/venv/bin/yt-dlp` of that project by
+itself when there is no `yt-dlp` on PATH. The current directory does not matter
+and is never searched. One installed with `cargo install` needs `yt-dlp` on
+PATH, `--yt-dlp` or `CLICLOUD_YT_DLP`. An explicit `--yt-dlp` or
+`CLICLOUD_YT_DLP` outranks what is found automatically.
 
-### Если программ нет
+### When the programs are missing
 
-Когда интерфейс не находит `yt-dlp` или `mpv`, он открывает окно «ПРОГРАММЫ».
+When the interface finds no `yt-dlp` or no `mpv`, it opens a window named
+PROGRAMS.
 
-yt-dlp клиент умеет поставить сам: по `Enter` он скачивает файл последнего
-релиза через `curl` и через настроенный прокси, сверяет его SHA-256 с суммой
-из того же релиза и только после этого кладёт рядом с библиотекой, в
-`~/.local/share/clicloud/bin`. Дальше он находит его там сам, в систему ничего
-не прописывается и прав администратора не требуется. Сумма защищает от битой
-или подменённой по пути загрузки, но не от скомпрометированного релиза: она
-берётся из того же релиза.
+yt-dlp is something the client can fetch itself: on `Enter` it downloads the
+file of the latest release with `curl`, through the proxy that is set, checks
+its SHA-256 against the sum published in that release, and only then puts it
+next to the library, in `~/.local/share/clicloud/bin`. From then on it finds it
+there by itself; nothing is written into the system and no administrator rights
+are needed. The sum guards against a download that was damaged or replaced on
+its way, not against a compromised release: it comes from the same release.
 
-mpv так не ставится. Это системный пакет с библиотеками и кодеками, которые
-разложит только пакетный менеджер, поэтому окно показывает готовую команду для
-вашей системы - её нужно выполнить самому. `Esc` закрывает окно и оставляет всё
-как есть.
+mpv cannot be had that way. It is a system package with libraries and codecs
+that only a package manager lays out, so the window shows the command for your
+system, and running it is up to you. `Esc` closes the window and leaves things
+as they are.
 
-## Использование
+## Usage
 
-### Терминальный интерфейс
+### The terminal interface
 
 ```sh
 cargo run --
@@ -84,177 +93,186 @@ cargo run -- --tor
 cargo run -- ui --library ./my-library.json
 ```
 
-Запуск без команды открывает TUI на Ratatui (Linux, macOS и Windows, минимум
-80×24).
-Рамки, кнопки и значки набраны ASCII-символами, а цвета задаёт схема: по
-умолчанию интерфейс повторяет цвета терминала, другие схемы выбираются в
-настройках (`o`). На широком экране справа отображаются очередь и недавно
-включённые треки.
-На экране выше 24 строк в шапке вместо надписи рисуется лого. Оно набрано
-точками Брайля - единственное в интерфейсе, что не ASCII; в консоли Linux, где
-таких знаков нет, остаётся надпись. Сам рисунок лежит в `logo.txt`.
+Started without a command, the client opens a TUI built on Ratatui (Linux,
+macOS and Windows, at least 80×24). Frames, buttons and marks are ASCII, and
+the colors come from a scheme: by default the interface follows the colors of
+the terminal, and other schemes are chosen in the settings (`o`). On a wide
+screen the queue and the tracks played last are shown on the right. On a screen
+taller than 24 lines the header draws the logo instead of spelling the name. It
+is drawn in Braille dots, one of the two things in the interface that are not
+ASCII; the Linux console, which has no such letters, keeps the spelled name.
+The drawing itself is in `logo.txt`.
 
-У главного экрана две вкладки, они стоят в правом углу шапки, как у браузера:
-«Списки» - поиск, библиотека, очередь и недавние, и «Трек» - то, что играет
-сейчас. `t` переключает между ними, щелчок по вкладке тоже; `Esc`, клавиши
-`1`-`4` и `/` возвращают к спискам. Вкладка трека занимает весь главный экран:
-слева обложка, рядом название, автор, длительность и те же значки, что в
-списке (`*` - в избранном, `v` - в кеше), ниже жанр, дата, сколько раз трек
-слушали, лайки, репосты, комментарии и теги, а на широком экране отдельной
-колонкой - описание от автора; `↑`/`↓` и `PgUp`/`PgDn` листают его. Клавиши
-трека здесь относятся к тому, что играет: `f` - в избранное, `d` - в кеш, `m` -
-похожие, `u` - автор. Плеер остаётся внизу.
+The main screen has two tabs in the right corner of the header, as a browser
+has them at its top: Lists, which is the search, the library, the queue and the
+history, and Track, which is what plays now. `t` goes from one to the other,
+and so does a click; `Esc`, the keys `1`-`4` and `/` go back to the lists. The
+tab of the track has the whole main screen: the cover on the left, beside it
+the title, the author, the length and the marks the track has in a list (`*` a
+favorite, `v` stored), below them the genre, the date, how often it was played,
+its likes, reposts, comments and tags, and on a wide screen a column of its own
+for what the author wrote of it; `↑`/`↓` and `PgUp`/`PgDn` move through that.
+The keys of a track are about the one that plays here: `f` makes it a favorite,
+`d` stores it, `m` opens tracks like it, `u` its author. The player stays below.
 
-Сведения о треке yt-dlp сообщает при загрузке трека попутно, иначе - одним
-запросом, когда вкладка открыта; они хранятся в кеше в `info/`. Обложка
-рисуется в клетках терминала одним из шести способов, он выбирается в
-настройках (`cover` в файле):
+yt-dlp tells all of that by the way when it fetches a track, or in one request
+while the tab is open; it is kept in the cache, in `info/`. The cover is drawn
+in the cells of the terminal in one of six ways, chosen in the settings
+(`cover` in the file):
 
-- **цветные блоки** (`blocks`, по умолчанию) - половинки клетки, два пикселя на
-  клетку, каждый своего цвета: обложка узнаётся лучше всего;
-- **цветной брайль** (`braille`) - точки Брайля, восемь на клетку, клетка
-  окрашена в цвет того, что за ними стоит: мельче, но темнее;
-- **блоки в цветах схемы** (`block-scheme`) и **брайль в цветах схемы**
-  (`braille-scheme`) - обложка, собранная из цветов самой схемы: каждая точка
-  берёт ближайший из них, а разница расходится по соседним, так что оттенок
-  передаётся смесью двух-трёх цветов схемы. В схеме `terminal`, у которой
-  своих цветов нет, обложка остаётся в собственных;
-- **блоки в тонах** (`block-tones`) и **брайль в тонах** (`braille-tones`) - то
-  же в одном тоне, от цвета фона схемы до цвета её текста;
-- **нет** (`none`) - экран без обложки, и за ней никто не ходит.
+- **colored blocks** (`blocks`, the default): half blocks, two pixels to a
+  cell, each with its own color. The cover is easiest to recognize this way;
+- **colored Braille** (`braille`): Braille dots, eight to a cell, the cell in
+  the color of what its dots stand for. Finer, but darker;
+- **blocks in scheme colors** (`block-scheme`) and **Braille in scheme colors**
+  (`braille-scheme`): the cover made of the colors of the scheme itself. Each
+  point takes the nearest of them and what it is off by goes to its neighbors,
+  so a shade is a mix of the two or three colors of the scheme it lies between.
+  Under the `terminal` scheme, which has no colors of its own, the cover keeps
+  its own;
+- **blocks in tones** (`block-tones`) and **Braille in tones**
+  (`braille-tones`): the same in one tone, from the background of the scheme to
+  the color of its text;
+- **none** (`none`): the tab without a cover, and nothing is fetched for it.
 
-В терминале с 24-битным цветом цвета берутся как есть, в остальных -
-ближайшие из 256. В схеме `mono` и там, где цвета отключены, рисунок
-складывается из одних знаков: точка или половинка есть либо её нет. Обложка -
-вторая после лого вещь в интерфейсе, набранная не ASCII, и единственная,
-раскрашенная не цветами схемы.
+A terminal with 24-bit color gets the colors as they are, any other the nearest
+of the 256. Under the `mono` scheme, and wherever colors are switched off, the
+picture is made of marks alone: a dot or a half is there or it is not. The
+cover is the second thing in the interface after the logo that is not ASCII,
+and the only one colored by anything but the scheme.
 
-Обложка загружается один раз, когда вкладка трека открыта: её адрес приходит
-вместе со сведениями о треке, картинку 300×300 скачивает `curl` через тот же
-прокси, а в точки её превращает mpv. Дальше она лежит в кеше рядом с аудио, а
-без кеша - в памяти до выхода. При 80×24 под обложку остаётся 18×9 клеток; на
-экране повыше она растёт.
-Кнопки нажимаются мышью или через `Tab` / `Shift+Tab` и `Enter`.
+The cover is fetched once, while the tab of the track is open: its address
+comes with the rest that is known of the track, `curl` downloads a 300×300
+picture through the same proxy, and mpv turns it into pixels. After that it
+lies in the cache beside the audio, or in memory until you quit when there is
+no cache. At 80×24 the cover has 18×9 cells; it grows with the screen.
 
-| Клавиша | Действие |
+Buttons are pressed with the mouse or with `Tab` / `Shift+Tab` and `Enter`.
+
+| Key | What it does |
 |---|---|
-| `/`, затем `Enter` | Ввести и отправить поисковый запрос или ссылку SoundCloud |
-| `Esc` | Отменить идущий поиск |
-| `1`, `2`, `3`, `4` | Поиск, библиотека, очередь, недавние |
-| `t` | Вкладка трека вместо списков и обратно: обложка и всё, что о нём известно |
-| `o` | Настройки и цветовые схемы |
-| `↑` / `↓`, `j` / `k` | Выбрать трек |
-| `PgUp` / `PgDn` | Листать список на экран |
-| `Home` / `End`, `g` / `G` | К началу / концу списка |
-| `Ctrl+F` | Фильтр библиотеки по словам из названия и исполнителя; `Esc` сбрасывает |
-| `Enter` | Проиграть выбранный трек, за ним пойдут следующие по списку / нажать выделенную кнопку |
-| `m` | Похожие треки: станция SoundCloud по выбранному треку |
-| `u` | Страница автора выбранного трека; `[` / `]` — её разделы |
-| `b` | Назад к списку, который был открыт до этого |
-| `F` | Добавить в избранное все треки списка |
-| `z` | Играть список по порядку или вперемешку |
-| `r` | Повтор: нет, весь список, один трек |
-| `Space` | Пауза / продолжить |
-| `f` | Добавить в избранное или убрать из него |
-| `a` | Добавить выбранный трек в очередь |
-| `d` / `D` | Загрузить в кеш выбранный трек / все треки списка, не включая их |
-| `x` | Удалить выбранный трек из кеша |
-| `Delete` | Убрать выбранный трек из очереди |
-| `p` / `n` | Предыдущий / следующий трек |
-| `←` / `→` | Перемотка на шаг из настроек (10 секунд) |
-| `,` / `.` | Медленнее / быстрее на 0.1, от x0.5 до x2.0 |
-| `−` / `+` | Громкость |
-| `s`, `q`, `?` | Стоп, выход, справка |
-| `e` | Полный текст последней ошибки поиска или воспроизведения; ↑↓ — прокрутка, Esc — закрыть |
+| `/`, then `Enter` | Type and send a search, or a SoundCloud link |
+| `Esc` | Cancel the search that runs |
+| `1`, `2`, `3`, `4` | Search, library, queue, history |
+| `t` | The tab of the track instead of the lists, and back: the cover and all that is known of the track |
+| `o` | Settings and color schemes |
+| `↑` / `↓`, `j` / `k` | Select a track |
+| `PgUp` / `PgDn` | Move through the list by a screen |
+| `Home` / `End`, `g` / `G` | To the top / the end of the list |
+| `Ctrl+F` | Filter the library by words of the title and the artist; `Esc` clears |
+| `Enter` | Play the selected track, and the rest of its list after it / press the focused button |
+| `m` | Tracks like the selected one: its SoundCloud station |
+| `u` | The page of the author of the selected track; `[` / `]` go through its sections |
+| `b` | Back to the list that was open before |
+| `F` | Add every track of the list to the favorites |
+| `z` | Play a list in order or shuffled |
+| `r` | Repeat: off, the whole list, one track |
+| `Space` | Pause / go on |
+| `f` | Add to the favorites or remove from them |
+| `a` | Add the selected track to the queue |
+| `d` / `D` | Store the selected track / every track of the list in the cache, without playing them |
+| `x` | Remove the selected track from the cache |
+| `Delete` | Take the selected track out of the queue |
+| `p` / `n` | The track before / the next one |
+| `←` / `→` | Seek by the step from the settings (10 seconds) |
+| `,` / `.` | Slower / faster by 0.1, from x0.5 to x2.0 |
+| `−` / `+` | Volume |
+| `s`, `q`, `?` | Stop, quit, help |
+| `e` | The full text of the last error of a search or of playback; ↑↓ scroll, Esc closes |
 
-Поиск выполняется в фоне, и список наполняется по мере того, как yt-dlp находит
-треки, а не после того, как найдёт все: первый трек появляется в разы раньше
-последнего, потому что yt-dlp тратит на каждый около секунды. Поэтому по
-умолчанию запрашивается 10 треков - это настраивается (`search_limit`).
-Запрос, который уже искали в этом сеансе, открывается мгновенно из памяти;
-чтобы обновить его результаты, отправьте тот же запрос ещё раз. При самом первом
-запуске, пока кеш yt-dlp пуст, клиент заранее делает один запрос к SoundCloud:
-yt-dlp узнаёт `client_id`, пока вы набираете запрос, и первый поиск не ждёт
-лишний круг - без этого он может оказаться в разы дольше остальных. С
-`--no-cache` и во всех последующих запусках этого запроса нет.
+A search runs in the background, and the list fills as yt-dlp finds the tracks
+rather than after it has found them all: the first track shows many times
+sooner than the last, because each costs yt-dlp about a second. That is why 10
+tracks are asked for by default, which can be changed (`search_limit`). A
+question that was asked before in this run is answered at once from memory; to
+refresh its results, send the same question again. On the very first run, while
+the cache of yt-dlp is empty, the client makes one request to SoundCloud ahead
+of time: yt-dlp learns the `client_id` while you type, and the first search
+does not wait an extra round, which could make it several times longer than
+the others. With `--no-cache`, and on every later run, that request is not
+made.
 
-`Enter` включает трек, и после него играют остальные треки того же списка -
-результатов поиска, библиотеки или недавних. Сначала идёт то, что вы сами
-поставили в очередь клавишей `a`, затем продолжение списка; очередь (`3`)
-показывает и то и другое, `Delete` убирает трек из любого из них. `z` включает
-порядок вперемешку: то, что впереди, перемешивается сразу, а трек, начатый при
-нём, получает за собой весь остальной список. `r` по кругу переключает повтор:
-нет, весь список, один трек. Оба выбора видны в рамке плеера и запоминаются в
-файле настроек (`shuffle`, `repeat`: `off`, `all` или `one`).
+`Enter` starts a track, and the rest of its list plays after it, whether that
+is the results of a search, the library or the history. What you put in the
+queue yourself with `a` comes first, then the rest of the list; the queue (`3`)
+shows both, and `Delete` takes a track out of either. `z` plays in a shuffled
+order: what is ahead is mixed at once, and a track started while it is on has
+all the others of its list after it. `r` goes round the ways to repeat: off,
+the whole list, one track. Both choices show in the frame of the player and are
+kept in the settings file (`shuffle`, `repeat`: `off`, `all` or `one`).
 
-В поле поиска можно вставить и ссылку SoundCloud - она откроется как список:
-плейлист или альбом, страница автора (`/имя/tracks`, `albums`, `sets`,
-`reposts`, `likes`), станция трека. То же делают клавиши: `m` открывает станцию
-выбранного трека - сам трек и то, что SoundCloud играет после него, `u` - треки
-его автора, а `[` и `]` листают разделы автора: треки, альбомы, плейлисты,
-репосты, лайки. Плейлист среди треков отмечен `>>` на месте длительности, и
-`Enter` на нём открывает его, а не играет. `b` возвращает к предыдущему списку
-без нового запроса, `F` добавляет в избранное все треки открытого списка - так
-переносятся плейлисты и репосты. Из списка берётся не больше 500 треков.
+A SoundCloud link can be pasted where a search is typed, and it opens as a
+list: a playlist or an album, a page of an author (`/name/tracks`, `albums`,
+`sets`, `reposts`, `likes`), the station of a track. The keys do the same: `m`
+opens the station of the selected track, which is that track and what
+SoundCloud plays after it, `u` the tracks of its author, and `[` and `]` go
+through the sections of the author: tracks, albums, playlists, reposts, likes.
+A playlist among tracks is marked `>>` where the length would be, and `Enter`
+on it opens it instead of playing it. `b` goes back to the list before without
+asking again, and `F` adds every track of the open list to the favorites, which
+is how playlists and reposts are brought over. At most 500 tracks are taken of
+a list.
 
-Страница автора и станция сообщают о треке название и ссылку, так что
-исполнитель сначала берётся из ссылки, а длительности нет - как у лайков, они
-подставляются при первой загрузке трека. Плейлист ссылки и названия всех своих
-треков не сообщает, поэтому yt-dlp запрашивает каждый трек отдельно: список
-наполняется примерно по треку в секунду, зато сразу с исполнителем и
-длительностью. Длительность 0:30 означает, что SoundCloud отдаёт только
-отрывок.
+A page of an author and a station tell the title and the link of a track, so
+the artist is at first read from the link and there is no length, as with
+likes; both are put right when the track is first fetched. A playlist does not
+tell the links and titles of all its tracks, so yt-dlp looks each one up: the
+list fills at about a track a second, but with the artist and the length from
+the start. A length of 0:30 means that SoundCloud hands out a preview only.
 
-В длинном списке рисуются только строки, которые видны, так что библиотека в
-тысячи треков листается так же быстро, как короткая; справа внизу рамки стоит
-место выбранного трека и общее число. `Ctrl+F` сужает библиотеку до треков, в
-названии или исполнителе которых есть все набранные слова: `Enter` оставляет
-фильтр, `Esc` сбрасывает, а `Enter` на треке играет дальше уже по суженному
-списку.
+Only the rows that show are drawn of a long list, so a library of thousands of
+tracks moves as fast as a short one; the lower right corner of the frame says
+where the selection stands and how many there are. `Ctrl+F` narrows the library
+to the tracks that have every word typed in their title or artist: `Enter`
+keeps the filter, `Esc` clears it, and `Enter` on a track plays on through the
+narrowed list.
 
-Пока трек играет и уже загружен целиком, клиент заранее загружает в кеш тот,
-что идёт следом, а когда он там - сам плеер переходит к нему без остановки:
-новый mpv не запускается, и паузы между треками нет. Так играет подряд всё,
-что уже лежит в кеше. Без кеша (`--no-cache`), при повторе одного трека и когда
-следующий трек ещё не успел загрузиться, он включается как раньше - новым
-плеером. На полосе трека, который ещё загружается, `~` показывает, сколько уже
-пришло; `,` и `.` меняют скорость до конца сеанса, и она стоит в рамке плеера,
-пока не равна обычной.
+While a track plays and all of it has arrived, the client fetches the one that
+follows into the cache ahead of time, and once it is there the player itself
+goes on to it without stopping: no new mpv is started and there is no gap
+between the tracks. Everything that is already in the cache plays on like that.
+Without a cache (`--no-cache`), when one track is repeated, and when the next
+track has not arrived in time, it starts as before, in a player of its own. On
+the bar of a track that is still arriving `~` shows how far it has come; `,`
+and `.` change the speed for the rest of the run, and it stands in the frame of
+the player while it is not the usual one.
 
-Следующий трек включается автоматически после окончания текущего. Если
-трек не удалось проиграть, он пропускается и включается следующий; после трёх
-ошибок подряд очередь останавливается, чтобы сбой сети её не опустошил. Пауза,
-прогресс и громкость приходят от mpv через локальный IPC: Unix-сокет, а в
-Windows - именованный канал. Пока трек загружается, перемотка ограничена
-загруженной частью, а длительность берётся из результатов поиска. При ошибке
-воспроизведения или загрузки в кеш окно `e` показывает сообщения об ошибках mpv
-и вывод yt-dlp. По SIGTERM, SIGHUP и SIGINT, а также когда окно
-терминала закрыли, интерфейс в Unix завершается штатно: останавливает mpv и yt-dlp, удаляет временный каталог с IPC-сокетом и
-недокачанные треки.
+The next track starts by itself when the current one ends. A track that cannot
+be played is skipped and the next one starts; after three failures in a row the
+queue stops, so that a dead network does not drain it. Pause, progress and
+volume come from mpv over a local connection: a Unix socket, or a named pipe on
+Windows. While a track is being fetched, seeking is limited to what has
+arrived, and the length is the one the search told. When playback or storing
+fails, the window that `e` opens shows the error messages of mpv and the output
+of yt-dlp. On SIGTERM, SIGHUP and SIGINT, and when the window of its terminal
+is closed, the interface on Unix ends in an orderly way: it stops mpv and
+yt-dlp and removes the temporary directory with the socket and the downloads
+that were not finished.
 
-Библиотека (`2`) — всё, что вы оставили себе: сначала избранное, за ним
-остальные треки из кеша. Это локальный список, без синхронизации с аккаунтом
-SoundCloud; лайки профиля в него переносит строка «Лайки SoundCloud» в
-настройках или команда `import`. `f` убирает трек из избранного, `x` — из
-кеша; трек, которого нет ни там, ни там, из библиотеки исчезает. Файл
-библиотеки может менять и другой процесс - команда `import` или второй
-интерфейс: открытый интерфейс замечает это за пару секунд и перед каждым
-сохранением, добавляет чужие новые треки к своим и убирает удалённые там.
-Избранное и последние 30 включённых треков сохраняются в
-`$XDG_DATA_HOME/clicloud/library.json` или `~/.local/share/clicloud/library.json`.
-Недавние треки открываются клавишей `4`, их можно включить снова.
-То, что играло и что стояло за ним, - очередь и продолжение списка, до 500
-треков - тоже сохраняется там при выходе: в следующий раз оно ждёт в очереди,
-и `n` включает его с того трека, на котором остановились. Путь можно переопределить через
-`ui --library`. Повреждённый файл библиотеки не перезаписывается.
+The library (`2`) is all that you have kept: the favorites first, then the rest
+of the tracks in the cache. It is a local list, not synchronized with a
+SoundCloud account; the likes of a profile are brought into it by the line
+SoundCloud likes of the settings or by the `import` command. `f` removes a
+track from the favorites, `x` from the cache; a track that is in neither
+disappears from the library. The library file may be changed by another process
+too, the `import` command or a second interface: an open interface notices it
+within a couple of seconds and before every save, adds the tracks that are new
+there to its own and removes those that were removed there. The favorites and
+the last 30 tracks played are kept in `$XDG_DATA_HOME/clicloud/library.json` or
+`~/.local/share/clicloud/library.json`. The history opens with `4`, and its
+tracks can be played again. What played and what was ahead of it, the queue and
+the rest of the list, up to 500 tracks, is kept there too when you quit: the
+next time it waits in the queue, and `n` starts it from the track it stopped
+at. The path can be changed with `ui --library`. A damaged library file is not
+overwritten.
 
-Трек, который не удалось проиграть, до конца сеанса отмечен `!!` на месте
-номера - пока не проиграется: причиной могла быть и сеть.
+A track that could not be played is marked `!!` in place of its number for the
+rest of the run, or until it plays: the network may have been the reason.
 
-В последнем столбце списка `v` отмечает трек, который лежит в кеше, а `~` —
-трек, который сейчас загружается. Подробнее — в разделе «Кеш и офлайн».
+In the last column of a list `v` marks a track that is in the cache and `~` one
+that is being fetched. More of that under "Cache and offline".
 
-### Обычные CLI-команды
+### Plain commands
 
 ```sh
 cargo run -- search "burial" --limit 10
@@ -268,213 +286,222 @@ cargo run -- cache
 cargo run -- doctor
 ```
 
-`play` с запросом показывает список и предлагает выбрать номер. `q` или EOF
-отменяют выбор. В скриптах используйте `--first` или прямую ссылку.
-`search --json` выводит массив объектов `title`, `artist`, `duration` (секунды
-или null), `url`; сообщения идут в stderr. Допустимый `--limit`: 1–50.
-Ссылка вместо запроса открывается как список: плейлист, страница автора,
-станция трека.
+`play` with a question shows a list and asks for a number. `q` or EOF cancels
+the choice. In scripts use `--first` or a link. `search --json` prints an array
+of objects with `title`, `artist`, `duration` (seconds or null) and `url`;
+messages go to stderr. `--limit` takes 1–50. A link in place of a question is
+opened as a list: a playlist, a page of an author, the station of a track.
 
-Во время проигрывания: **пробел** — пауза, **←/→** — перемотка,
-**9/0** — громкость, **q** — выход. Ссылка на плейлист передаётся mpv целиком;
-поиск возвращает отдельные треки. Получив SIGTERM, SIGHUP или SIGINT, `play`
-просит mpv завершиться, останавливает yt-dlp и выходит с кодом 128 + номер
-сигнала, а не оставляет плеер играть в фоне.
+While it plays: **space** pauses, **←/→** seek, **9/0** change the volume, **q**
+quits. A link to a playlist is handed to mpv whole; a search returns single
+tracks. On SIGTERM, SIGHUP or SIGINT `play` asks mpv to end, stops yt-dlp and
+exits with 128 plus the number of the signal, rather than leaving the player
+playing in the background.
 
-### Перенос лайков из профиля SoundCloud
+The help of the command line (`--help`) is in Russian only.
 
-В интерфейсе это последняя строка настроек (`o`), «Лайки SoundCloud»: `Enter`
-открывает поле для имени профиля или ссылки на него, второй `Enter` начинает
-перенос. Он идёт в фоне - окно можно закрыть, музыка не прерывается. Строка
-показывает, сколько треков получено, а в конце - сколько добавлено и сколько
-уже было; `Enter` на ней, пока список читается, прерывает перенос, и избранное
-остаётся прежним. Имя профиля запоминается в настройках, так что в следующий
-раз достаточно двух `Enter`; пустая строка его забывает.
+### Bringing over the likes of a SoundCloud profile
 
-То же делает команда, без интерфейса:
+In the interface this is the last line of the settings (`o`), SoundCloud likes:
+`Enter` opens a field for the name of a profile or a link to it, and a second
+`Enter` starts. The list is read in the background: the window can be closed
+and the music goes on. The line shows how many tracks have arrived, and at the
+end how many were added and how many were there already; `Enter` on it while
+the list is being read stops it, and the favorites stay as they were. The name
+of the profile is remembered in the settings, so the next time two presses of
+`Enter` are enough; an empty line forgets it.
+
+The command does the same without the interface:
 
 ```sh
-clicloud import my-profile            # или @my-profile, soundcloud.com/my-profile
-clicloud import my-profile --dry-run  # показать, что добавится, ничего не записывая
-clicloud import https://soundcloud.com/my-profile/reposts    # не лайки, а другой список
-clicloud import https://soundcloud.com/my-profile/sets/mix   # плейлист
+clicloud import my-profile            # or @my-profile, soundcloud.com/my-profile
+clicloud import my-profile --dry-run  # show what would be added and write nothing
+clicloud import https://soundcloud.com/my-profile/reposts    # another list than the likes
+clicloud import https://soundcloud.com/my-profile/sets/mix   # a playlist
 ```
 
-Перенос читает страницу лайков профиля и добавляет её треки в избранное, после
-уже имеющихся, начиная с последних лайков. Вход в аккаунт не нужен, но лайки
-должны быть видны в профиле: скрытые клиент не получит. Имя профиля - то, что
-стоит в адресе его страницы; `soundcloud.com/you/likes` своего имени не содержит.
+It reads the page of likes of the profile and adds its tracks to the favorites,
+after those already there, the latest likes first. No account is signed in to,
+but the likes must be visible in the profile: hidden ones cannot be had. The
+name of a profile is what stands in the address of its page;
+`soundcloud.com/you/likes` does not contain your name.
 
-Перенос идёт в одну сторону и только добавляет: трек, с которого лайк снят,
-остаётся в избранном, а локальное избранное на сайт не отправляется. Повторный
-запуск добавляет только новое, поэтому после обрыва сети достаточно повторить
-перенос: полученное до обрыва уже сохранено. Итог называет три числа:
-добавлено, уже было и пропущено - это лайки не на отдельные треки, а на
-плейлисты и альбомы.
+It goes one way and only adds: a track whose like was taken back stays a
+favorite, and the local favorites are not sent to the site. Asking again adds
+only what is new, so after the network broke off it is enough to ask again:
+what had arrived was saved. The outcome names three numbers: added, there
+already, and skipped, which are likes of playlists and albums rather than of
+single tracks.
 
-Страница лайков сообщает название и ссылку, но не исполнителя и не длительность.
-Сначала исполнителем становится имя профиля автора из ссылки (`low-sea` →
-`low sea`), а на месте длительности стоит прочерк. Настоящие название, автор и
-длительность подставляются, когда трек впервые загружается - при
-воспроизведении или клавишей `d`: yt-dlp узнаёт их по пути, и клиент записывает
-их в библиотеку. Доступность трека тоже заранее не видна:
-удалённый или закрытый в регионе трек попадёт в избранное и будет пропущен при
-воспроизведении.
+The page of likes tells the title and the link, but neither the artist nor the
+length. At first the artist is the name of the author's profile from the link
+(`low-sea` → `low sea`) and a dash stands for the length. The real title,
+author and length are put in when the track is first fetched, by playing it or
+with `d`: yt-dlp learns them on the way and the client writes them into the
+library. Whether a track can be played is not known ahead either: one that was
+deleted or is closed in your region becomes a favorite and is skipped when its
+turn comes.
 
-Команду `import` можно запускать и при открытом интерфейсе: он подхватит
-новые треки сам. Другой файл задаётся через `--library`, как у `ui`. Для
-страниц профиля yt-dlp просит имитацию браузера и без неё
-предупреждает, а SoundCloud может ответить 403; она ставится вместе с
-`curl_cffi`: `pipx install "yt-dlp[default,curl-cffi]"`.
+`import` can be run while the interface is open: the interface picks up the
+new tracks by itself. Another file is named with `--library`, as for `ui`. For
+the pages of a profile yt-dlp asks for the impersonation of a browser, warns
+without it, and SoundCloud may answer 403; it comes with `curl_cffi`:
+`pipx install "yt-dlp[default,curl-cffi]"`.
 
-Можно указать программы через `--yt-dlp /path/to/yt-dlp`, `--mpv /path/to/mpv`
-или переменные `CLICLOUD_YT_DLP`, `CLICLOUD_MPV`. Передавайте путь к исполняемому
-файлу, а не команду с аргументами. Программы вызываются без shell.
-Пользовательские конфиги yt-dlp и mpv отключены для воспроизводимого поведения.
+The programs can be named with `--yt-dlp /path/to/yt-dlp`, `--mpv /path/to/mpv`
+or the variables `CLICLOUD_YT_DLP`, `CLICLOUD_MPV`. Give the path of an
+executable, not a command with arguments. The programs are started without a
+shell. The user's own configuration of yt-dlp and mpv is switched off, so that
+the client behaves the same everywhere.
 
-### Настройки и цветовые схемы
+### Settings and color schemes
 
-Клавиша `o` открывает окно настроек: `↑`/`↓` выбирают строку, `←`/`→` меняют
-значение, `Enter` переключает или открывает, `Esc` закрывает окно. Мышью:
-щелчок выбирает строку, щелчок по выбранной — переключает. Изменение действует
-сразу и записывается в файл настроек. Окно закрывает строку сообщений, поэтому
-то, что клиент сообщает, пока оно открыто, - например, почему не подошёл адрес
-прокси, - показывается в нём самом.
+`o` opens the settings window: `↑`/`↓` choose a line, `←`/`→` change its value,
+`Enter` switches or opens, `Esc` closes the window. With the mouse, a click
+chooses a line and a click on the chosen one switches it. A change applies at
+once and is written to the settings file. The window covers the line of
+messages, so what the client says while it is open, such as why a proxy address
+would not do, is shown in the window itself.
 
-| Настройка | Что меняет | В файле |
+| Setting | What it changes | In the file |
 |---|---|---|
-| Цветовая схема | Цвета интерфейса | `theme` |
-| Фоновый рисунок | ASCII-рисунок за списком треков: `reaper`, `pentagram` или `none` — без рисунка | `backdrop` |
-| Обложка | Как вкладка трека рисует обложку: блоками или брайлем; в её цветах, в цветах схемы или в тонах; или никак | `cover` |
-| Язык | Русский, English или 日本語: `ru`, `en`, `ja` | `language` |
-| Прокси | Включает и выключает прокси со следующего поиска и трека | `proxy_enabled` |
-| Адрес прокси | HTTP(S) или SOCKS5 с портом | `proxy` |
-| Кеш треков | Сохранение треков на диск | `cache_enabled` |
-| Размер кеша | Предел в мегабайтах, 0 — без ограничения | `cache_limit_mb` |
-| Результатов поиска | От 5 до 50 треков на поиск в интерфейсе, по умолчанию 10 | `search_limit` |
-| Шаг перемотки | 5, 10, 15, 30 или 60 секунд | `seek_step` |
-| Громкость при запуске | От 0 до 100 | `volume` |
-| Ровная громкость | Тихие и громкие треки приводятся к одной громкости; со следующего трека | `normalize` |
-| Аудиоустройство | Устройство из тех, что видит mpv; `авто` оставляет выбор за ним | `audio_device` |
-| Медиаклавиши | Пауза, стоп и соседние треки с клавиатуры и из панели рабочего стола, через плагин `mpv-mpris` | `media_keys` |
-| yt-dlp | Показывает версию; yt-dlp, скачанный клиентом, по `Enter` заменяется свежим релизом | — |
-| Лайки SoundCloud | Добавляет в избранное лайки профиля; запоминает его имя | `soundcloud_profile` |
+| Color scheme | The colors of the interface | `theme` |
+| Backdrop | The ASCII drawing behind the list of tracks: `reaper`, `pentagram`, or `none` | `backdrop` |
+| Cover | How the tab of the track draws the cover: in blocks or in Braille; in its own colors, those of the scheme or tones; or not at all | `cover` |
+| Language | Русский, English or 日本語: `ru`, `en`, `ja` | `language` |
+| Proxy | Switches the proxy on and off from the next search and track | `proxy_enabled` |
+| Proxy address | HTTP(S) or SOCKS5 with a port | `proxy` |
+| Track cache | Storing tracks on disk | `cache_enabled` |
+| Cache size | The limit in megabytes; 0 lifts it | `cache_limit_mb` |
+| Search results | From 5 to 50 tracks for a search in the interface, 10 by default | `search_limit` |
+| Seek step | 5, 10, 15, 30 or 60 seconds | `seek_step` |
+| Start volume | From 0 to 100 | `volume` |
+| Even loudness | Quiet and loud tracks are brought to one loudness; from the next track | `normalize` |
+| Audio device | One of the devices mpv sees; `auto` leaves the choice to it | `audio_device` |
+| Media keys | Pause, stop and the tracks around from the keyboard and the panel of the desktop, by the plugin `mpv-mpris` | `media_keys` |
+| yt-dlp | Tells its version; a yt-dlp that the client fetched is replaced by the latest release on `Enter` | — |
+| SoundCloud likes | Adds the likes of a profile to the favorites; remembers its name | `soundcloud_profile` |
 
-Флаги `--tor`, `--proxy`, `--no-proxy`, `--cache-dir` и `--no-cache` задают
-состояние на время запуска; переключение в настройках его заменяет.
+The flags `--tor`, `--proxy`, `--no-proxy`, `--cache-dir` and `--no-cache` set
+the state for one run; switching it in the settings replaces that.
 
-Язык меняется сразу и относится ко всему, что пишет клиент: к интерфейсу, к
-сообщениям об ошибках и к выводу команд `search`, `play`, `import`, `cache` и `doctor`.
-На русском остаётся только справка `--help`. Японские знаки занимают две
-клетки, поэтому терминалу нужен шрифт с ними.
+The language changes at once and covers everything the client writes: the
+interface, the error messages and the output of `search`, `play`, `import`,
+`cache` and `doctor`. Only `--help` stays in Russian. Japanese letters take two
+cells, so the terminal needs a font that has them.
 
-Схемы:
+Schemes:
 
-- `terminal` (по умолчанию) — цвета терминала. В Ghostty клиент читает его
-  конфигурацию и берёт тему оттуда, так что оттенки совпадают с остальным
-  терминалом; фон терминала, включая прозрачный, остаётся нетронутым. В других
-  терминалах используются их 16 цветов.
-- `mono` — без цвета: жирный, тусклый и инверсия.
-- темы Ghostty: 45 встроены (Catppuccin, Dracula, Gruvbox, Nord, TokyoNight,
-  Rose Pine, Kanagawa, Everforest, Solarized и другие), а если Ghostty
-  установлен, доступны все его темы и ваши собственные из
-  `~/.config/ghostty/themes`.
+- `terminal` (the default): the colors of the terminal. In Ghostty the client
+  reads its configuration and takes the theme from there, so the shades match
+  the rest of the terminal; the background of the terminal, a transparent one
+  included, is left alone. In other terminals their 16 colors are used.
+- `mono`: no color; bold, dim and reverse.
+- Ghostty themes: 45 are built in (Catppuccin, Dracula, Gruvbox, Nord,
+  TokyoNight, Rose Pine, Kanagawa, Everforest, Solarized and others), and where
+  Ghostty is installed all of its themes and your own from
+  `~/.config/ghostty/themes` are available.
 
-`Enter` на строке схемы открывает список: схема под курсором сразу
-применяется для просмотра, `Enter` оставляет её, `Esc` возвращает прежнюю.
-Тема задаёт только палитру. Роли цветов (заголовки, выделение, играющий трек,
-значки) клиент назначает сам и подтягивает оттенки до читаемого контраста,
-поэтому и светлые, и тёмные темы остаются разборчивыми.
+`Enter` on the line of the scheme opens a list: the scheme under the cursor is
+applied at once for a look, `Enter` keeps it, `Esc` brings back the one before.
+A theme gives the palette only. The roles of the colors (titles, the selection,
+the track that plays, the marks) are assigned by the client, which moves the
+shades as far as it takes to read them, so light and dark themes alike stay
+legible.
 
-### Медиаклавиши
+### Media keys
 
-Клавиши «пауза», «следующий», «предыдущий» и «стоп» на клавиатуре и плеер в
-панели рабочего стола говорят не с клиентом, а с mpv - по протоколу MPRIS,
-которому mpv учит плагин [mpv-mpris](https://github.com/hoyon/mpv-mpris). Если
-плагин установлен (`sudo pacman -S mpv-mpris`, `sudo apt install mpv-mpris`),
-клиент находит его сам и подключает к каждому плееру; в панели трек называется
-«исполнитель - название». Интерфейс следует за тем, что сделали клавиши: пауза
-и стоп отражаются в плеере, «следующий» переходит к следующему треку, если он
-уже лежит в кеше (иначе mpv идти некуда - нажмите `n`), «предыдущий» включает
-предыдущий трек. `media_keys` в файле настроек: `auto` - искать плагин в
-обычных местах, `off` - не подключать, любое другое значение - путь к
-`mpris.so`. Без плагина настройка ничего не меняет. В Windows и macOS MPRIS
-нет.
+The keys for pause, next, previous and stop on the keyboard, and the player in
+the panel of the desktop, do not talk to the client but to mpv, over the MPRIS
+protocol, which mpv learns from the plugin
+[mpv-mpris](https://github.com/hoyon/mpv-mpris). Where the plugin is installed
+(`sudo pacman -S mpv-mpris`, `sudo apt install mpv-mpris`), the client finds it
+by itself and gives it to every player; in the panel a track is named "artist -
+title". The interface follows what the keys did: pause and stop show in the
+player, next goes on to the next track if that one is in the cache already
+(otherwise mpv has nowhere to go; press `n`), previous starts the track before.
+`media_keys` in the settings file: `auto` looks for the plugin in the usual
+places, `off` does not use it, anything else is the path of `mpris.so`. Without
+the plugin the setting changes nothing. Windows and macOS have no MPRIS.
 
-### Терминалы
+### Terminals
 
-Интерфейсу нужны только обычные возможности терминала: альтернативный экран,
-мышь, жирный, тусклый и инверсия. Цвета подстраиваются под терминал сами:
+The interface needs only what every terminal has: the alternate screen, the
+mouse, bold, dim and reverse. The colors adapt to the terminal by themselves:
 
-- **24-битный цвет** используется там, где терминал о нём сообщает: переменная
+- **24-bit color** is used where the terminal announces it: the variable
   `COLORTERM=truecolor`, Windows Terminal, Ghostty, kitty, Alacritty, foot,
-  WezTerm, iTerm2, VS Code, а также внутри tmux, который сам приводит цвета к
-  возможностям внешнего терминала. Так же ведут себя Konsole и GNOME Terminal.
-- **256 цветов** — во всех остальных случаях, например в Terminal.app, xterm,
-  GNU screen или по ssh, куда `COLORTERM` не передаётся. Тема подбирается из
-  стандартной палитры; оттенки чуть грубее, но всё остаётся читаемым.
-- **16 цветов терминала** — схема `terminal` вне Ghostty: она ничего не
-  красит сама и подходит любому цветному терминалу, включая консоль Linux.
-- **Без цвета** — схема `mono`. Переменная `NO_COLOR` делает такой же схему
-  `terminal`.
+  WezTerm, iTerm2, VS Code, and inside tmux, which brings colors down to what
+  the outer terminal can do. Konsole and GNOME Terminal behave the same.
+- **256 colors** everywhere else, such as Terminal.app, xterm, GNU screen, or
+  over ssh, where `COLORTERM` is not passed on. The theme is picked from the
+  standard palette; the shades are a little coarser, but everything stays
+  legible.
+- **The 16 colors of the terminal**: the `terminal` scheme outside Ghostty. It
+  colors nothing by itself and suits any color terminal, the Linux console
+  included.
+- **No color**: the `mono` scheme. The variable `NO_COLOR` makes the `terminal`
+  scheme the same.
 
-Тусклый текст поддерживают не все терминалы: там второстепенные надписи
-выглядят как обычные. Для русского и японского нужен шрифт с этими знаками;
-в консоли Linux японского нет.
+Not every terminal has dim text: there the secondary texts look like the
+others. Russian and Japanese need a font with those letters; the Linux console
+has no Japanese.
 
-**Windows и PowerShell.** Работают все команды и полный интерфейс: вместо
-Unix-сокета mpv слушает именованный канал `\\.\pipe\clicloud-...`. Сигналов
-SIGTERM и SIGHUP в Windows нет, поэтому интерфейс завершается по `q` и `Ctrl+C`,
-которые приходят как нажатия клавиш. Настройки, кеш и библиотека лежат в
-`%USERPROFILE%\.config\clicloud`, `%USERPROFILE%\.cache\clicloud` и
-`%USERPROFILE%\.local\share\clicloud`; переменные `XDG_*` учитываются и здесь.
-Если `yt-dlp` или `mpv` установлены не в `PATH`, укажите путь к `.exe` через
-`--mpv` и `--yt-dlp`. Локальный yt-dlp проекта клиент ищет в
-`.tools\venv\Scripts\yt-dlp.exe` - там, где его создаёт `py -m venv`.
-Если вывод передаётся по конвейеру в PowerShell 5 и кириллица превращается в
-кракозябры, выполните
-`[Console]::OutputEncoding = [Text.Encoding]::UTF8` или включите английский
-язык (`"language": "en"`). Интерфейс так же доступен в WSL, в том числе в
-Windows Terminal.
+**Windows and PowerShell.** Every command and the whole interface work: in
+place of a Unix socket mpv listens on a named pipe, `\\.\pipe\clicloud-...`.
+Windows has no SIGTERM or SIGHUP, so the interface ends on `q` and `Ctrl+C`,
+which arrive as keys. The settings, the cache and the library are in
+`%USERPROFILE%\.config\clicloud`, `%USERPROFILE%\.cache\clicloud` and
+`%USERPROFILE%\.local\share\clicloud`; the `XDG_*` variables count here too.
+If `yt-dlp` or `mpv` is not on `PATH`, name the `.exe` with `--mpv` and
+`--yt-dlp`. The yt-dlp of the project is looked for in
+`.tools\venv\Scripts\yt-dlp.exe`, where `py -m venv` puts it. If output is
+piped in PowerShell 5 and Cyrillic turns into garbage, run
+`[Console]::OutputEncoding = [Text.Encoding]::UTF8` or switch to English
+(`"language": "en"`). The interface also runs in WSL, Windows Terminal
+included.
 
-## Кеш и офлайн
+## Cache and offline
 
-Трек загружается один раз: yt-dlp пишет его в кеш, а mpv в это время играет
-уже загруженную часть. Как только загрузка закончилась (обычно это десятки
-секунд), трек остаётся на диске, и дальше он включается мгновенно и без сети —
-в интерфейсе и в `play` по ссылке, с прокси и без. Если остановить или
-переключить трек раньше, недокачанное удаляется: неполных файлов в кеше нет.
-Пока трек загружается, перемотка работает в пределах загруженного.
+A track is fetched once: yt-dlp writes it into the cache while mpv plays what
+has arrived. As soon as the download is over, usually in tens of seconds, the
+track stays on disk, and from then on it starts at once and without a network,
+in the interface and for `play` with a link, with a proxy and without. If you
+stop or change the track sooner, what had arrived is removed: there are no
+incomplete files in the cache. While a track is being fetched, seeking works
+within what has arrived.
 
-Чтобы подготовиться к работе без сети, в интерфейсе нажмите `d` на треке или
-`D` — на всём списке, например на библиотеке: треки загрузятся в кеш по одному,
-не прерывая музыку. Всё сохранённое видно в библиотеке (`2`), в том числе
-треки, которых нет в избранном: оттуда они включаются без сети, а `x` удаляет
-трек из кеша. Заголовок библиотеки показывает, сколько треков в кеше и сколько
-они занимают. Поиск без сети недоступен. В командной строке работает
-`clicloud play` со ссылкой на сохранённый трек.
+To get ready for a time without a network, press `d` on a track in the
+interface, or `D` on a whole list, the library for one: the tracks are stored
+one at a time without interrupting the music. All that is stored shows in the
+library (`2`), tracks that are not favorites included: from there they play
+without a network, and `x` removes a track from the cache. The title of the
+library says how many tracks are stored and how much they take. There is no
+search without a network. On the command line `clicloud play` with a link to a
+stored track works.
 
-Сохраняются только отдельные треки. Ссылка на плейлист, профиль или короткая
-ссылка `on.soundcloud.com` проигрывается как раньше, без сохранения.
+Only single tracks are stored. A link to a playlist or a profile, and a short
+`on.soundcloud.com` link, play as before, without being stored.
 
-Кеш лежит в `$XDG_CACHE_HOME/clicloud` или `~/.cache/clicloud`:
+The cache is in `$XDG_CACHE_HOME/clicloud` or `~/.cache/clicloud`:
 
-- `audio/` — треки в том виде, в каком их отдаёт SoundCloud (обычно AAC или
-  MP3), с именами вида `исполнитель.трек`;
-- `yt-dlp/` — служебные данные yt-dlp. С ними он не запрашивает у SoundCloud
-  идентификатор клиента перед каждым поиском и треком, и те начинаются на
-  несколько секунд быстрее. Кеш yt-dlp в домашнем каталоге не используется;
-- `tracks/` — название, исполнитель и длительность каждого трека для
-  библиотеки, как их сообщил yt-dlp при загрузке; если он их не сообщил, трек,
-  сохранённый командой `play` по ссылке, называется по этой ссылке;
-- `art/` и `info/` — обложки и сведения о треках для вкладки трека: обложка -
-  квадрат 128×128 точек, около 48 КБ на трек. В предел размера кеша они не
-  входят;
-- `partial/` — текущие загрузки.
+- `audio/`: the tracks as SoundCloud hands them out (usually AAC or MP3), named
+  `artist.track`;
+- `yt-dlp/`: what yt-dlp keeps for itself. With it yt-dlp does not ask
+  SoundCloud for the client id before every search and track, and those start
+  a few seconds sooner. The cache of yt-dlp in your home directory is not
+  used;
+- `tracks/`: the title, the artist and the length of every track for the
+  library, as yt-dlp told them when it fetched the track; where it did not, a
+  track stored by `play` with a link is named after that link;
+- `art/` and `info/`: the covers and what is known of the tracks, for the tab
+  of the track. A cover is a square of 128×128 pixels, about 48 KB a track.
+  They do not count toward the limit of the cache;
+- `partial/`: the downloads that run now.
 
-По умолчанию аудио занимает не больше 1024 МБ: когда места не хватает,
-удаляются треки, которые дольше всего не включались. Настройки — в том же
-`config.json`, что и прокси:
+By default the audio takes no more than 1024 MB: when there is no room left,
+the tracks that were played longest ago are removed. The settings are in the
+same `config.json` as the proxy:
 
 ```json
 {
@@ -484,29 +511,30 @@ Windows Terminal.
 }
 ```
 
-`cache_limit_mb: 0` снимает ограничение. Каталог можно задать и флагом
-`--cache-dir` или переменной `CLICLOUD_CACHE_DIR`; он должен быть пустым или
-уже принадлежать clicloud (тот помечает его файлом `CACHEDIR.TAG`) — каталог с
-чужими файлами клиент не займёт и ничего в нём не удалит. `--no-cache` или
-`CLICLOUD_NO_CACHE=1` отключают кеш целиком: на диск ничего не пишется, mpv
-получает поток сам, как описано в разделе о прокси.
+`cache_limit_mb: 0` lifts the limit. The directory can also be given with the
+`--cache-dir` flag or the `CLICLOUD_CACHE_DIR` variable; it must be empty or
+belong to clicloud already, which marks it with a `CACHEDIR.TAG` file. The
+client does not take a directory with someone else's files and removes nothing
+in it. `--no-cache` or `CLICLOUD_NO_CACHE=1` switches the cache off altogether:
+nothing is written to disk, and mpv fetches the stream itself, as described
+under the proxy.
 
 ```sh
-clicloud cache          # где лежит кеш и сколько занимает
-clicloud cache --clear  # удалить аудио и данные yt-dlp
+clicloud cache          # where the cache is and how much it takes
+clicloud cache --clear  # remove the audio and the data of yt-dlp
 ```
 
-## Прокси и Tor
+## Proxy and Tor
 
-Разовый запуск через уже работающий Tor (SOCKS на `127.0.0.1:9050`):
+One run through a Tor that is already running (SOCKS on `127.0.0.1:9050`):
 
 ```sh
 cargo run -- --tor search "burial"
 cargo run -- --tor play "burial"
 ```
 
-Tor запускается отдельно; clicloud не устанавливает и не запускает его.
-Для Tor Browser используйте порт его SOCKS-прокси, обычно 9150:
+Tor is started separately; clicloud neither installs nor starts it. For Tor
+Browser use the port of its SOCKS proxy, usually 9150:
 
 ```sh
 cargo run -- --proxy socks5h://127.0.0.1:9150 play "burial"
@@ -514,8 +542,8 @@ cargo run -- --proxy http://127.0.0.1:8080 search "ambient"
 cargo run -- --no-proxy play "ambient"
 ```
 
-Постоянные настройки: `$XDG_CONFIG_HOME/clicloud/config.json`, если переменная
-задана, иначе `~/.config/clicloud/config.json`. Содержимое:
+Lasting settings: `$XDG_CONFIG_HOME/clicloud/config.json` if the variable is
+set, otherwise `~/.config/clicloud/config.json`. Its content:
 
 ```json
 {
@@ -524,54 +552,56 @@ cargo run -- --no-proxy play "ambient"
 }
 ```
 
-Чтобы отключить настройку, измените `proxy_enabled` на `false` или переключите
-прокси в настройках интерфейса (`o`).
-В репозитории есть `config.example.json`; можно попробовать без копирования:
+To switch the setting off, change `proxy_enabled` to `false` or switch the
+proxy in the settings of the interface (`o`). The repository has a
+`config.example.json`, which can be tried without copying it:
 
 ```sh
 cargo run -- --config config.example.json search "ambient"
 ```
 
-Поддерживаются HTTP, HTTPS, SOCKS5 и SOCKS5h, для SOCKS укажите порт.
-Для Tor используется SOCKS5h: имена серверов разрешаются через прокси.
-Альтернативы файлу: `CLICLOUD_PROXY` и `CLICLOUD_CONFIG`.
-Приоритет: `--no-proxy` → `--tor` → `--proxy` → `CLICLOUD_PROXY` → файл.
-Флаги `--tor` и `--no-proxy` несовместимы. Без собственной настройки
-сохраняется стандартное поведение внешних программ относительно системных
-переменных прокси; `--no-proxy` принудительно выбирает прямое соединение.
+HTTP, HTTPS, SOCKS5 and SOCKS5h are supported; SOCKS needs a port. Tor uses
+SOCKS5h: the names of servers are resolved through the proxy. In place of the
+file there are `CLICLOUD_PROXY` and `CLICLOUD_CONFIG`. The order is
+`--no-proxy` → `--tor` → `--proxy` → `CLICLOUD_PROXY` → the file. `--tor` and
+`--no-proxy` cannot be used together. With no setting of its own the client
+leaves the external programs to do what they do with the system's proxy
+variables; `--no-proxy` forces a direct connection.
 
-Отдельный трек всегда загружает yt-dlp — с заданным прокси, а без него с
-прокси из `HTTPS_PROXY` и `ALL_PROXY`, включая SOCKS. mpv получает байты, а не
-сетевую ссылку, поэтому ограничения SOCKS у mpv/FFmpeg его не касаются. При
-ошибке прокси клиент не переключается на прямое соединение.
+A single track is always fetched by yt-dlp, through the proxy that is set, and
+without one through the proxy from `HTTPS_PROXY` and `ALL_PROXY`, SOCKS
+included. mpv gets bytes, not a network address, so the limits of SOCKS in mpv
+and FFmpeg do not concern it. When the proxy fails the client does not fall
+back to a direct connection.
 
-Плейлист, а с `--no-cache` и любой трек проигрывается по-старому. С заданным
-прокси yt-dlp передаёт аудио в mpv через pipe; перемотка ограничена буфером,
-а ссылка на плейлист воспроизводит только первый трек. Без заданного прокси
-mpv получает поток сам через встроенный хук yt-dlp. yt-dlp читает
-`HTTPS_PROXY` и `ALL_PROXY`, а FFmpeg внутри mpv — только `http_proxy`, поэтому
-HTTP-прокси из этих переменных clicloud передаёт mpv явно: иначе адрес потока
-искался бы через прокси, а сам поток шёл мимо него. SOCKS-прокси из окружения
-mpv использовать не умеет; задайте его через `--proxy` или `--tor`.
-Tor может замедлить загрузку, а SoundCloud может отклонять его выходные узлы.
-Для поиска тайм-аут сетевой операции составляет 45 секунд через прокси,
-заданный в clicloud или в переменных окружения, и 15 секунд без него. Ошибка поиска открывается в отдельном окне TUI;
-её можно повторно открыть клавишей `e`, пока не начат новый поиск или трек.
+A playlist, and with `--no-cache` any track, plays the old way. With a proxy
+set, yt-dlp hands the audio to mpv through a pipe; seeking is limited to the
+buffer, and a link to a playlist plays its first track only. Without one, mpv
+fetches the stream itself through its built-in yt-dlp hook. yt-dlp reads
+`HTTPS_PROXY` and `ALL_PROXY`, while FFmpeg inside mpv reads only `http_proxy`,
+so clicloud hands an HTTP proxy from those variables to mpv explicitly:
+otherwise the address of the stream would be looked up through the proxy and
+the stream itself would go past it. mpv cannot use a SOCKS proxy from the
+environment; set it with `--proxy` or `--tor`. Tor may slow downloads, and
+SoundCloud may turn its exit nodes away. The network timeout of a search is 45
+seconds through a proxy, set in clicloud or in the environment, and 15 seconds
+without one. The error of a search opens in a window of its own, which `e`
+opens again until a new search or track is started.
 
-## Ограничения
+## Limits
 
-Это не официальный SoundCloud API. Работа зависит от текущего экстрактора
-yt-dlp; при ошибках сначала обновите его (`pipx upgrade yt-dlp`). Наличие
-результата поиска не гарантирует воспроизведение: приватные, платные,
-удалённые и недоступные в регионе треки могут выдавать ошибку или превью.
-Вход в аккаунт и синхронизация с библиотекой SoundCloud не поддерживаются:
-перенос только добавляет в избранное лайки, видимые в профиле.
-Кеш хранит треки в исходном виде и без тегов; это не экспорт коллекции.
-С `--no-cache` аудио на диск не сохраняется: mpv буферизует поток, а в режиме
-прокси yt-dlp держит текущий фрагмент во временном каталоге клиента, который
-удаляется при завершении.
+This is not the official SoundCloud API. It depends on the current extractor
+of yt-dlp; when something fails, update that first (`pipx upgrade yt-dlp`). A
+search result is no promise of playback: private, paid, deleted and
+region-locked tracks may give an error or a preview. Signing in to an account
+and synchronizing with a SoundCloud library are not supported: bringing likes
+over only adds the likes that are visible in a profile to the favorites. The
+cache keeps tracks as they come and without tags; it is not an export of a
+collection. With `--no-cache` no audio is written to disk: mpv buffers the
+stream, and in proxy mode yt-dlp keeps the current fragment in a temporary
+directory of the client, which is removed at the end.
 
-## Проверки
+## Checks
 
 ```sh
 cargo fmt --check
@@ -581,24 +611,26 @@ cargo build --locked
 python3 tests/tui_smoke.py
 ```
 
-Интеграционные тесты на Unix используют подставные внешние программы и
-не требуют сети или аудиоустройства. Реальный поиск проверяется отдельно:
+The integration tests on Unix use stand-ins for the external programs and need
+neither a network nor an audio device. A real search is checked separately:
 `clicloud search "ambient" --limit 3`.
 
-`cargo test` проходит и в Windows: подставные программы там - батники, а
-плеер, отвечающий по именованному каналу, написан на PowerShell. Набор
-`tests/cli.rs` остаётся на Unix: он держится на shell-скриптах.
+`cargo test` passes on Windows too: the stand-ins there are batch files, and
+the player that answers on a named pipe is written in PowerShell. The
+`tests/cli.rs` suite stays on Unix: it rests on shell scripts.
 
-`tui_smoke.py` запускает настоящий TUI в PTY с подставными yt-dlp и mpv,
-проверяет поиск, сохранение избранного, IPC-команды плеера, сохранение трека
-в кеш, повторный запуск из него и удаление, запись настройки в файл, перенос
-лайков профиля из настроек,
-восстановление терминала в обычном режиме и
-с прокси, а также остановку mpv по SIGTERM. Нужны Python 3 и разрешение на
-локальные Unix-сокеты; интернет и аудиоустройство не нужны.
+`tui_smoke.py` runs the real TUI in a PTY with stand-ins for yt-dlp and mpv. It
+checks the search, the saving of favorites, the commands sent to the player,
+the storing of a track in the cache, playing it again from there and removing
+it, the writing of a setting to the file, bringing over the likes of a profile
+from the settings, the restoring of the terminal with and without a proxy, the
+stopping of mpv on SIGTERM, and that the interface ends when its terminal is
+closed. It needs Python 3 and permission for local Unix sockets; neither the
+internet nor an audio device.
 
-Встроенные цветовые схемы — копии тем из поставки Ghostty, которые он берёт
-из набора iTerm2-Color-Schemes (MIT); подробности в `themes/README.md`.
+The built-in color schemes are copies of the themes that ship with Ghostty,
+which takes them from the iTerm2-Color-Schemes collection (MIT); see
+`themes/README.md`.
 
-Документация: [yt-dlp](https://github.com/yt-dlp/yt-dlp),
+Documentation: [yt-dlp](https://github.com/yt-dlp/yt-dlp),
 [mpv](https://mpv.io/manual/stable/).
