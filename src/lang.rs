@@ -1019,13 +1019,23 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("Скорость: x{}", "Speed: x{}", "速度: x{}"),
     ("Обложка", "Cover", "ジャケット"),
     (
-        "Enter или Left/Right - как рисовать обложку на вкладке трека (t):\nблоками или точками Брайля, в её цветах или в тонах схемы.",
-        "Enter or Left/Right - how the tab of the track (t) draws the cover:\nblocks or Braille dots, in its own colors or in tones of the scheme.",
-        "Enter か Left/Right - 曲のタブ (t) でのジャケットの描き方:\nブロックか点字、元の色か配色の濃淡で描きます。",
+        "Enter или Left/Right - как рисовать обложку на вкладке трека (t):\nблоками или точками Брайля; в её цветах, в цветах или в тонах схемы.",
+        "Enter or Left/Right - how the tab of the track (t) draws the cover:\nblocks or Braille dots; its own colors, the scheme's colors, tones.",
+        "Enter か Left/Right - 曲のタブ (t) でのジャケットの描き方:\nブロックか点字; 元の色、配色の色、配色の濃淡のいずれか。",
     ),
     ("цветные блоки", "colored blocks", "カラーのブロック"),
     ("цветной брайль", "colored Braille", "カラーの点字"),
     ("блоки в тонах", "blocks in tones", "濃淡のブロック"),
+    (
+        "блоки в цветах схемы",
+        "blocks in scheme colors",
+        "配色のブロック",
+    ),
+    (
+        "брайль в цветах схемы",
+        "Braille in scheme colors",
+        "配色の点字",
+    ),
     ("брайль в тонах", "Braille in tones", "濃淡の点字"),
     (" ТРЕК ", " TRACK ", " 曲 "),
     ("Списки", "Lists", "一覧"),
@@ -1059,6 +1069,17 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Tracks in the queue from the last time: {}. n - play",
         "前回のキューに {} 曲あります。n - 再生",
     ),
+    (
+        "Enter - узнать версию; если yt-dlp скачан клиентом, взять свежий.\nПоставленный иначе обновляется тем же способом, что ставился.",
+        "Enter - ask its version; one the client fetched is fetched anew.\nOne installed another way is updated the way it was installed.",
+        "Enter - バージョンを確認; クライアントが取得したものは更新します。\nほかの方法で入れたものは、その方法で更新してください。",
+    ),
+    (
+        "{}, поставлен не клиентом",
+        "{}, not installed by the client",
+        "{}、クライアント以外が導入",
+    ),
+    ("обновлён: {}", "updated: {}", "更新しました: {}"),
 ];
 
 #[cfg(test)]
