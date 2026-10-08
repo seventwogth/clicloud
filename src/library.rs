@@ -14,6 +14,9 @@ use std::{
 pub struct Library {
     pub favorites: Vec<Track>,
     pub recent: Vec<Track>,
+    /// What was to play when the interface was last closed: the track it stopped at,
+    /// then what was ahead of it.
+    pub queue: Vec<Track>,
 }
 
 /// What became of the tracks that were offered to the favorites.
@@ -154,6 +157,7 @@ mod tests {
         let library = |favorites: &[&str], recent: &[&str]| Library {
             favorites: favorites.iter().map(|name| track(&url(name))).collect(),
             recent: recent.iter().map(|name| track(&url(name))).collect(),
+            queue: vec![],
         };
         let listed = |tracks: &[Track]| -> Vec<String> {
             (tracks.iter())
@@ -182,6 +186,7 @@ mod tests {
         let mut library = Library {
             favorites: vec![track("https://soundcloud.com/a/kept")],
             recent: vec![track("https://soundcloud.com/a/played")],
+            queue: vec![],
         };
         let merged = library.merge([
             track("https://soundcloud.com/b/new"),

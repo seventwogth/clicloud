@@ -1054,6 +1054,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     ("ждём обложку", "cover is coming", "読み込み中..."),
     ("обложки нет", "no cover", "ジャケットなし"),
+    (
+        "С прошлого раза в очереди треков: {}. n - включить",
+        "Tracks in the queue from the last time: {}. n - play",
+        "前回のキューに {} 曲あります。n - 再生",
+    ),
 ];
 
 #[cfg(test)]
