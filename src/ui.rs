@@ -239,6 +239,14 @@ const REPEATS: [(&str, Repeat); 3] = [
     ("one", Repeat::One),
 ];
 
+// Whether the link of an entry leads to a list of tracks and not to one of them.
+fn leads_to_list(url: &str) -> bool {
+    matches!(
+        soundcloud::page(url),
+        Some((soundcloud::Page::Set | soundcloud::Page::Listing, _))
+    )
+}
+
 /// `tracks` in an order of chance. The standard library hands out no random numbers,
 /// but the hasher that hash maps seed from the system does.
 fn shuffled(mut tracks: Vec<Track>) -> Vec<Track> {
@@ -253,6 +261,9 @@ fn shuffled(mut tracks: Vec<Track>) -> Vec<Track> {
     tracks
 }
 
+// The most that is taken of a list behind a link: a playlist costs a request for each
+// of its tracks, and a profile may have thousands.
+const LIST_LIMIT: u16 = 500;
 // A failed track must not stop the queue, but a dead network must not drain it either.
 const SKIP_LIMIT: u8 = 3;
 #[derive(Clone, Copy)]
@@ -349,8 +360,10 @@ struct App {
     results: Vec<Track>,
     // What a search has already answered this run, and the question the list answers.
     // Asking it again is how a search is repeated, so that is never served from here.
-    searched: HashMap<(String, u8), Vec<Track>>,
-    shown: Option<(String, u8)>,
+    searched: HashMap<(String, u16), Vec<Track>>,
+    shown: Option<(String, u16)>,
+    // The questions whose lists were shown before the current one, for the way back.
+    trail: Vec<String>,
     queue: VecDeque<Track>,
     // What plays when the queue is empty: the rest of the list the current track was
     // started from, in the order it will play, and that whole list to go round again.
@@ -424,6 +437,7 @@ impl App {
             results: vec![],
             searched: HashMap::new(),
             shown: None,
+            trail: vec![],
             queue: VecDeque::new(),
             ahead: VecDeque::new(),
             source: vec![],
@@ -512,8 +526,16 @@ impl App {
             Some(index) => self.ahead.remove(index),
         }
     }
-    // The track at `index` of `list` is about to play: the rest of the list follows it.
+    // The track at `index` of `list` is about to play: the rest of the list follows it,
+    // but for the playlists that a page lists among its tracks.
     fn follow(&mut self, list: Vec<Track>, index: usize) {
+        let chosen = list[index].url.clone();
+        let list: Vec<Track> = (list.into_iter())
+            .filter(|track| track.url == chosen || !leads_to_list(&track.url))
+            .collect();
+        let index = (list.iter())
+            .position(|track| track.url == chosen)
+            .unwrap_or(0);
         self.ahead = if self.settings.shuffle {
             let mut rest = list.clone();
             rest.remove(index);
@@ -1073,8 +1095,22 @@ impl App {
             return;
         }
         self.last_error = None;
-        let limit = self.settings.search_limit;
+        // A link is opened as the list it leads to; anything else is searched for.
+        let link = soundcloud::page(&self.query).is_some();
+        let limit = if link {
+            LIST_LIMIT
+        } else {
+            self.settings.search_limit.into()
+        };
         let asked = (self.query.trim().to_owned(), limit);
+        if let Some((before, _)) = &self.shown
+            && *before != asked.0
+        {
+            self.trail.push(before.clone());
+            if self.trail.len() > 50 {
+                self.trail.remove(0);
+            }
+        }
         if self.shown.as_ref() != Some(&asked)
             && let Some(tracks) = self.searched.get(&asked)
         {
@@ -1114,7 +1150,7 @@ impl App {
             })
             .quiet()
             .cancellable(&cancel)
-            .stream(&query, limit, |track| {
+            .ask(&query, limit, |track| {
                 let _ = sender.send(Found::Track(track));
             })
             .map_err(|e| e.to_string());
@@ -1125,7 +1161,88 @@ impl App {
         self.filling = false;
         self.editing = false;
         self.select_view(View::Search);
-        self.message = t!("Ищем треки... Esc - отмена").into();
+        self.message = if link {
+            t!("Читаю список... Esc - отмена")
+        } else {
+            t!("Ищем треки... Esc - отмена")
+        }
+        .into();
+    }
+    // Puts a link where a question is typed and asks it: lists are opened like that.
+    fn open(&mut self, link: String) {
+        self.query = link;
+        self.search();
+    }
+    // Back to the list that was shown before this one.
+    fn back(&mut self) {
+        if self.searching {
+            self.cancel_search();
+        }
+        let Some(before) = self.trail.pop() else {
+            self.message = t!("Раньше ничего не открывалось").into();
+            return;
+        };
+        self.query = before;
+        // The list to leave is not one to come back to.
+        self.shown = None;
+        self.search();
+    }
+    // The station of the selected track: that track and what SoundCloud plays after it.
+    fn similar(&mut self) {
+        match self
+            .selected()
+            .and_then(|track| soundcloud::station(&track.url))
+        {
+            Some(station) => self.open(station),
+            None => self.message = t!("Станция есть только у отдельного трека").into(),
+        }
+    }
+    // The page of whoever published the selected track or list, at its tracks.
+    fn author(&mut self) {
+        match self
+            .selected()
+            .and_then(|track| soundcloud::owner(&track.url))
+        {
+            Some((profile, _)) => self.open(soundcloud::section(&profile, 0)),
+            None => self.message = t!("У этой ссылки нет страницы автора").into(),
+        }
+    }
+    // The profile whose page is shown and the section of it that the page is.
+    fn profile(&self) -> Option<(String, Option<usize>)> {
+        let (question, _) = self.shown.as_ref()?;
+        match soundcloud::page(question)? {
+            (soundcloud::Page::Listing, link) => soundcloud::owner(&link),
+            _ => None,
+        }
+    }
+    // The next or the previous section of the profile whose page is shown.
+    fn turn(&mut self, delta: isize) {
+        if self.view != View::Search {
+            return;
+        }
+        let Some((profile, at)) = self.profile() else {
+            return;
+        };
+        let count = soundcloud::SECTIONS.len();
+        let next = match at {
+            Some(at) => (at + count).saturating_add_signed(delta) % count,
+            None => 0,
+        };
+        self.open(soundcloud::section(&profile, next));
+    }
+    // Every track of the list that is shown joins the favorites.
+    fn favor_all(&mut self) {
+        let tracks: Vec<Track> = self.tracks().into_iter().cloned().collect();
+        let merged = self.library.merge(tracks);
+        self.message = t!(
+            "В избранное добавлено: {}, уже было: {}",
+            merged.added,
+            merged.known
+        );
+        if merged.added > 0 {
+            self.save();
+            self.list_stored();
+        }
     }
     fn cancel_search(&mut self) {
         // The worker kills yt-dlp; its late result goes nowhere.
@@ -1352,6 +1469,13 @@ impl App {
             }
             Action::Play => {
                 let index = self.table.selected().unwrap_or(0);
+                // An entry that is a playlist or a page is opened as the list it is.
+                if self.view != View::Queue
+                    && let Some(entry) = self.selected()
+                    && leads_to_list(&entry.url)
+                {
+                    return self.open(entry.url);
+                }
                 let track = if self.view == View::Queue {
                     self.take_upcoming(index)
                 } else {
@@ -1884,6 +2008,12 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     KeyCode::Char('n') => app.action(Action::Next),
                     KeyCode::Char('p') => app.action(Action::Previous),
                     KeyCode::Char('s') => app.action(Action::Stop),
+                    KeyCode::Char('m') => app.similar(),
+                    KeyCode::Char('u') => app.author(),
+                    KeyCode::Char(']') => app.turn(1),
+                    KeyCode::Char('[') => app.turn(-1),
+                    KeyCode::Char('b') => app.back(),
+                    KeyCode::Char('F') => app.favor_all(),
                     KeyCode::Char('z') => app.action(Action::Shuffle),
                     KeyCode::Char('r') => app.action(Action::Repeat),
                     KeyCode::Char('+') | KeyCode::Char('=') => app.action(Action::Louder),
@@ -2319,21 +2449,39 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(2)])
         .split(area);
-    let library;
-    let title = match app.view {
-        View::Search => t!(" РЕЗУЛЬТАТЫ "),
-        View::Library if app.cache.is_none() => t!(" МОЯ БИБЛИОТЕКА "),
-        View::Library => {
-            library = t!(
-                " МОЯ БИБЛИОТЕКА | избранное: {} | в кеше: {}, {} ",
-                app.library.favorites.len(),
-                app.stored_count,
-                megabytes(app.stored_size)
+    let (library, author);
+    let title = match (app.view, app.profile()) {
+        // A page of a profile says whose it is and which of its sections.
+        (View::Search, Some((profile, Some(section)))) => {
+            let sections = [
+                t!("треки"),
+                t!("альбомы"),
+                t!("плейлисты"),
+                t!("репосты"),
+                t!("лайки"),
+            ];
+            author = t!(
+                " АВТОР {} | {} | [ ] - раздел ",
+                clean(&profile),
+                sections[section]
             );
-            &library
+            &author
         }
-        View::Queue => t!(" ОЧЕРЕДЬ ВОСПРОИЗВЕДЕНИЯ "),
-        View::Recent => t!(" НЕДАВНИЕ "),
+        _ => match app.view {
+            View::Search => t!(" РЕЗУЛЬТАТЫ "),
+            View::Library if app.cache.is_none() => t!(" МОЯ БИБЛИОТЕКА "),
+            View::Library => {
+                library = t!(
+                    " МОЯ БИБЛИОТЕКА | избранное: {} | в кеше: {}, {} ",
+                    app.library.favorites.len(),
+                    app.stored_count,
+                    megabytes(app.stored_size)
+                );
+                &library
+            }
+            View::Queue => t!(" ОЧЕРЕДЬ ВОСПРОИЗВЕДЕНИЯ "),
+            View::Recent => t!(" НЕДАВНИЕ "),
+        },
     };
     let tracks = app.tracks();
     let selected = tracks.get(app.table.selected().unwrap_or(0)).copied();
@@ -2410,8 +2558,13 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                     },
                     Cell::from(clean(&track.title)),
                     Cell::from(clean(&track.artist)).style(theme.muted),
-                    Cell::from(track.duration.map(time).unwrap_or_else(|| "-".into()))
-                        .style(theme.muted),
+                    // A playlist among the tracks has no length: Enter goes into it.
+                    Cell::from(match track.duration {
+                        Some(duration) => time(duration),
+                        None if leads_to_list(&track.url) => ">>".into(),
+                        None => "-".into(),
+                    })
+                    .style(theme.muted),
                     mark(favorite, "*", theme.favorite),
                     if !stored && app.fetching(&track.url) {
                         Cell::from("~").style(theme.waiting)
@@ -2757,7 +2910,7 @@ fn draw_player(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame, theme: &Theme, size: Rect) {
-    let modal_area = Rect::new(size.width / 2 - 32, size.height / 2 - 11, 64, 22);
+    let modal_area = Rect::new(size.width / 2 - 32, size.height / 2 - 12, 64, 24);
     frame.render_widget(Clear, modal_area);
     let keys = [
         ("/", t!("Поиск (Enter отправляет, Esc отменяет)")),
@@ -2773,6 +2926,8 @@ fn draw_help(frame: &mut Frame, theme: &Theme, size: Rect) {
         ("Space", t!("Пауза / продолжить")),
         ("p / n", t!("Предыдущий / следующий трек")),
         ("z / r", t!("Вперемешку / повтор: нет, список, трек")),
+        ("m / u", t!("Похожие треки / автор   [ ]  Его разделы")),
+        ("F / b", t!("Весь список в избранное / назад к списку")),
         ("Left / Right", t!("Перемотка")),
         ("- / +", t!("Громкость    s  Стоп    q  Выход")),
         ("o", t!("Настройки и цветовые схемы")),
@@ -3533,6 +3688,147 @@ mod tests {
         }
     }
 
+    // Lets the search that runs come to its end.
+    fn settle(app: &mut App) {
+        for _ in 0..3000 {
+            app.tick();
+            if !app.searching {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the search did not end");
+    }
+
+    #[test]
+    fn links_open_as_lists_to_go_through_and_back() {
+        // What yt-dlp would answer for each page; a playlist tells all of every track.
+        let program = script(
+            "pages",
+            r#"case "$*" in
+*"--flat-playlist"*"/stations/track/test/night")
+  echo '{"title":"Night","url":"https://soundcloud.com/test/night"}'
+  echo '{"title":"Far","url":"https://soundcloud.com/other/far"}';;
+*"--flat-playlist"*"/other/tracks")
+  echo '{"title":"Far","url":"https://soundcloud.com/other/far"}'
+  echo '{"title":"Near","url":"https://soundcloud.com/other/near"}';;
+*"--flat-playlist"*"/other/albums")
+  echo '{"title":"Album","url":"https://soundcloud.com/other/sets/album"}';;
+*"soundcloud:formats=none"*"/other/sets/album")
+  echo '{"title":"First","uploader":"Other","duration":61,"webpage_url":"https://soundcloud.com/other/first"}'
+  echo '{"title":"Second","uploader":"Other","duration":62,"webpage_url":"https://soundcloud.com/other/second"}';;
+*) echo "ERROR: unexpected $*" >&2; exit 1;;
+esac"#,
+        );
+        let path = std::env::temp_dir().join(format!("clicloud-pages-{}.json", std::process::id()));
+        let mut app = app(path.clone());
+        app.yt_dlp = program.to_string_lossy().into_owned();
+        app.mpv = "clicloud-no-such-program".into();
+        let titles = |app: &App| -> Vec<String> {
+            app.results
+                .iter()
+                .map(|track| track.title.clone())
+                .collect()
+        };
+
+        // `m` opens the station of the selected track: the link is asked like a question.
+        app.table.select(Some(0));
+        app.similar();
+        assert_eq!(
+            app.query,
+            "https://soundcloud.com/stations/track/test/night"
+        );
+        assert_eq!(app.message, "Читаю список... Esc - отмена");
+        settle(&mut app);
+        assert_eq!(titles(&app), ["Night", "Far"]);
+        assert_eq!(app.results[1].artist, "other");
+        assert!(screen(&mut app, 80, 30).contains(" РЕЗУЛЬТАТЫ "));
+
+        // `u` goes to whoever made the selected track, and the brackets through the
+        // sections of that profile.
+        app.table.select(Some(1));
+        app.author();
+        settle(&mut app);
+        assert_eq!(
+            (app.query.as_str(), titles(&app)),
+            (
+                "https://soundcloud.com/other/tracks",
+                vec!["Far".to_owned(), "Near".to_owned()]
+            )
+        );
+        assert!(screen(&mut app, 80, 30).contains(" АВТОР other | треки | [ ] - раздел "));
+        app.turn(1);
+        settle(&mut app);
+        assert_eq!(titles(&app), ["Album"]);
+        let text = screen(&mut app, 80, 30);
+        assert!(
+            text.contains(" АВТОР other | альбомы ") && text.contains(">>"),
+            "{text}"
+        );
+
+        // Enter on a playlist goes into it instead of playing it.
+        app.table.select(Some(0));
+        app.action(Action::Play);
+        assert!(app.current.is_none() && app.searching);
+        settle(&mut app);
+        assert_eq!(titles(&app), ["First", "Second"]);
+        assert_eq!(
+            (app.results[0].artist.as_str(), app.results[0].duration),
+            ("Other", Some(61.0))
+        );
+
+        // `F` keeps all of the list; a playlist among tracks is not a favorite track.
+        app.favor_all();
+        assert_eq!(app.message, "В избранное добавлено: 2, уже было: 0");
+        assert_eq!(library::load(&path).unwrap().favorites.len(), 2);
+        app.favor_all();
+        assert_eq!(app.message, "В избранное добавлено: 0, уже было: 2");
+
+        // `b` goes back the way that was come, without asking again.
+        app.yt_dlp = "clicloud-no-such-program".into();
+        for (link, list) in [
+            ("https://soundcloud.com/other/albums", vec!["Album"]),
+            ("https://soundcloud.com/other/tracks", vec!["Far", "Near"]),
+            (
+                "https://soundcloud.com/stations/track/test/night",
+                vec!["Night", "Far"],
+            ),
+        ] {
+            app.back();
+            assert!(!app.searching, "{link}");
+            assert_eq!(
+                (app.query.as_str(), titles(&app)),
+                (link, list.iter().map(|t| t.to_string()).collect())
+            );
+        }
+        // The list the run began with was not asked for, so it cannot be come back to.
+        app.back();
+        assert_eq!(app.message, "Раньше ничего не открывалось");
+
+        // A list that plays on leaves out the playlists that stand among its tracks.
+        app.results = vec![
+            numbered(1),
+            Track {
+                url: "https://soundcloud.com/other/sets/album".into(),
+                duration: None,
+                ..numbered(2)
+            },
+            numbered(3),
+        ];
+        app.follow(app.results.clone(), 0);
+        assert_eq!((app.ahead.len(), app.source.len()), (1, 2));
+        assert_eq!(app.ahead[0].title, "Title 3");
+        // Nothing but a single track has a station, and a station has no author.
+        app.select_view(View::Search);
+        app.table.select(Some(1));
+        app.similar();
+        assert_eq!(app.message, "Станция есть только у отдельного трека");
+        drop(app);
+        for file in [path, program] {
+            fs::remove_file(file).unwrap();
+        }
+    }
+
     #[test]
     fn a_list_plays_on_from_the_track_that_was_started() {
         let player = script("order-player", "exec sleep 30");
@@ -4019,7 +4315,7 @@ mod tests {
     #[test]
     fn the_list_fills_while_the_search_is_still_running() {
         let mut app = app(PathBuf::new());
-        let limit = app.settings.search_limit;
+        let limit = u16::from(app.settings.search_limit);
         let found = |title: &str| {
             Found::Track(Track {
                 title: title.into(),
@@ -4068,7 +4364,7 @@ mod tests {
         let mut app = app(PathBuf::new());
         // No search of this test may reach the network, whatever is installed here.
         app.yt_dlp = "clicloud-no-such-program".into();
-        let limit = app.settings.search_limit;
+        let limit = u16::from(app.settings.search_limit);
         let kept = vec![
             Track {
                 title: "One".into(),
@@ -4100,7 +4396,7 @@ mod tests {
 
         // A question with another limit is another question.
         app.shown = None;
-        app.settings.search_limit = limit + 1;
+        app.settings.search_limit += 1;
         app.search();
         assert!(app.searching);
         app.cancel_search();
