@@ -4711,7 +4711,13 @@ exit /b 1"#,
     fn the_next_track_is_fetched_ahead_and_the_player_goes_on_to_it() {
         let root = std::env::temp_dir().join(format!("clicloud-ahead-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let extractor = script("ahead-fetch", "printf audio", "<nul set /p =audio");
+        // `set /p` writes without a line break and leaves a status of failure behind,
+        // having read nothing: the exit says how the download went.
+        let extractor = script(
+            "ahead-fetch",
+            "printf audio",
+            "<nul set /p =audio\nexit /b 0",
+        );
         let player = idle("ahead-player");
         let library = root.with_extension("json");
         let mut app = app(library.clone());
