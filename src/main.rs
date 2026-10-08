@@ -342,7 +342,10 @@ fn run(cli: Cli) -> Result<()> {
                 &url,
                 found.as_ref(),
                 cache.as_ref(),
-                settings.sound(),
+                player::Sound {
+                    plugin: player::media_keys(&settings.media_keys).as_deref(),
+                    ..settings.sound()
+                },
             )?;
         }
         Action::Import {

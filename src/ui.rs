@@ -128,11 +128,12 @@ enum Setting {
     Volume,
     Normalize,
     Device,
+    MediaKeys,
     Extractor,
     Likes,
 }
 
-const SETTINGS: [Setting; 15] = [
+const SETTINGS: [Setting; 16] = [
     Setting::Theme,
     Setting::Backdrop,
     Setting::Cover,
@@ -146,6 +147,7 @@ const SETTINGS: [Setting; 15] = [
     Setting::Volume,
     Setting::Normalize,
     Setting::Device,
+    Setting::MediaKeys,
     Setting::Extractor,
     Setting::Likes,
 ];
@@ -167,6 +169,7 @@ impl Setting {
             Self::Volume => t!("Громкость при запуске"),
             Self::Normalize => t!("Ровная громкость"),
             Self::Device => t!("Аудиоустройство"),
+            Self::MediaKeys => t!("Медиаклавиши"),
             Self::Extractor => "yt-dlp",
             Self::Likes => t!("Лайки SoundCloud"),
         }
@@ -222,6 +225,11 @@ impl Setting {
             Self::Device => {
                 t!(
                     "Enter или Left/Right - следующее из устройств, что видит mpv.\nавто оставляет выбор за ним. Действует сразу."
+                )
+            }
+            Self::MediaKeys => {
+                t!(
+                    "Enter - включить или выключить: пауза, стоп и соседние треки с\nклавиатуры и из панели, через плагин mpv-mpris. Со следующего трека."
                 )
             }
             Self::Extractor => {
@@ -434,6 +442,8 @@ struct App {
     page_job: Option<(String, String, mpsc::Receiver<Page>)>,
     // The picture that was last drawn, as cells.
     drawn: Option<(String, u16, u16, Mode, String, Vec<cover::Cell>)>,
+    // The plugin that lets the media keys of the desktop reach mpv, where it is used.
+    plugin: Option<PathBuf>,
     // A newer yt-dlp on its way, and what the line of the settings says of the last
     // look at the one there is.
     update: Option<mpsc::Receiver<std::result::Result<PathBuf, String>>>,
@@ -467,6 +477,7 @@ impl App {
     fn new(session: Session, library_path: PathBuf, library: Library) -> Self {
         // What was to play the last time waits to be played now.
         let waiting: VecDeque<Track> = library.queue.iter().cloned().collect();
+        let plugin = player::media_keys(&session.settings.media_keys);
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
             worker: None,
@@ -532,6 +543,7 @@ impl App {
             page_job: None,
             drawn: None,
             broken: Default::default(),
+            plugin,
             update: None,
             updated: None,
             devices: vec![],
@@ -843,6 +855,11 @@ impl App {
                     .find(|(name, described)| name == device && !described.is_empty())
                     .map_or_else(|| device.clone(), |(_, described)| described.clone()),
             },
+            Setting::MediaKeys => match (&self.plugin, self.settings.media_keys.as_str()) {
+                (_, "off" | "none" | "") => switch(false),
+                (Some(plugin), _) => t!("вкл: {}", clean(&plugin.to_string_lossy())),
+                (None, _) => t!("вкл, но плагин mpv-mpris не найден").into(),
+            },
             Setting::Extractor => match (&self.update, &self.updated) {
                 (Some(_), _) => t!("Скачиваю и проверяю...").into(),
                 (None, Some(said)) => said.clone(),
@@ -1008,6 +1025,11 @@ impl App {
                 self.settings.volume = step(u64::from(self.settings.volume), 5, 100) as u8;
             }
             Setting::Normalize => self.settings.normalize = !self.settings.normalize,
+            Setting::MediaKeys => {
+                let off = matches!(self.settings.media_keys.as_str(), "off" | "none" | "");
+                self.settings.media_keys = if off { "auto" } else { "off" }.into();
+                self.plugin = player::media_keys(&self.settings.media_keys);
+            }
             Setting::Device => {
                 // mpv is asked once what it can play on; its own choice is the first.
                 if self.devices.is_empty() {
@@ -1465,7 +1487,10 @@ impl App {
             self.extractor(),
             &track,
             self.cache.as_ref(),
-            self.settings.sound(),
+            player::Sound {
+                plugin: self.plugin.as_deref(),
+                ..self.settings.sound()
+            },
             self.volume,
             self.speed,
         ) {
@@ -2162,12 +2187,32 @@ impl App {
             }
             self.volume = player.volume;
             let (advanced, astray) = (player.advanced(), player.astray());
+            let (wandered, halted) = (player.wandered(), player.halted());
             let outcome = match result {
                 Ok(over) => Ok(over),
                 Err(error) => Err((error.to_string(), player.details())),
             };
+            // The media keys of the desktop reach mpv, not the client: stopped by
+            // them, it is gone, and no track has failed.
+            if halted {
+                self.player = None;
+                self.message = t!("Воспроизведение остановлено").into();
+                return;
+            }
             if advanced {
                 self.advanced();
+                if let (Some(player), Some(track)) = (&mut self.player, &self.current) {
+                    player.name(track);
+                }
+            }
+            // Sent back by them, it plays a file of its own choosing: the track before
+            // is started the way the key for it would, or the current one again.
+            if wandered {
+                return match (self.previous.is_empty(), self.current.clone()) {
+                    (false, _) => self.action(Action::Previous),
+                    (true, Some(track)) => self.start(track),
+                    (true, None) => (),
+                };
             }
             if astray && let Some(track) = self.current.clone() {
                 // It plays what was to follow before that was changed: start over.
@@ -4598,6 +4643,42 @@ esac"#,
             fs::remove_file(file).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_media_keys_of_the_desktop_are_let_through_where_the_plugin_is() {
+        let mut app = app(PathBuf::new());
+        app.setting = SETTINGS
+            .iter()
+            .position(|s| *s == Setting::MediaKeys)
+            .unwrap();
+        // Wanted and not installed, which is how most machines are.
+        app.plugin = None;
+        assert_eq!(
+            app.value(Setting::MediaKeys),
+            "вкл, но плагин mpv-mpris не найден"
+        );
+        app.activate();
+        assert_eq!(
+            (
+                app.settings.media_keys.as_str(),
+                app.value(Setting::MediaKeys)
+            ),
+            ("off", "выкл".into())
+        );
+        assert!(app.plugin.is_none());
+        // A file named in the settings is the plugin, wherever it is.
+        let here = std::env::current_exe().unwrap();
+        app.settings.media_keys = here.to_string_lossy().into_owned();
+        app.plugin = player::media_keys(&app.settings.media_keys);
+        assert_eq!(
+            app.value(Setting::MediaKeys),
+            format!("вкл: {}", here.display())
+        );
+        app.adjust(1);
+        assert_eq!(app.settings.media_keys, "off");
+        app.adjust(1);
+        assert_eq!(app.settings.media_keys, "auto");
     }
 
     #[test]

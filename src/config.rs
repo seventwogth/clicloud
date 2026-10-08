@@ -41,6 +41,9 @@ pub struct Settings {
     /// The device mpv plays on, by the name it knows it by; mpv chooses without one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_device: Option<String>,
+    /// Whether the media keys of the desktop reach the player: auto uses the plugin
+    /// mpv-mpris where it is installed, off does not, anything else is its file.
+    pub media_keys: String,
     /// Whether a list plays in an order of chance.
     pub shuffle: bool,
     /// What happens at the end of a list: off, all or one.
@@ -69,6 +72,7 @@ impl Default for Settings {
             cover: "blocks".into(),
             normalize: false,
             audio_device: None,
+            media_keys: "auto".into(),
             shuffle: false,
             repeat: "off".into(),
             soundcloud_profile: None,
@@ -127,6 +131,7 @@ impl Settings {
         crate::player::Sound {
             normalize: self.normalize,
             device: self.audio_device.as_deref(),
+            plugin: None,
         }
     }
 

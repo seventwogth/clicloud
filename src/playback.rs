@@ -59,6 +59,11 @@ pub struct Playback {
     // The file mpv is to name as the one it plays now, and whether it named another.
     expected: Option<PathBuf>,
     astray: bool,
+    // What was done to mpv from outside, by the media keys of the desktop: a file was
+    // left before its end, and then mpv either went to another one or was gone.
+    interrupted: bool,
+    wandered: bool,
+    halted: bool,
 }
 
 impl Playback {
@@ -87,6 +92,9 @@ impl Playback {
             advanced: false,
             expected: None,
             astray: false,
+            interrupted: false,
+            wandered: false,
+            halted: false,
         }
     }
 
@@ -120,6 +128,11 @@ impl Playback {
             ))
             .arg(format!("--volume={volume}"))
             .arg(format!("--speed={speed}"))
+            // What the desktop shows of the player: mpv would name the file otherwise.
+            .arg(format!(
+                "--force-media-title={} - {}",
+                track.artist, track.title
+            ))
             .stdout(Stdio::null())
             .stderr(log.try_clone()?);
         if let Some(file) = cache.and_then(|cache| cache.find(url)) {
@@ -185,6 +198,23 @@ impl Playback {
     /// followed was changed in the instant it went on. Told once.
     pub fn astray(&mut self) -> bool {
         std::mem::take(&mut self.astray)
+    }
+
+    /// Whether mpv went to another file than the one that was to follow because it
+    /// was told to from outside, by the key for the track before. Told once.
+    pub fn wandered(&mut self) -> bool {
+        std::mem::take(&mut self.wandered)
+    }
+
+    /// Whether mpv was stopped from outside, and is gone.
+    pub fn halted(&self) -> bool {
+        self.halted
+    }
+
+    /// Names the track that plays for whoever asks mpv what it plays.
+    pub fn name(&mut self, track: &Track) {
+        let name = format!("{} - {}", track.artist, track.title);
+        let _ = self.send(json!(["set_property", "force-media-title", name]));
     }
 
     /// What yt-dlp has noted of the track it fetches for this player, told once.
@@ -275,6 +305,11 @@ impl Playback {
                     t!("Ошибка mpv: поток недоступен или отсутствует аудиоустройство.").into(),
                 );
             }
+            // Stopped from outside, it is not a track that failed.
+            if self.interrupted {
+                self.halted = true;
+                return Ok(false);
+            }
             if !self.eof {
                 return Err(t!("Плеер завершился до окончания трека.").into());
             }
@@ -283,17 +318,26 @@ impl Playback {
         Ok(self.eof)
     }
 
+    // mpv plays the file that was to follow: a stored one, from its start.
+    fn go_on(&mut self) {
+        self.expected = self.appended.take();
+        self.advanced = true;
+        self.origin = Origin::Cache;
+        self.noted = None;
+        self.loaded = false;
+        (self.position, self.duration, self.buffered) = (0.0, 0.0, 0.0);
+    }
+
     fn event(&mut self, event: Value) {
         match event["event"].as_str() {
             Some("file-loaded") => self.loaded = true,
             // The end of a file that another one follows is not the end of the player.
             Some("end-file") if event["reason"] == "eof" && self.appended.is_some() => {
-                self.expected = self.appended.take();
-                self.advanced = true;
-                self.origin = Origin::Cache;
-                self.noted = None;
-                self.loaded = false;
-                (self.position, self.duration, self.buffered) = (0.0, 0.0, 0.0);
+                self.go_on();
+            }
+            // Left before its end by a word from outside: what mpv does next tells which.
+            Some("end-file") if event["reason"] == "stop" || event["reason"] == "quit" => {
+                self.interrupted = true;
             }
             Some("end-file") => {
                 self.eof = event["reason"] == "eof";
@@ -330,8 +374,19 @@ impl Playback {
                 Some("volume") => self.volume = event["data"].as_f64().unwrap_or(self.volume),
                 Some("speed") => self.speed = event["data"].as_f64().unwrap_or(self.speed),
                 Some("path") => {
-                    if let (Some(path), Some(expected)) = (event["data"].as_str(), &self.expected) {
-                        self.astray = Path::new(path) != expected;
+                    let path = event["data"].as_str().map(Path::new);
+                    if let (Some(path), true) = (path, self.interrupted) {
+                        // Sent on from outside: to the file that was to follow, which
+                        // is the same as going on to it, or back to one before.
+                        self.interrupted = false;
+                        if self.appended.as_deref() == Some(path) {
+                            self.go_on();
+                            self.expected = None;
+                        } else {
+                            self.wandered = true;
+                        }
+                    } else if let (Some(path), Some(expected)) = (path, &self.expected) {
+                        self.astray = path != expected;
                         self.expected = None;
                     }
                 }
@@ -419,6 +474,22 @@ mod tests {
         player.event(ended);
         player.event(json!({"event": "property-change", "name": "path", "data": "/other"}));
         assert!(player.advanced() && player.astray() && !player.astray());
+        // The media keys of the desktop reach mpv, not the client. Sent on to the file
+        // that follows, it has gone on to it; sent back, it has wandered off.
+        let left = json!({"event": "end-file", "reason": "stop"});
+        let plays = |path: &Path| json!({"event": "property-change", "name": "path", "data": path.to_str()});
+        player.appended = Some(directory.join("next"));
+        player.event(left.clone());
+        assert!(!player.advanced());
+        player.event(plays(&directory.join("next")));
+        assert!(player.advanced() && !player.wandered() && !player.astray());
+        player.appended = Some(directory.join("after"));
+        player.event(left.clone());
+        player.event(plays(&directory.join("before")));
+        assert!(!player.advanced() && player.wandered() && !player.wandered());
+        // Stopped, it is gone without a file to go to: no track failed.
+        player.event(left);
+        assert!(player.interrupted && !player.halted());
         // A failure is still a failure, whatever follows.
         player.appended = Some(next);
         player.event(json!({"event": "end-file", "reason": "error"}));
