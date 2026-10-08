@@ -14,6 +14,51 @@ pub struct Track {
     pub url: String,
 }
 
+/// What yt-dlp tells of a track when it fetches it, which is more than the list of a
+/// profile does: there a track has a title and a link, and its maker is a guess.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Details {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub duration: Option<f64>,
+}
+
+impl Details {
+    /// The file that a download notes them in, in the directory it runs in.
+    pub const FILE: &'static str = "details.json";
+    /// What makes yt-dlp write that file: a line of JSON, with null for what it lacks.
+    pub const ARGUMENTS: [&'static str; 5] = [
+        "--output-na-placeholder",
+        "null",
+        "--print-to-file",
+        r#"{"title":%(title)j,"artist":%(uploader)j,"duration":%(duration)j}"#,
+        Self::FILE,
+    ];
+
+    /// The details noted in `directory`; None until yt-dlp has looked the track up.
+    pub fn read(directory: &Path) -> Option<Self> {
+        let text = std::fs::read(directory.join(Self::FILE)).ok()?;
+        let line = text.split(|byte| *byte == b'\n').next()?;
+        let details: Self = serde_json::from_slice(line).ok()?;
+        (details.title.is_some() || details.artist.is_some() || details.duration.is_some())
+            .then_some(details)
+    }
+
+    /// Puts what is known in place of what `track` had.
+    pub fn apply(&self, track: &mut Track) {
+        let named = |name: &Option<String>| name.clone().filter(|name| !name.trim().is_empty());
+        if let Some(title) = named(&self.title) {
+            track.title = title;
+        }
+        if let Some(artist) = named(&self.artist) {
+            track.artist = artist;
+        }
+        if let Some(duration) = self.duration.filter(|d| d.is_finite() && *d > 0.0) {
+            track.duration = Some(duration);
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct SearchResponse {
     entries: Vec<Option<Entry>>,
@@ -436,6 +481,53 @@ mod tests {
             let error = profile(input).expect_err(input).to_string();
             assert!(error.contains("раздел сайта"), "{input}: {error}");
         }
+    }
+
+    #[test]
+    fn details_of_a_download_replace_what_a_link_told() {
+        let directory =
+            std::env::temp_dir().join(format!("clicloud-details-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        assert!(Details::read(&directory).is_none());
+        let file = directory.join(Details::FILE);
+        // Nothing is known while the line is being written, or where yt-dlp knew nothing.
+        for unknown in [
+            "",
+            "{\"title\":\"Rem",
+            r#"{"title":null,"artist":null,"duration":null}"#,
+        ] {
+            std::fs::write(&file, unknown).unwrap();
+            assert!(Details::read(&directory).is_none(), "{unknown}");
+        }
+        std::fs::write(
+            &file,
+            "{\"title\":\"Remote Viewing\",\"artist\":\"low_sea\",\"duration\":196.645}\nmore\n",
+        )
+        .unwrap();
+        let details = Details::read(&directory).unwrap();
+        let mut track = Track {
+            title: "Remote Viewing".into(),
+            artist: "low sea".into(),
+            duration: None,
+            url: "https://soundcloud.com/low-sea/remote-viewing".into(),
+        };
+        details.apply(&mut track);
+        assert_eq!(
+            (track.artist.as_str(), track.duration),
+            ("low_sea", Some(196.645))
+        );
+        // What yt-dlp lacks leaves what was there.
+        let partly = Details {
+            title: Some(" ".into()),
+            artist: None,
+            duration: Some(0.0),
+        };
+        partly.apply(&mut track);
+        assert_eq!(
+            (track.title.as_str(), track.artist.as_str(), track.duration),
+            ("Remote Viewing", "low_sea", Some(196.645))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

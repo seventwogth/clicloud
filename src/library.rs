@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
 };
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Library {
     pub favorites: Vec<Track>,
@@ -48,6 +48,47 @@ impl Library {
         }
         merged
     }
+}
+
+// What makes two entries the same track: its name in the cache, or its link as it is.
+fn name(track: &Track) -> String {
+    cache::key(&track.url).unwrap_or_else(|| track.url.clone())
+}
+
+impl Library {
+    /// Takes over what another process did to the file: `base` is the file as this
+    /// one last read or wrote it, `disk` is the file now. A favorite that was added
+    /// there joins ours, one that was removed there leaves, and ours stay otherwise.
+    /// Returns whether anything changed.
+    pub fn adopt(&mut self, base: &Library, disk: &Library) -> bool {
+        let names = |tracks: &[Track]| -> HashSet<String> { tracks.iter().map(name).collect() };
+        let (before, now) = (names(&base.favorites), names(&disk.favorites));
+        let count = self.favorites.len();
+        self.favorites
+            .retain(|track| !before.contains(&name(track)) || now.contains(&name(track)));
+        let mut changed = self.favorites.len() != count;
+        let mut ours = names(&self.favorites);
+        for track in &disk.favorites {
+            if !before.contains(&name(track)) && ours.insert(name(track)) {
+                self.favorites.push(track.clone());
+                changed = true;
+            }
+        }
+        // The history is one list: whoever played last has the latest one.
+        let links = |tracks: &[Track]| -> Vec<String> { tracks.iter().map(name).collect() };
+        if links(&disk.recent) != links(&base.recent) && links(&self.recent) == links(&base.recent)
+        {
+            self.recent = disk.recent.clone();
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// What tells that the file was written since it was last looked at.
+pub fn stamp(path: &PathBuf) -> Option<(std::time::SystemTime, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 /// The library file: the given one, or the default one in the user's directory.
@@ -105,6 +146,35 @@ mod tests {
             duration: None,
             url: url.into(),
         }
+    }
+
+    #[test]
+    fn what_another_process_wrote_is_taken_over() {
+        let url = |name: &str| format!("https://soundcloud.com/a/{name}");
+        let library = |favorites: &[&str], recent: &[&str]| Library {
+            favorites: favorites.iter().map(|name| track(&url(name))).collect(),
+            recent: recent.iter().map(|name| track(&url(name))).collect(),
+        };
+        let listed = |tracks: &[Track]| -> Vec<String> {
+            (tracks.iter())
+                .map(|track| track.url.rsplit('/').next().unwrap().to_owned())
+                .collect()
+        };
+        let base = library(&["one", "two", "three"], &["one"]);
+        // Here `two` was removed and `ours` added; there `three` went and `theirs` came.
+        let mut ours = library(&["one", "three", "ours"], &["one"]);
+        let disk = library(&["one", "two", "theirs"], &["theirs", "one"]);
+        assert!(ours.adopt(&base, &disk));
+        assert_eq!(listed(&ours.favorites), ["one", "ours", "theirs"]);
+        assert_eq!(listed(&ours.recent), ["theirs", "one"]);
+        // Nothing more to take from the same file, and what was played here stays.
+        let mut played = Library {
+            recent: library(&[], &["ours", "one"]).recent,
+            ..ours.clone()
+        };
+        assert!(!ours.adopt(&disk, &disk));
+        assert!(!played.adopt(&base, &disk));
+        assert_eq!(listed(&played.recent), ["ours", "one"]);
     }
 
     #[test]

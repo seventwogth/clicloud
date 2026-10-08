@@ -1,6 +1,9 @@
 //! Audio kept on disk: a track that was played starts at once the next time and
 //! needs no network. yt-dlp keeps what it learns about SoundCloud next to it.
-use crate::{Result, soundcloud::Track};
+use crate::{
+    Result,
+    soundcloud::{Details, Track},
+};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -148,6 +151,7 @@ impl Cache {
             directory,
             target,
             details: self.details(),
+            url: url.to_owned(),
             track: None,
             limit: self.limit,
         }))
@@ -158,6 +162,13 @@ impl Cache {
         if let Some(key) = key(&track.url).filter(|_| self.contains(&track.url))
             && !self.details().join(&key).exists()
         {
+            let _ = write_details(&self.details(), &key, track);
+        }
+    }
+
+    /// Records what has become known of a stored track in place of what was recorded.
+    pub fn correct(&self, track: &Track) {
+        if let Some(key) = key(&track.url).filter(|_| self.contains(&track.url)) {
             let _ = write_details(&self.details(), &key, track);
         }
     }
@@ -216,6 +227,7 @@ pub struct Partial {
     directory: PathBuf,
     target: PathBuf,
     details: PathBuf,
+    url: String,
     track: Option<Track>,
     limit: u64,
 }
@@ -236,7 +248,21 @@ impl Partial {
     }
 
     /// Makes the finished download a part of the cache, evicting what was used longest ago.
-    pub fn commit(self) -> io::Result<()> {
+    pub fn commit(mut self) -> io::Result<()> {
+        // What yt-dlp noted of the track while fetching it outranks what was known
+        // before, and names a track that was asked for by its link alone.
+        if let Some(noted) = Details::read(&self.directory) {
+            let mut track = (self.track.take())
+                .or_else(|| named(&self.url))
+                .unwrap_or_else(|| Track {
+                    title: String::new(),
+                    artist: String::new(),
+                    duration: None,
+                    url: self.url.clone(),
+                });
+            noted.apply(&mut track);
+            self.track = Some(track).filter(|track| !track.title.is_empty());
+        }
         let path = self.path();
         if fs::metadata(&path)?.len() == 0 {
             return Err(io::Error::other("empty download"));
@@ -477,6 +503,60 @@ mod tests {
         download(&cache, "https://soundcloud.com/c/big", &[0; 12]);
         assert_eq!(cache.tracks().len(), 1);
         assert!(!root.join("tracks/b.zebra").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn what_the_download_noted_of_a_track_is_kept_with_it() {
+        let root = directory("noted");
+        let cache = Cache::open(root.clone(), 0).unwrap();
+        let note = |partial: &Partial, line: &str| {
+            fs::write(partial.directory().join(Details::FILE), line).unwrap();
+            fs::write(partial.path(), b"audio").unwrap();
+        };
+        // Asked for by its link alone, as `play` with a link does.
+        let partial = cache
+            .store("https://soundcloud.com/low-sea/one")
+            .unwrap()
+            .unwrap();
+        note(
+            &partial,
+            r#"{"title":"One","artist":"low_sea","duration":61.5}"#,
+        );
+        partial.commit().unwrap();
+        // Known from the likes of a profile: a title, and a maker guessed from the link.
+        let mut partial = cache
+            .store("https://soundcloud.com/low-sea/two")
+            .unwrap()
+            .unwrap();
+        partial.describe(&named("https://soundcloud.com/low-sea/two").unwrap());
+        note(
+            &partial,
+            r#"{"title":"Two","artist":"low_sea","duration":null}"#,
+        );
+        partial.commit().unwrap();
+
+        let tracks = cache.tracks();
+        let told: Vec<_> = (tracks.iter())
+            .map(|track| (track.title.as_str(), track.artist.as_str(), track.duration))
+            .collect();
+        assert_eq!(
+            told,
+            [("One", "low_sea", Some(61.5)), ("Two", "low_sea", None)]
+        );
+
+        // What becomes known later replaces what was recorded, for a stored track only.
+        let longer = Track {
+            duration: Some(90.0),
+            ..tracks[1].clone()
+        };
+        cache.correct(&longer);
+        assert_eq!(cache.tracks()[1].duration, Some(90.0));
+        cache.correct(&Track {
+            url: "https://soundcloud.com/low-sea/three".into(),
+            ..longer
+        });
+        assert_eq!(cache.tracks().len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 

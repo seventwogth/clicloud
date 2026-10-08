@@ -9,7 +9,7 @@ use crate::{
     playback::{self, Origin, Playback},
     player::{self, Download},
     setup,
-    soundcloud::{self, Extractor, SoundCloud, Track},
+    soundcloud::{self, Details, Extractor, SoundCloud, Track},
     theme::{self, Theme},
 };
 use crossterm::{
@@ -34,7 +34,7 @@ use std::{
     io::{self, IsTerminal},
     path::PathBuf,
     sync::mpsc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 // What the header says after the name. One of them is picked for a run; add as many
@@ -225,6 +225,34 @@ struct Picker {
     original: Theme,
 }
 
+// What happens when the list a track was started from has been played to its end.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Repeat {
+    Off,
+    All,
+    One,
+}
+// By their names in the settings; a name that is not known repeats nothing.
+const REPEATS: [(&str, Repeat); 3] = [
+    ("off", Repeat::Off),
+    ("all", Repeat::All),
+    ("one", Repeat::One),
+];
+
+/// `tracks` in an order of chance. The standard library hands out no random numbers,
+/// but the hasher that hash maps seed from the system does.
+fn shuffled(mut tracks: Vec<Track>) -> Vec<Track> {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+    let mut state = RandomState::new().build_hasher().finish() | 1;
+    for last in (1..tracks.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        tracks.swap(last, (state % (last as u64 + 1)) as usize);
+    }
+    tracks
+}
+
 // A failed track must not stop the queue, but a dead network must not drain it either.
 const SKIP_LIMIT: u8 = 3;
 #[derive(Clone, Copy)]
@@ -243,6 +271,8 @@ enum Action {
     Stop,
     Quieter,
     Louder,
+    Shuffle,
+    Repeat,
 }
 
 // The likes of a profile on their way into the favorites.
@@ -256,6 +286,8 @@ struct Import {
 
 // A track being downloaded into the cache without being played.
 struct Fetch {
+    // Whether what yt-dlp notes of the track is still to be looked for.
+    unknown: bool,
     track: Track,
     download: Download,
     log: PathBuf,
@@ -284,6 +316,8 @@ struct App {
     themes: Vec<String>,
     picker: Option<Picker>,
     // The settings window: whether it is open, its current line and where its lines are.
+    // It covers the line of messages, so one that came after `greeted` is shown in it.
+    greeted: String,
     options: bool,
     setting: usize,
     setting_rows: Rect,
@@ -303,13 +337,25 @@ struct App {
     pending: VecDeque<Track>,
     library_path: PathBuf,
     library: Library,
+    // The file of the library as this process last read or wrote it, and what told it
+    // apart then: another process may write it too.
+    base: Library,
+    stamp: Option<(SystemTime, u64)>,
+    synced: Instant,
     view: View,
+    // The words the library is narrowed to, and whether they are being typed.
+    filter: String,
+    filtering: bool,
     results: Vec<Track>,
     // What a search has already answered this run, and the question the list answers.
     // Asking it again is how a search is repeated, so that is never served from here.
     searched: HashMap<(String, u8), Vec<Track>>,
     shown: Option<(String, u8)>,
     queue: VecDeque<Track>,
+    // What plays when the queue is empty: the rest of the list the current track was
+    // started from, in the order it will play, and that whole list to go round again.
+    ahead: VecDeque<Track>,
+    source: Vec<Track>,
     previous: Vec<Track>,
     current: Option<Track>,
     player: Option<Playback>,
@@ -351,6 +397,7 @@ impl App {
             setup: None,
             themes: vec![],
             picker: None,
+            greeted: String::new(),
             options: false,
             setting: 0,
             setting_rows: Rect::default(),
@@ -366,13 +413,20 @@ impl App {
             config: session.config,
             fetch: None,
             pending: VecDeque::new(),
+            base: library.clone(),
+            stamp: library::stamp(&library_path),
+            synced: Instant::now(),
             library_path,
             library,
             view: View::Search,
+            filter: String::new(),
+            filtering: false,
             results: vec![],
             searched: HashMap::new(),
             shown: None,
             queue: VecDeque::new(),
+            ahead: VecDeque::new(),
+            source: vec![],
             previous: vec![],
             current: None,
             player: None,
@@ -404,13 +458,70 @@ impl App {
     fn tracks(&self) -> Vec<&Track> {
         match self.view {
             View::Search => self.results.iter().collect(),
-            // What the user keeps: the favorites, then the rest of what is stored.
-            View::Library => (self.library.favorites.iter())
-                .chain(&self.stored)
-                .collect(),
-            View::Queue => self.queue.iter().collect(),
+            // What the user keeps: the favorites, then the rest of what is stored,
+            // narrowed to those that have every word of the filter in their names.
+            View::Library => {
+                let words: Vec<String> = (self.filter.split_whitespace())
+                    .map(str::to_lowercase)
+                    .collect();
+                (self.library.favorites.iter())
+                    .chain(&self.stored)
+                    .filter(|track| {
+                        words.is_empty() || {
+                            let names = format!("{} {}", track.artist, track.title).to_lowercase();
+                            words.iter().all(|word| names.contains(word))
+                        }
+                    })
+                    .collect()
+            }
+            // What will play, in its order: the queue, then the rest of the list.
+            View::Queue => self.queue.iter().chain(&self.ahead).collect(),
             View::Recent => self.library.recent.iter().collect(),
         }
+    }
+    // How the list plays, in words: for the player's frame and for the messages.
+    fn order(&self) -> &'static str {
+        if self.settings.shuffle {
+            t!("вперемешку")
+        } else {
+            t!("по порядку")
+        }
+    }
+    fn repeating(&self) -> &'static str {
+        match self.repeat() {
+            Repeat::Off => t!("без повтора"),
+            Repeat::All => t!("повтор списка"),
+            Repeat::One => t!("повтор трека"),
+        }
+    }
+    fn repeat(&self) -> Repeat {
+        (REPEATS.iter())
+            .find(|(name, _)| *name == self.settings.repeat)
+            .map_or(Repeat::Off, |(_, repeat)| *repeat)
+    }
+    // Whether a track would follow the current one.
+    fn more(&self) -> bool {
+        !self.queue.is_empty()
+            || !self.ahead.is_empty()
+            || (self.repeat() == Repeat::All && !self.source.is_empty())
+    }
+    // Takes a track out of what will play, by its place in the view of the queue.
+    fn take_upcoming(&mut self, index: usize) -> Option<Track> {
+        match index.checked_sub(self.queue.len()) {
+            None => self.queue.remove(index),
+            Some(index) => self.ahead.remove(index),
+        }
+    }
+    // The track at `index` of `list` is about to play: the rest of the list follows it.
+    fn follow(&mut self, list: Vec<Track>, index: usize) {
+        self.ahead = if self.settings.shuffle {
+            let mut rest = list.clone();
+            rest.remove(index);
+            shuffled(rest).into()
+        } else {
+            list[index + 1..].to_vec().into()
+        };
+        self.source = list;
     }
     fn selected(&self) -> Option<Track> {
         self.tracks()
@@ -421,6 +532,7 @@ impl App {
         self.view = view;
         self.table = TableState::default().with_selected(0);
         self.editing = false;
+        self.filtering = false;
         if view == View::Library {
             self.list_stored();
         }
@@ -474,8 +586,68 @@ impl App {
         });
     }
     fn save(&mut self) {
-        if let Err(error) = library::save(&self.library_path, &self.library) {
-            self.message = t!("Не удалось сохранить библиотеку: {}", error);
+        // What another process wrote meanwhile is not written over.
+        self.sync();
+        match library::save(&self.library_path, &self.library) {
+            Ok(()) => {
+                self.base = self.library.clone();
+                self.stamp = library::stamp(&self.library_path);
+            }
+            Err(error) => self.message = t!("Не удалось сохранить библиотеку: {}", error),
+        }
+    }
+    /// Takes over what another process did to the library file since this one last
+    /// read or wrote it, such as an import of likes; true if the library changed.
+    fn sync(&mut self) -> bool {
+        self.synced = Instant::now();
+        let stamp = library::stamp(&self.library_path);
+        // A file that is gone tells nothing of what was removed from it.
+        if stamp == self.stamp || stamp.is_none() {
+            return false;
+        }
+        let Ok(disk) = library::load(&self.library_path) else {
+            return false;
+        };
+        let changed = self.library.adopt(&self.base, &disk);
+        self.base = disk;
+        self.stamp = stamp;
+        changed
+    }
+    /// What has become known of the track at `url` replaces what its link or a list of
+    /// likes told, wherever the track is listed. One with a length was looked up before.
+    fn learn(&mut self, url: &str, details: &Details) {
+        let Some(name) = cache::key(url) else {
+            return;
+        };
+        let known = |track: &mut Track| {
+            let same = track.duration.is_none() && cache::key(&track.url).as_deref() == Some(&name);
+            if same {
+                details.apply(track);
+            }
+            same
+        };
+        let mut kept = None;
+        for track in (self.library.favorites.iter_mut()).chain(&mut self.library.recent) {
+            if known(track) {
+                kept = Some(track.clone());
+            }
+        }
+        (self.results.iter_mut())
+            .chain(&mut self.queue)
+            .chain(&mut self.ahead)
+            .chain(&mut self.source)
+            .chain(&mut self.previous)
+            .chain(&mut self.stored)
+            .chain(&mut self.pending)
+            .chain(&mut self.current)
+            .for_each(|track| {
+                known(track);
+            });
+        if let Some(track) = kept {
+            if let Some(cache) = &self.cache {
+                cache.correct(&track);
+            }
+            self.save();
         }
     }
     fn persist(&mut self) {
@@ -995,14 +1167,40 @@ impl App {
         }
     }
     fn next(&mut self) {
-        if let Some(track) = self.queue.pop_front() {
+        let track = (self.queue.pop_front())
+            .or_else(|| self.ahead.pop_front())
+            .or_else(|| {
+                // The list is over: round it again, if that is what was asked for.
+                if self.repeat() != Repeat::All {
+                    return None;
+                }
+                let list = self.source.clone();
+                self.ahead = if self.settings.shuffle {
+                    shuffled(list).into()
+                } else {
+                    list.into()
+                };
+                self.ahead.pop_front()
+            });
+        if let Some(track) = track {
             if let Some(current) = self.current.take() {
                 self.previous.push(current);
+                // A list that goes round would keep every round of it.
+                if self.previous.len() > 200 {
+                    self.previous.remove(0);
+                }
             }
             self.start(track);
         } else {
             self.player = None;
             self.message = t!("Очередь закончилась").into();
+        }
+    }
+    // The current track played to its end.
+    fn ended(&mut self) {
+        match self.current.clone() {
+            Some(track) if self.repeat() == Repeat::One => self.start(track),
+            _ => self.next(),
         }
     }
     fn failed(&mut self, error: String, details: Option<String>) {
@@ -1015,7 +1213,7 @@ impl App {
         if let Some(details) = details {
             report = format!("{report}\n\n{details}");
         }
-        if self.queue.is_empty() {
+        if !self.more() {
             self.message = error;
         } else if self.failures < SKIP_LIMIT {
             self.next();
@@ -1071,6 +1269,7 @@ impl App {
             match self.fetch(&track) {
                 Ok(fetch) => {
                     self.fetch = fetch.map(|(download, log)| Fetch {
+                        unknown: track.duration.is_none(),
                         track,
                         download,
                         log,
@@ -1125,13 +1324,46 @@ impl App {
             Action::View(view) => self.select_view(view),
             Action::Search => {
                 self.editing = true;
+                self.filtering = false;
                 self.focus = None;
             }
+            Action::Shuffle => {
+                self.settings.shuffle = !self.settings.shuffle;
+                // What is ahead changes its order at once; the queue stays as it was built.
+                let ahead: Vec<Track> = self.ahead.drain(..).collect();
+                let at = (self.current.as_ref())
+                    .and_then(|now| self.source.iter().position(|track| track.url == now.url));
+                self.ahead = match at {
+                    _ if self.settings.shuffle => shuffled(ahead),
+                    Some(at) => self.source[at + 1..].to_vec(),
+                    None => ahead,
+                }
+                .into();
+                self.message = t!("Порядок: {}", self.order());
+                self.persist();
+            }
+            Action::Repeat => {
+                let at = (REPEATS.iter())
+                    .position(|(_, repeat)| *repeat == self.repeat())
+                    .unwrap_or(0);
+                self.settings.repeat = REPEATS[(at + 1) % REPEATS.len()].0.into();
+                self.message = t!("Повтор: {}", self.repeating());
+                self.persist();
+            }
             Action::Play => {
-                if let Some(track) = self.selected() {
-                    if self.view == View::Queue {
-                        self.queue.remove(self.table.selected().unwrap_or(0));
+                let index = self.table.selected().unwrap_or(0);
+                let track = if self.view == View::Queue {
+                    self.take_upcoming(index)
+                } else {
+                    // The rest of the list plays after the track, whatever the list is.
+                    let list: Vec<Track> = self.tracks().into_iter().cloned().collect();
+                    let track = list.get(index).cloned();
+                    if track.is_some() {
+                        self.follow(list, index);
                     }
+                    track
+                };
+                if let Some(track) = track {
                     if let Some(current) = self.current.take() {
                         self.previous.push(current);
                     }
@@ -1320,6 +1552,16 @@ impl App {
                 None => self.import = Some(import),
             }
         }
+        // Looked for before the download is asked how it goes: one that is over takes
+        // its directory, and what yt-dlp noted in it, along into the cache.
+        if let Some(fetch) = &mut self.fetch
+            && fetch.unknown
+            && let Some(details) = fetch.download.directory().and_then(Details::read)
+        {
+            fetch.unknown = false;
+            let url = fetch.track.url.clone();
+            self.learn(&url, &details);
+        }
         if let Some(fetch) = &mut self.fetch
             && let Some(saved) = match fetch.download.poll() {
                 Ok(status) => status.map(|status| status.success()),
@@ -1341,9 +1583,30 @@ impl App {
             self.fetch = None;
             self.fetch_next();
         }
+        // An import from the command line writes the library while this one is open.
+        if self.synced.elapsed() > Duration::from_secs(2) && self.sync() {
+            self.list_stored();
+            self.navigate(0);
+        }
         // Tracks get there from playback and other instances too.
         if self.view == View::Library && self.listed.elapsed() > Duration::from_secs(1) {
             self.list_stored();
+        }
+        // A track known by its link gets its names from the yt-dlp that fetches it, and
+        // its length from mpv once that has the whole of it.
+        let unknown = self.current.as_ref().is_some_and(|t| t.duration.is_none());
+        let noted = self.player.as_mut().and_then(|player| {
+            player.learn().or_else(|| {
+                (unknown && player.loaded && !player.receiving() && player.duration > 0.0)
+                    .then_some(Details {
+                        title: None,
+                        artist: None,
+                        duration: Some(player.duration),
+                    })
+            })
+        });
+        if let (Some(details), Some(url)) = (noted, self.current.as_ref().map(|t| t.url.clone())) {
+            self.learn(&url, &details);
         }
         if let Some(player) = &mut self.player {
             let was_loaded = player.loaded;
@@ -1362,7 +1625,7 @@ impl App {
             }
             self.volume = player.volume;
             match result {
-                Ok(true) => self.next(),
+                Ok(true) => self.ended(),
                 Err(error) => {
                     let details = player.details();
                     self.failed(error.to_string(), details);
@@ -1469,6 +1732,29 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     }
                     continue;
                 }
+                if app.filtering {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.filter.clear();
+                            app.filtering = false;
+                        }
+                        KeyCode::Enter => app.filtering = false,
+                        KeyCode::Backspace => {
+                            app.filter.pop();
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.filter.clear()
+                        }
+                        KeyCode::Char(c) if !c.is_control() && app.filter.chars().count() < 200 => {
+                            app.filter.push(c)
+                        }
+                        _ => (),
+                    }
+                    // The list under the words is another one after every letter.
+                    app.table.select(Some(0));
+                    app.navigate(0);
+                    continue;
+                }
                 if app.editing {
                     match key.code {
                         KeyCode::Esc => app.editing = false,
@@ -1535,6 +1821,13 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     KeyCode::Char('?') => app.help = true,
                     KeyCode::Char('o') => {
                         app.options = true;
+                        app.greeted = app.message.clone();
+                        app.focus = None;
+                    }
+                    // Before the letter alone, which is another key.
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.select_view(View::Library);
+                        app.filtering = true;
                         app.focus = None;
                     }
                     KeyCode::Char('e') => {
@@ -1554,6 +1847,10 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                         app.focus = None;
                         app.navigate(-1);
                     }
+                    KeyCode::PageDown => app.navigate(app.rows.height.max(1) as isize),
+                    KeyCode::PageUp => app.navigate(-(app.rows.height.max(1) as isize)),
+                    KeyCode::Home | KeyCode::Char('g') => app.navigate(isize::MIN),
+                    KeyCode::End | KeyCode::Char('G') => app.navigate(isize::MAX),
                     KeyCode::Tab => {
                         app.focus = Some(app.focus.map_or(0, |i| (i + 1) % app.hits.len().max(1)))
                     }
@@ -1566,6 +1863,10 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                         )
                     }
                     KeyCode::Esc if app.searching => app.cancel_search(),
+                    KeyCode::Esc if app.view == View::Library && !app.filter.is_empty() => {
+                        app.filter.clear();
+                        app.navigate(0);
+                    }
                     KeyCode::Esc => app.focus = None,
                     KeyCode::Enter => app.action(
                         app.focus
@@ -1583,6 +1884,8 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     KeyCode::Char('n') => app.action(Action::Next),
                     KeyCode::Char('p') => app.action(Action::Previous),
                     KeyCode::Char('s') => app.action(Action::Stop),
+                    KeyCode::Char('z') => app.action(Action::Shuffle),
+                    KeyCode::Char('r') => app.action(Action::Repeat),
                     KeyCode::Char('+') | KeyCode::Char('=') => app.action(Action::Louder),
                     KeyCode::Char('-') => app.action(Action::Quieter),
                     KeyCode::Char('x') => app.action(Action::Evict),
@@ -1594,7 +1897,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                         app.control(json!(["seek", app.settings.seek_step, "relative"]))
                     }
                     KeyCode::Delete if app.view == View::Queue => {
-                        app.queue.remove(app.table.selected().unwrap_or(0));
+                        app.take_upcoming(app.table.selected().unwrap_or(0));
                         app.navigate(0);
                     }
                     _ => (),
@@ -1710,6 +2013,27 @@ fn cells(text: &str) -> usize {
 // The text with spaces after it up to `width` cells.
 fn pad(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width.saturating_sub(cells(text))))
+}
+/// `text` in lines of at most `width` cells, broken between words where it has any.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    for word in text.split_inclusive(' ') {
+        let line = lines.last_mut().expect("a line to write on");
+        if !line.is_empty() && cells(line) + cells(word.trim_end()) > width {
+            line.truncate(line.trim_end().len());
+            lines.push(String::new());
+        }
+        // A word wider than a line, or a language without spaces, breaks by the letter.
+        for letter in word.chars() {
+            let line = lines.last_mut().expect("a line to write on");
+            if cells(line) + cells(letter.encode_utf8(&mut [0; 4])) > width {
+                lines.push(String::new());
+            }
+            lines.last_mut().expect("a line to write on").push(letter);
+        }
+    }
+    lines.retain(|line| !line.trim().is_empty());
+    lines
 }
 fn time(value: f64) -> String {
     let seconds = value.max(0.0) as u64;
@@ -1886,7 +2210,15 @@ fn draw_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 }
 
 fn draw_search(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
-    let query = if app.query.is_empty() && !app.editing {
+    // While the library is narrowed, the box holds the words that narrow it.
+    let narrowed = app.filtering || (app.view == View::Library && !app.filter.is_empty());
+    let query = if narrowed {
+        format!(
+            "{}{}",
+            clean(&app.filter),
+            if app.filtering { "_" } else { "" }
+        )
+    } else if app.query.is_empty() && !app.editing {
         t!("Найти исполнителя, трек, новый звук...").into()
     } else {
         format!(
@@ -1901,21 +2233,24 @@ fn draw_search(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         .spacing(1)
         .split(area);
     app.hits.push((search[0], Action::Search));
-    let title = if app.searching {
+    let title = if narrowed {
+        t!(" ФИЛЬТР БИБЛИОТЕКИ   Enter - оставить, Esc - сбросить ").to_owned()
+    } else if app.searching {
         t!(" ПОИСК {} Esc - отмена ", spinner(app))
     } else {
         t!(" / ПОИСК   Enter - найти ").to_owned()
     };
+    let typing = app.editing || app.filtering;
     frame.render_widget(
         Paragraph::new(query)
             .block(
-                block(&title, theme).border_style(if app.editing || app.focus == Some(0) {
+                block(&title, theme).border_style(if typing || app.focus == Some(0) {
                     theme.accent
                 } else {
                     theme.border
                 }),
             )
-            .style(if app.editing { theme.text } else { theme.muted }),
+            .style(if typing { theme.text } else { theme.muted }),
         search[0],
     );
     button(
@@ -1961,7 +2296,7 @@ fn draw_navigation(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) 
     let loading = app.pending.len() + usize::from(app.fetch.is_some());
     let mut lines = vec![
         t!("{} избранных", app.library.favorites.len()),
-        t!("{} в очереди", app.queue.len()),
+        t!("{} в очереди", app.queue.len() + app.ahead.len()),
     ];
     if loading > 0 {
         lines.push(t!("{} качается", loading));
@@ -2011,6 +2346,9 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                     "\n\nВаша следующая любимая песня - здесь.\n\nНажмите / и введите поисковый запрос.\nEnter - слушать, f - сохранить"
                 )
             }
+            View::Library if !app.filter.is_empty() => {
+                t!("\n\nПо этому фильтру ничего нет.\n\nEsc - сбросить фильтр.")
+            }
             View::Library => {
                 t!(
                     "\n\nСоберите свою коллекцию.\n\nf - добавить трек в избранное.\nЗдесь же всё, что сохранено в кеш (d)\nи играет без сети."
@@ -2037,10 +2375,21 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         );
         0
     } else {
+        // Only the rows that show are made: a library may hold thousands of tracks,
+        // and each row asks the disk whether its track is stored.
         let count = tracks.len();
+        let height = usize::from(center[0].height.saturating_sub(4)).max(1);
+        let chosen = app.table.selected().map(|chosen| chosen.min(count - 1));
+        let at = chosen.unwrap_or(0);
+        let offset = (app.table.offset())
+            .clamp(at.saturating_sub(height - 1), at)
+            .min(count.saturating_sub(height));
+        let digits = count.to_string().len().max(2);
         let rows: Vec<Row> = tracks
             .iter()
             .enumerate()
+            .skip(offset)
+            .take(height)
             .map(|(i, track)| {
                 let favorite = app.library.favorites.iter().any(|t| t.url == track.url);
                 let playing = app.current.as_ref().is_some_and(|t| t.url == track.url)
@@ -2057,7 +2406,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                     if playing {
                         Cell::from("|>")
                     } else {
-                        Cell::from(format!("{:02}", i + 1)).style(theme.muted)
+                        Cell::from(format!("{:0digits$}", i + 1)).style(theme.muted)
                     },
                     Cell::from(clean(&track.title)),
                     Cell::from(clean(&track.artist)).style(theme.muted),
@@ -2076,7 +2425,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         let table = Table::new(
             rows,
             [
-                Constraint::Length(3),
+                Constraint::Length(digits as u16 + 1),
                 Constraint::Min(12),
                 Constraint::Percentage(27),
                 Constraint::Length(6),
@@ -2089,17 +2438,22 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 .style(theme.muted)
                 .bottom_margin(1),
         )
-        .block(block(title, theme))
+        .block(block(title, theme).title_bottom(
+            // Where in the list the selection is, which a long list does not show.
+            Line::styled(format!(" {}/{count} ", at + 1), theme.muted).right_aligned(),
+        ))
         .row_highlight_style(theme.selected)
         .highlight_symbol("> ");
-        frame.render_stateful_widget(table, center[0], &mut app.table);
+        let mut window = TableState::default().with_selected(chosen.map(|chosen| chosen - offset));
+        frame.render_stateful_widget(table, center[0], &mut window);
+        *app.table.offset_mut() = offset;
         app.rows = Rect::new(
             center[0].x + 1,
             center[0].y + 3,
             center[0].width.saturating_sub(2),
             center[0].height.saturating_sub(4),
         );
-        2 + (count.saturating_sub(app.table.offset()) as u16).min(app.rows.height)
+        2 + ((count - offset) as u16).min(app.rows.height)
     };
     draw_backdrop(
         frame.buffer_mut(),
@@ -2193,7 +2547,7 @@ fn draw_settings(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
         .map(|setting| setting.hint().lines().count())
         .max()
         .unwrap_or(0);
-    let (width, height) = (72.min(size.width - 4), (SETTINGS.len() + hints + 7) as u16);
+    let (width, height) = (72.min(size.width - 4), (SETTINGS.len() + hints + 8) as u16);
     let area = Rect::new(
         (size.width - width) / 2,
         size.height.saturating_sub(height) / 2,
@@ -2234,7 +2588,19 @@ fn draw_settings(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
         Some(file) => t!("Файл: {}", clean(&file.to_string_lossy())),
         None => t!("Файл настроек не определён: изменения действуют до выхода").into(),
     }));
-    lines.push(Line::raw(""));
+    // The window covers the line of messages; what was said since it opened is said here.
+    let said = if app.message == app.greeted {
+        vec![]
+    } else {
+        wrap(
+            &clean(&app.message),
+            usize::from(inner.width).saturating_sub(4),
+        )
+    };
+    for line in 0..2 {
+        let text = said.get(line).cloned().unwrap_or_default();
+        lines.push(Line::styled(format!("  {text}"), theme.strong));
+    }
     lines.push(note(
         t!("Up/Down - выбор   Left/Right - изменить   Enter - переключить").into(),
     ));
@@ -2268,12 +2634,12 @@ fn draw_picker(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
 
 fn draw_upcoming(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let mut lines = vec![Line::styled(t!("ДАЛЕЕ"), theme.accent), Line::raw("")];
-    for track in app.queue.iter().take(4) {
+    for track in app.queue.iter().chain(&app.ahead).take(4) {
         lines.push(Line::styled(clean(&track.title), theme.text));
         lines.push(Line::styled(clean(&track.artist), theme.muted));
         lines.push(Line::raw(""));
     }
-    if app.queue.is_empty() {
+    if app.queue.is_empty() && app.ahead.is_empty() {
         lines.push(Line::styled(t!("Очередь пока пуста"), theme.muted));
     }
     lines.push(Line::raw(""));
@@ -2288,7 +2654,14 @@ fn draw_upcoming(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 }
 
 fn draw_player(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
-    frame.render_widget(block(t!(" ПЛЕЕР "), theme), area);
+    // The frame also tells how a list plays, with the keys that change it.
+    let title = format!(
+        "{}| z {} | r {} ",
+        t!(" ПЛЕЕР "),
+        app.order(),
+        app.repeating()
+    );
+    frame.render_widget(block(&title, theme), area);
     let area = area.inner(Margin {
         horizontal: 2,
         vertical: 1,
@@ -2384,12 +2757,14 @@ fn draw_player(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame, theme: &Theme, size: Rect) {
-    let modal_area = Rect::new(size.width / 2 - 32, size.height / 2 - 9, 64, 19);
+    let modal_area = Rect::new(size.width / 2 - 32, size.height / 2 - 11, 64, 22);
     frame.render_widget(Clear, modal_area);
     let keys = [
         ("/", t!("Поиск (Enter отправляет, Esc отменяет)")),
         ("1 2 3 4", t!("Поиск / библиотека / очередь / недавние")),
         ("Up Down, j k", t!("Выбрать трек     Enter  Проиграть")),
+        ("PgUp PgDn", t!("Листать список   Home End  К краям списка")),
+        ("Ctrl+F", t!("Фильтр библиотеки (Esc сбрасывает)")),
         ("Tab", t!("Выбрать кнопку   Enter  Нажать")),
         ("f", t!("Добавить / удалить из избранного")),
         ("a", t!("Добавить в очередь   Del  Убрать из очереди")),
@@ -2397,6 +2772,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, size: Rect) {
         ("x", t!("Удалить трек из кеша")),
         ("Space", t!("Пауза / продолжить")),
         ("p / n", t!("Предыдущий / следующий трек")),
+        ("z / r", t!("Вперемешку / повтор: нет, список, трек")),
         ("Left / Right", t!("Перемотка")),
         ("- / +", t!("Громкость    s  Стоп    q  Выход")),
         ("o", t!("Настройки и цветовые схемы")),
@@ -3146,6 +3522,308 @@ mod tests {
         for path in [path, file, program, asked] {
             fs::remove_file(path).unwrap();
         }
+    }
+
+    fn numbered(number: usize) -> Track {
+        Track {
+            title: format!("Title {number}"),
+            artist: format!("artist{}", number % 10),
+            url: format!("https://soundcloud.com/test/{number}"),
+            ..track()
+        }
+    }
+
+    #[test]
+    fn a_list_plays_on_from_the_track_that_was_started() {
+        let player = script("order-player", "exec sleep 30");
+        let file = std::env::temp_dir().join(format!("clicloud-order-{}.json", std::process::id()));
+        let mut app = app(PathBuf::new());
+        app.config = Some(file.clone());
+        app.mpv = player.to_string_lossy().into_owned();
+        app.results = (0..6).map(numbered).collect();
+        let playing = |app: &App| app.current.as_ref().unwrap().title.clone();
+        let titles = |tracks: &VecDeque<Track>| -> Vec<String> {
+            tracks.iter().map(|track| track.title.clone()).collect()
+        };
+
+        // Enter starts a track, and the rest of its list follows it.
+        app.table.select(Some(2));
+        app.action(Action::Play);
+        assert_eq!(playing(&app), "Title 2");
+        assert_eq!(titles(&app.ahead), ["Title 3", "Title 4", "Title 5"]);
+        // What was put in the queue by hand plays before that.
+        app.queue.push_back(numbered(40));
+        app.next();
+        assert_eq!(playing(&app), "Title 40");
+        app.next();
+        assert_eq!(playing(&app), "Title 3");
+
+        // The view of the queue shows both, and a track goes out of either by its place.
+        app.queue.push_back(numbered(41));
+        app.select_view(View::Queue);
+        let shown: Vec<&str> = app.tracks().iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(shown, ["Title 41", "Title 4", "Title 5"]);
+        assert_eq!(app.take_upcoming(1).unwrap().title, "Title 4");
+        // Started from the queue, a track leaves it, and the rest stays as it was.
+        app.table.select(Some(1));
+        app.action(Action::Play);
+        assert_eq!(playing(&app), "Title 5");
+        assert_eq!(
+            (titles(&app.queue), app.ahead.len()),
+            (vec!["Title 41".to_owned()], 0)
+        );
+        app.next();
+        // Nothing follows the last track, and the player stops.
+        assert!(!app.more());
+        app.next();
+        assert!(app.player.is_none() && app.message == "Очередь закончилась");
+
+        // `r` goes round: the list again from its top, or the track again.
+        app.select_view(View::Search);
+        app.table.select(Some(5));
+        app.action(Action::Play);
+        assert!(app.ahead.is_empty() && !app.more());
+        app.action(Action::Repeat);
+        assert_eq!(
+            (app.repeat(), app.message.as_str()),
+            (Repeat::All, "Повтор: повтор списка")
+        );
+        assert!(app.more());
+        app.ended();
+        assert_eq!((playing(&app), app.ahead.len()), ("Title 0".to_owned(), 5));
+        app.action(Action::Repeat);
+        assert_eq!(app.repeat(), Repeat::One);
+        app.ended();
+        assert_eq!((playing(&app), app.ahead.len()), ("Title 0".to_owned(), 5));
+        // Asked for the next one, it still moves on.
+        app.next();
+        assert_eq!(playing(&app), "Title 1");
+        app.action(Action::Repeat);
+        assert_eq!(app.repeat(), Repeat::Off);
+
+        // `z` mixes what is ahead at once, and puts it back in the order of the list.
+        app.results = (0..40).map(numbered).collect();
+        app.table.select(Some(0));
+        app.action(Action::Play);
+        let straight = titles(&app.ahead);
+        app.action(Action::Shuffle);
+        assert_eq!(app.message, "Порядок: вперемешку");
+        let mixed = titles(&app.ahead);
+        assert_ne!(mixed, straight);
+        let mut sorted = mixed.clone();
+        sorted.sort_by_key(|title| straight.iter().position(|other| other == title));
+        assert_eq!(sorted, straight);
+        // A track started while it is on has all the others of the list after it.
+        app.table.select(Some(7));
+        app.action(Action::Play);
+        assert_eq!(app.ahead.len(), 39);
+        assert!(app.ahead.iter().all(|track| track.title != "Title 7"));
+        app.action(Action::Shuffle);
+        assert_eq!(titles(&app.ahead), straight[7..]);
+        let saved = config::load(Some(&file)).unwrap();
+        assert_eq!((saved.shuffle, saved.repeat.as_str()), (false, "off"));
+        assert!(screen(&mut app, 80, 24).contains(" ПЛЕЕР | z по порядку | r без повтора "));
+
+        drop(app);
+        fs::remove_file(player).unwrap();
+        fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn a_long_list_is_paged_counted_and_narrowed() {
+        let mut app = app(PathBuf::new());
+        app.library.favorites = (1..=1200).map(numbered).collect();
+        app.logo = false;
+        app.select_view(View::Library);
+        let text = screen(&mut app, 80, 30);
+        // The first screen of it, numbered wide enough for the last, and where it stands.
+        assert!(
+            text.contains("> 0001  Title 1 ") && text.contains(" 1/1200 "),
+            "{text}"
+        );
+        assert!(
+            text.contains("0008  Title 8") && !text.contains("Title 9 "),
+            "{text}"
+        );
+        // The keys move by what the screen holds, and to the ends.
+        let page = app.rows.height as isize;
+        assert_eq!(page, 8);
+        app.navigate(page);
+        app.navigate(page);
+        let text = screen(&mut app, 80, 30);
+        assert!(
+            text.contains("> 0017  Title 17") && text.contains(" 17/1200 "),
+            "{text}"
+        );
+        assert!(
+            text.contains("0010  Title 10") && !text.contains("Title 9 "),
+            "{text}"
+        );
+        app.navigate(isize::MAX);
+        let text = screen(&mut app, 80, 30);
+        assert!(
+            text.contains("> 1200  Title 1200") && text.contains(" 1200/1200 "),
+            "{text}"
+        );
+        assert!(
+            text.contains("1193  Title 1193") && !text.contains("Title 1192"),
+            "{text}"
+        );
+        // Going up, the selection becomes the first row that shows.
+        app.navigate(-10);
+        let text = screen(&mut app, 80, 30);
+        assert!(
+            text.contains("> 1190  Title 1190") && text.contains("1197  Title 1197"),
+            "{text}"
+        );
+        app.navigate(isize::MIN);
+        assert_eq!(app.table.selected(), Some(0));
+
+        // The words of the filter are looked for in both names, in any order and case.
+        app.filtering = true;
+        app.filter = "TITLE 77 artist7".into();
+        app.navigate(0);
+        let found: Vec<String> = (app.tracks().iter())
+            .map(|track| track.title.clone())
+            .collect();
+        let expected = [77, 177, 277, 377, 477, 577, 677, 777, 877, 977, 1077, 1177]
+            .map(|number| format!("Title {number}"));
+        assert_eq!(found, expected);
+        let text = screen(&mut app, 80, 24);
+        assert!(text.contains(" ФИЛЬТР БИБЛИОТЕКИ ") && text.contains("TITLE 77 artist7_"));
+        assert!(text.contains(&format!(" 1/{} ", found.len())), "{text}");
+        // The list that plays on is the narrowed one.
+        app.filtering = false;
+        app.mpv = "clicloud-no-such-program".into();
+        app.action(Action::Play);
+        assert_eq!(app.source.len(), found.len());
+        app.filter = "no such track".into();
+        app.navigate(0);
+        assert!(app.selected().is_none());
+        assert!(screen(&mut app, 80, 24).contains("По этому фильтру ничего нет."));
+        // Another view has the box for the search again, and the filter waits.
+        app.select_view(View::Search);
+        assert!(screen(&mut app, 80, 24).contains(" / ПОИСК   Enter - найти "));
+    }
+
+    #[test]
+    fn what_is_learned_of_a_track_reaches_every_list_it_is_in() {
+        let path = std::env::temp_dir().join(format!("clicloud-learn-{}.json", std::process::id()));
+        let mut app = app(path.clone());
+        let liked = Track {
+            title: "Remote Viewing".into(),
+            artist: "low sea".into(),
+            duration: None,
+            url: "https://soundcloud.com/low-sea/remote-viewing".into(),
+        };
+        // Known in full already: the same link under another spelling, with a length.
+        let known = Track {
+            url: "https://www.soundcloud.com/low-sea/remote-viewing?si=1".into(),
+            duration: Some(10.0),
+            ..liked.clone()
+        };
+        app.library.favorites = vec![track(), liked.clone()];
+        app.library.recent = vec![liked.clone()];
+        app.queue = [liked.clone(), known.clone()].into();
+        app.current = Some(liked.clone());
+        let details = Details {
+            title: Some("Remote Viewing".into()),
+            artist: Some("low_sea".into()),
+            duration: Some(196.645),
+        };
+        app.learn(&liked.url, &details);
+        for track in [
+            &app.library.favorites[1],
+            &app.library.recent[0],
+            &app.queue[0],
+        ]
+        .into_iter()
+        .chain(&app.current)
+        {
+            assert_eq!(
+                (track.artist.as_str(), track.duration),
+                ("low_sea", Some(196.645))
+            );
+        }
+        assert_eq!(
+            (app.queue[1].artist.as_str(), app.queue[1].duration),
+            ("low sea", Some(10.0))
+        );
+        assert_eq!(app.library.favorites[0].artist, "Test artist");
+        let saved = library::load(&path).unwrap();
+        assert_eq!(saved.favorites[1].duration, Some(196.645));
+        // Told again, there is nothing left to put right and nothing is written.
+        fs::remove_file(&path).unwrap();
+        app.learn(&liked.url, &details);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_library_follows_what_another_process_writes() {
+        let path = std::env::temp_dir().join(format!("clicloud-sync-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut app = app(path.clone());
+        app.table.select(Some(0));
+        app.action(Action::Favorite);
+        assert_eq!(app.library.favorites.len(), 1);
+        assert!(!app.sync());
+
+        // An import from the command line adds to the file while the interface is open.
+        let mut theirs = library::load(&path).unwrap();
+        theirs.favorites.push(numbered(1));
+        theirs.favorites.push(numbered(2));
+        library::save(&path, &theirs).unwrap();
+        assert!(app.sync() && !app.sync());
+        assert_eq!(app.library.favorites.len(), 3);
+
+        // Written again there before this one saves: neither loses what the other did.
+        theirs.favorites.push(numbered(3));
+        theirs.favorites.remove(1);
+        library::save(&path, &theirs).unwrap();
+        app.select_view(View::Library);
+        app.table.select(Some(0));
+        app.action(Action::Favorite);
+        let kept = |library: &Library| -> Vec<String> {
+            (library.favorites.iter())
+                .map(|track| track.title.clone())
+                .collect()
+        };
+        assert_eq!(kept(&app.library), ["Title 2", "Title 3"]);
+        assert_eq!(kept(&library::load(&path).unwrap()), ["Title 2", "Title 3"]);
+        // A file that is gone takes nothing away, and one that is damaged is left out.
+        fs::remove_file(&path).unwrap();
+        assert!(!app.sync() && app.library.favorites.len() == 2);
+        fs::write(&path, "{broken").unwrap();
+        assert!(!app.sync() && app.library.favorites.len() == 2);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn what_is_said_while_the_settings_are_open_shows_in_them() {
+        assert_eq!(
+            wrap("Ожидается имя профиля SoundCloud или ссылка", 20),
+            ["Ожидается имя", "профиля SoundCloud", "или ссылка"]
+        );
+        assert_eq!(wrap("abcdefgh ij", 3), ["abc", "def", "gh", "ij"]);
+        assert!(wrap("  ", 10).is_empty());
+
+        let mut app = app(PathBuf::new());
+        app.options = true;
+        app.greeted = app.message.clone();
+        // The window covers the line of messages on the least screen.
+        let quiet = screen(&mut app, 80, 24);
+        assert!(!quiet.contains("Найдено треков: 1"), "{quiet}");
+        app.setting = SETTINGS.len() - 1;
+        app.activate();
+        app.input = Some("https://soundcloud.com/artist/night".into());
+        app.submit();
+        let said = screen(&mut app, 80, 24);
+        assert!(
+            said.contains("Ожидается имя профиля SoundCloud или ссылка на него: name или")
+                && said.contains("soundcloud.com/name."),
+            "{said}"
+        );
+        assert!(said.contains("Up/Down - выбор"), "{said}");
     }
 
     #[test]

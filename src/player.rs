@@ -149,6 +149,8 @@ pub fn downloader(
         command.arg("--no-progress");
     }
     command
+        // What it learns of the track on the way is noted beside the audio.
+        .args(crate::soundcloud::Details::ARGUMENTS)
         .args(["--format", "bestaudio/best", "--output", "-", "--", url])
         .stdin(Stdio::null())
         .stdout(Stdio::piped());
@@ -225,6 +227,11 @@ impl Download {
 
     pub fn finished(&self) -> bool {
         self.status.is_some()
+    }
+
+    /// The directory yt-dlp runs in, until the download has joined the cache.
+    pub fn directory(&self) -> Option<&Path> {
+        self.partial.as_ref().map(Partial::directory)
     }
 }
 

@@ -912,6 +912,38 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Reading the likes was interrupted",
         "いいねの読み込みが中断されました",
     ),
+    ("вперемешку", "shuffled", "シャッフル"),
+    ("по порядку", "in order", "順番どおり"),
+    ("без повтора", "no repeat", "リピートなし"),
+    ("повтор списка", "repeat the list", "リストをリピート"),
+    ("повтор трека", "repeat the track", "1曲リピート"),
+    ("Порядок: {}", "Order: {}", "再生順: {}"),
+    ("Повтор: {}", "Repeat: {}", "リピート: {}"),
+    (
+        " ФИЛЬТР БИБЛИОТЕКИ   Enter - оставить, Esc - сбросить ",
+        " LIBRARY FILTER   Enter - keep, Esc - clear ",
+        " ライブラリの絞り込み   Enter - 確定、Esc - 解除 ",
+    ),
+    (
+        "\n\nПо этому фильтру ничего нет.\n\nEsc - сбросить фильтр.",
+        "\n\nNothing matches this filter.\n\nEsc - clear the filter.",
+        "\n\nこの条件に合う曲はありません。\n\nEsc - 絞り込みを解除",
+    ),
+    (
+        "Листать список   Home End  К краям списка",
+        "Page the list    Home End  To its ends",
+        "ページ送り       Home End  先頭 / 末尾",
+    ),
+    (
+        "Фильтр библиотеки (Esc сбрасывает)",
+        "Filter the library (Esc clears)",
+        "ライブラリを絞り込む (Esc で解除)",
+    ),
+    (
+        "Вперемешку / повтор: нет, список, трек",
+        "Shuffle / repeat: off, list, track",
+        "シャッフル / リピート: なし、リスト、1曲",
+    ),
 ];
 
 #[cfg(test)]

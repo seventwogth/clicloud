@@ -33,6 +33,10 @@ pub struct Settings {
     pub seek_step: u16,
     /// The volume the interface starts with.
     pub volume: u8,
+    /// Whether a list plays in an order of chance.
+    pub shuffle: bool,
+    /// What happens at the end of a list: off, all or one.
+    pub repeat: String,
     /// The profile whose likes the interface was last asked to bring in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub soundcloud_profile: Option<String>,
@@ -54,6 +58,8 @@ impl Default for Settings {
             search_limit: 10,
             seek_step: 10,
             volume: 70,
+            shuffle: false,
+            repeat: "off".into(),
             soundcloud_profile: None,
         }
     }
