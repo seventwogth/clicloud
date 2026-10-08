@@ -25,6 +25,9 @@ def main():
     result = subprocess.check_output([str(source.resolve()), "--version"], text=True).strip()
     if result != f"clicloud {version}":
         raise SystemExit(f"Unexpected binary version: {result}")
+    # The build machine has the Visual C++ runtime; the user's Windows may not.
+    if windows and b"vcruntime140" in source.read_bytes().lower():
+        raise SystemExit("The Windows binary needs VCRUNTIME140.dll; link the C runtime statically")
     name = f"clicloud-{version}-{args.target}"
     args.output.mkdir(parents=True, exist_ok=True)
     archive = args.output / (name + (".zip" if windows else ".tar.gz"))

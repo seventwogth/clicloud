@@ -1,17 +1,45 @@
-# clicloud
+```text
+    #        #       #    #           #        #       # #       #      #
+########## #  #     #    ######## ########## #  #     #  #       # ##########   #######
+#        #  #      #    #    #    #        #  #      #          #       #          #
+       ##        ##    #    #            ##        ##          #        #          #
+     ##        ##          #           ##        ##          ##        #           #
+   ##        ##           #          ##        ##          ##         #            #
+ ##        ##            #         ##        ##          ##         ##        ##########
+
+       ..|'''.| '||'      '||'   ..|'''.| '||'       ..|''||   '||'  '|' '||''|.
+     .|'     '   ||        ||  .|'     '   ||       .|'    ||   ||    |   ||   ||
+     ||          ||        ||  ||          ||       ||      ||  ||    |   ||    ||
+     '|.      .  ||        ||  '|.      .  ||       '|.     ||  ||    |   ||    ||
+      ''|....'  .||.....| .||.  ''|....'  .||.....|  ''|...|'    '|..'   .||...|'
+```
 
 English | [Русский](README.ru.md)
 
-A terminal client for SoundCloud, written in Rust: search, listen, keep a
-library. `yt-dlp` does the searching and fetches the audio, `mpv` plays it.
-Tracks you have played stay in a cache on disk: the second time they start at
-once and play without a network.
+A terminal music player written in Rust: search, listen, keep a library.
+`yt-dlp` does the searching and fetches the audio, `mpv` plays it. Tracks you
+have played stay in a cache on disk: the second time they start at once and
+play without a network.
+
+![The lists: the results of a search, what plays next and the player](docs/screenshots/lists.png)
+
+<p>
+  <img src="docs/screenshots/track.png" width="49%" alt="The tab of the track: its cover in Braille dots and what is known of it">
+  <img src="docs/screenshots/themes.png" width="49%" alt="The list of color schemes, the one under the cursor applied for a look">
+</p>
 
 The interface speaks English, Russian and Japanese. English is the default on
 first launch. Change Language in settings (`o`), or set `"language": "ru"` or
 `"language": "ja"` in the settings file. An existing language choice is preserved.
 
 ## Installation
+
+Built binaries for Linux x86_64, macOS and Windows x86_64 are on the
+[releases page](https://github.com/seventwogth/clicloud/releases): extract the
+archive, put `clicloud` on PATH and run `clicloud doctor`. `yt-dlp` and `mpv`
+are installed separately, as below (on macOS `brew install mpv yt-dlp`); Rust
+is needed only to build the client yourself, and the commands further down
+then read `clicloud` in place of `cargo run --`.
 
 You need Rust/Cargo 1.88+ (edition 2024), `yt-dlp` no older than 2023.01 (the
 search uses `--lazy-playlist`) and `mpv` with its built-in `ytdl_hook` (the
@@ -249,6 +277,8 @@ is closed, the interface on Unix ends in an orderly way: it stops mpv and
 yt-dlp and removes the temporary directory with the socket and the downloads
 that were not finished.
 
+![The library with the reaper drawn behind the list](docs/screenshots/library.png)
+
 The library (`2`) is all that you have kept: the favorites first, then the rest
 of the tracks in the cache. It is a local list, not synchronized with a
 SoundCloud account; the likes of a profile are brought into it by the line
@@ -392,6 +422,8 @@ The language changes at once and covers everything the client writes: the
 interface, the error messages and the output of `search`, `play`, `import`,
 `cache` and `doctor`. Only `--help` stays in English. Japanese letters take two
 cells, so the terminal needs a font that has them.
+
+![A light scheme, Rose Pine Dawn, with the interface in Russian and the pentagram behind the list](docs/screenshots/light.png)
 
 Schemes:
 
@@ -593,7 +625,9 @@ opens again until a new search or track is started.
 
 ## Limits
 
-This is not the official SoundCloud API. It depends on the current extractor
+clicloud is an independent project: it is not affiliated with SoundCloud and
+is not endorsed by it, and the name SoundCloud belongs to its owner. This is
+not the official SoundCloud API. It depends on the current extractor
 of yt-dlp; when something fails, update that first (`pipx upgrade yt-dlp`). A
 search result is no promise of playback: private, paid, deleted and
 region-locked tracks may give an error or a preview. Signing in to an account

@@ -18,7 +18,7 @@ fn first_launch_is_english_and_saved_language_is_respected() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("Cache: off"));
     let help = fixture.command().arg("--help").output().unwrap();
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("Search and play SoundCloud"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Search and play music"));
     assert!(help.stdout.is_ascii());
     fs::write(fixture.0.join("config.json"), r#"{"language":"ru"}"#).unwrap();
     let output = fixture
