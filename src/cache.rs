@@ -29,7 +29,7 @@ const LISTS: [&str; 11] = [
     "following",
     "comments",
 ];
-const SECTIONS: [&str; 10] = [
+pub const SECTIONS: [&str; 10] = [
     "discover", "search", "you", "stream", "charts", "stations", "tags", "people", "pages",
     "upload",
 ];
@@ -304,6 +304,11 @@ fn files(directory: &Path) -> Vec<(SystemTime, u64, PathBuf)> {
 fn write_details(directory: &Path, key: &str, track: &Track) -> io::Result<()> {
     private_directory(directory)?;
     fs::write(directory.join(key), serde_json::to_vec(track)?)
+}
+
+/// The track at `url` as far as its link tells: who made it and what it is called.
+pub fn named(url: &str) -> Option<Track> {
+    key(url).and_then(|key| named_after(&key))
 }
 
 // The track behind a file name made by `key`, as far as the link tells.

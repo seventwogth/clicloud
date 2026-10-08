@@ -3,7 +3,9 @@ use crate::{
     cache::{self, Cache},
     clean, clean_lines,
     config::{self, Settings},
-    lang, megabytes,
+    lang,
+    library::{self, Library},
+    megabytes,
     playback::{self, Origin, Playback},
     player::{self, Download},
     setup,
@@ -20,7 +22,6 @@ use crossterm::{
 };
 use ratatui::layout::Position;
 use ratatui::{prelude::*, widgets::*};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::sync::{
@@ -30,7 +31,7 @@ use std::sync::{
 use std::{
     collections::{HashMap, VecDeque},
     fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal},
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
@@ -98,40 +99,6 @@ impl Setup {
 enum Found {
     Track(Track),
     Over(std::result::Result<(), String>),
-}
-
-#[derive(Default, Serialize, Deserialize)]
-#[serde(default)]
-struct Library {
-    favorites: Vec<Track>,
-    recent: Vec<Track>,
-}
-
-fn load_library(path: &PathBuf) -> Result<Library> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)
-            .map_err(|_| t!("Файл библиотеки повреждён; он не был перезаписан."))?),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Library::default()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn save_library(path: &PathBuf, library: &Library) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    let result = (|| -> Result<()> {
-        let mut file = fs::File::create(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(library)?)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    result
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -479,7 +446,7 @@ impl App {
         });
     }
     fn save(&mut self) {
-        if let Err(error) = save_library(&self.library_path, &self.library) {
+        if let Err(error) = library::save(&self.library_path, &self.library) {
             self.message = t!("Не удалось сохранить библиотеку: {}", error);
         }
     }
@@ -1270,15 +1237,8 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(t!("Интерфейсу нужен интерактивный терминал. Для скриптов используйте search или play --first.").into());
     }
-    let path = library
-        .or_else(|| {
-            config::directory("XDG_DATA_HOME", ".local/share")
-                .map(|p| p.join("clicloud/library.json"))
-        })
-        .ok_or(t!(
-            "Не удалось определить путь библиотеки; укажите ui --library PATH"
-        ))?;
-    let library = load_library(&path)?;
+    let path = library::path(library, "ui")?;
+    let library = library::load(&path)?;
     let terminate = Arc::new(AtomicBool::new(false));
     for signal in [SIGTERM, SIGHUP, SIGINT] {
         signal_hook::flag::register(signal, terminate.clone())?;
@@ -2359,13 +2319,13 @@ mod tests {
             std::env::temp_dir().join(format!("clicloud-library-test-{}.json", std::process::id()));
         let mut app = app(path.clone());
         app.action(Action::Favorite);
-        let stored = load_library(&path).unwrap();
+        let stored = library::load(&path).unwrap();
         assert_eq!(stored.favorites.len(), 1);
         assert_eq!(stored.favorites[0].title, "Ночной эфир");
         app.action(Action::Favorite);
-        assert!(load_library(&path).unwrap().favorites.is_empty());
+        assert!(library::load(&path).unwrap().favorites.is_empty());
         fs::write(&path, "broken json").unwrap();
-        assert!(load_library(&path).is_err());
+        assert!(library::load(&path).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "broken json");
         fs::remove_file(path).unwrap();
     }

@@ -106,7 +106,7 @@ impl<'a> SoundCloud<'a> {
 
     /// Searches, handing over each track as yt-dlp finds it, so that a list can fill
     /// while the rest of the results are still on their way.
-    pub fn stream(&self, query: &str, limit: u8, mut found: impl FnMut(Track)) -> Result<()> {
+    pub fn stream(&self, query: &str, limit: u8, found: impl FnMut(Track)) -> Result<()> {
         let query = query.trim();
         if query.is_empty() {
             return Err(t!("Поисковый запрос не должен быть пустым.").into());
@@ -114,6 +114,25 @@ impl<'a> SoundCloud<'a> {
         if !self.quiet {
             eprintln!("{}", t!("Поиск в SoundCloud…"));
         }
+        self.list(&format!("scsearch{limit}:{query}"), found)
+    }
+
+    /// The tracks that a profile has liked, the latest first, handed over as yt-dlp
+    /// lists them. `profile` is what `profile` reads: a name or a link.
+    ///
+    /// Such a list names each track and its link, and nothing of who made it or how
+    /// long it is. What is not a single track comes along too: playlists are liked
+    /// as well.
+    pub fn likes(&self, profile: &str, found: impl FnMut(Track)) -> Result<()> {
+        let name = self::profile(profile)?;
+        if !self.quiet {
+            eprintln!("{}", t!("Читаю лайки профиля {}…", name));
+        }
+        self.list(&format!("https://soundcloud.com/{name}/likes"), found)
+    }
+
+    // Asks yt-dlp for the tracks of `target`, a search or a page, one per line.
+    fn list(&self, target: &str, mut found: impl FnMut(Track)) -> Result<()> {
         let mut command = self.extractor.command();
         command
             .args([
@@ -128,7 +147,7 @@ impl<'a> SoundCloud<'a> {
                 "2",
             ])
             .arg("--")
-            .arg(format!("scsearch{limit}:{query}"))
+            .arg(target)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -182,7 +201,7 @@ impl<'a> SoundCloud<'a> {
             .map_err(|_| std::io::Error::other("stderr reader failed"))?;
         if !status.success() {
             return Err(t!(
-                "Поиск yt-dlp завершился с {}:\n{}",
+                "yt-dlp завершился с {}:\n{}",
                 status,
                 String::from_utf8_lossy(&errors).trim()
             )
@@ -248,13 +267,61 @@ fn track(entry: Entry) -> Option<Track> {
         .find(|url| validate_url(url).is_ok())?;
     Some(Track {
         title: entry.title.unwrap_or_else(|| t!("Без названия").into()),
+        // Where nothing says who made the track, its link still names the profile.
         artist: entry
             .artist
             .or(entry.uploader)
+            .or_else(|| crate::cache::named(&url).map(|track| track.artist))
             .unwrap_or_else(|| t!("Неизвестный исполнитель").into()),
         duration: entry.duration,
         url,
     })
+}
+
+/// The name a profile has in its address, read from the name itself, `@name`, or a
+/// link to the profile or to its likes.
+pub fn profile(input: &str) -> Result<String> {
+    let input = input.trim();
+    let name = if input.contains('/') {
+        let link = if input.contains("://") {
+            input.to_owned()
+        } else {
+            format!("https://{input}")
+        };
+        let url = Url::parse(&link).ok().filter(|url| {
+            matches!(url.scheme(), "https" | "http")
+                && matches!(
+                    url.host_str(),
+                    Some("soundcloud.com" | "www.soundcloud.com" | "m.soundcloud.com")
+                )
+        });
+        let parts: Vec<&str> = (url.iter())
+            .flat_map(|url| url.path_segments().into_iter().flatten())
+            .filter(|part| !part.is_empty())
+            .collect();
+        match parts[..] {
+            [name] | [name, "likes"] => name.to_owned(),
+            _ => String::new(),
+        }
+    } else {
+        input.strip_prefix('@').unwrap_or(input).to_owned()
+    };
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_');
+    if name.is_empty() || !name.chars().all(plain) {
+        return Err(t!(
+            "Ожидается имя профиля SoundCloud или ссылка на него: name или soundcloud.com/name."
+        )
+        .into());
+    }
+    // After signing in the site shows one's own pages under `you`, which names nobody.
+    if crate::cache::SECTIONS.contains(&name.as_str()) {
+        return Err(t!(
+            "{} - раздел сайта, а не профиль. Имя профиля стоит в адресе его страницы: soundcloud.com/name.",
+            name
+        )
+        .into());
+    }
+    Ok(name)
 }
 
 pub fn validate_url(value: &str) -> Result<()> {
@@ -312,6 +379,63 @@ mod tests {
         take(line, &mut count, &mut stray, &mut |_| ());
         take(b"not json", &mut count, &mut stray, &mut |_| ());
         assert_eq!((count, stray.as_deref()), (1, Some("not json")));
+    }
+
+    #[test]
+    fn a_liked_track_is_named_after_the_profile_in_its_link() {
+        // A line of the likes of a profile, as yt-dlp 2026.08 writes it.
+        let line = br#"{"_type":"url","ie_key":"Soundcloud","id":"157407329","title":"Bitter Sweet Tears","url":"https://soundcloud.com/the-propolis/bitter-sweet-tears","webpage_url":"https://soundcloud.com/the-propolis/bitter-sweet-tears","duration":null,"uploader":null}"#;
+        let tracks = parse_line(line).unwrap();
+        assert_eq!(
+            (tracks[0].artist.as_str(), tracks[0].title.as_str()),
+            ("the propolis", "Bitter Sweet Tears")
+        );
+        assert!(tracks[0].duration.is_none());
+        // A liked playlist is read as well; whoever keeps tracks leaves it out.
+        let list =
+            br#"{"_type":"url","title":"Album","url":"https://soundcloud.com/a/sets/album"}"#;
+        assert_eq!(
+            parse_line(list).unwrap()[0].artist,
+            "Неизвестный исполнитель"
+        );
+    }
+
+    #[test]
+    fn reads_the_name_of_a_profile_from_a_name_or_a_link() {
+        for input in [
+            "night_owl-1",
+            " @night_owl-1 ",
+            "soundcloud.com/night_owl-1",
+            "https://soundcloud.com/night_owl-1/",
+            "https://soundcloud.com/night_owl-1/likes",
+            "http://www.soundcloud.com/night_owl-1/likes/?si=1#x",
+            "m.soundcloud.com/night_owl-1",
+        ] {
+            assert_eq!(profile(input).unwrap(), "night_owl-1", "{input}");
+        }
+        for input in [
+            "",
+            "@",
+            "two words",
+            "--proxy=x",
+            "name?x=1",
+            "https://soundcloud.com/",
+            // A track, a playlist or a page of some other kind is not a profile.
+            "https://soundcloud.com/artist/night",
+            "https://soundcloud.com/artist/sets/album",
+            "https://soundcloud.com/artist/tracks",
+            "https://on.soundcloud.com/abc",
+            "https://soundcloud.com.evil.test/name",
+            "https://evil.test/soundcloud.com/name",
+            "file:///name",
+        ] {
+            let error = profile(input).expect_err(input).to_string();
+            assert!(error.contains("имя профиля"), "{input}: {error}");
+        }
+        for input in ["you", "https://soundcloud.com/you/likes", "discover"] {
+            let error = profile(input).expect_err(input).to_string();
+            assert!(error.contains("раздел сайта"), "{input}: {error}");
+        }
     }
 
     #[test]
