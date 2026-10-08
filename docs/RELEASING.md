@@ -19,3 +19,14 @@
 
 The release workflow does not publish a release automatically. A successful
 offline CI run does not establish that SoundCloud is reachable from users' networks.
+
+Run the preparation workflows from the CLI:
+
+```sh
+gh workflow run live.yml --ref main
+gh workflow run release.yml --ref main -f draft=true
+```
+
+Verify downloaded archives on Linux with `sha256sum --check SHA256SUMS`,
+on macOS with `shasum -a 256 --check SHA256SUMS`, or compare Windows
+`Get-FileHash -Algorithm SHA256 .\clicloud-VERSION-TARGET.zip` with the manifest.
