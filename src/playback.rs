@@ -597,6 +597,12 @@ mod tests {
         // Starting a shell and PowerShell takes a while, and a loaded machine more.
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
+            // The stand-in starts cmd.exe and Windows PowerShell before listening;
+            // that bootstrap can exceed mpv's normal five-second connection limit
+            // on CI. The outer deadline still bounds this test to sixty seconds.
+            if player.socket.is_none() {
+                player.started = Instant::now();
+            }
             match player.tick() {
                 Ok(true) => break,
                 Ok(false) if Instant::now() < deadline => {

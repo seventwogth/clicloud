@@ -59,6 +59,7 @@ if [ "$FAIL_SEARCH" = "late" ]; then exit 1; fi
 if [ "$1" = "--version" ]; then printf 'test-mpv\n'; exit 0; fi
 printf '%s\n' "$@" > "$PLAYER_LOG"
 printf '%s\n' "${http_proxy-unset}" > "$PLAYER_PROXY"
+printf '%s\n' "${no_proxy-unset}" > "$PLAYER_PROXY.bypass"
 for arg in "$@"; do last="$arg"; done
 if [ "$last" = "-" ]; then cat > "$PLAYER_BYTES"; fi
 if [ -f "$last" ]; then cat "$last" > "$PLAYER_BYTES"; fi
@@ -452,10 +453,11 @@ fn disabled_setting_and_explicit_direct_playback() {
         .unwrap();
     assert!(output.status.success());
     assert!(
-        fs::read_to_string(fixture.0.join("player.log"))
-            .unwrap()
-            .contains("--ytdl-raw-options-append=proxy=\n")
+        !fixture
+            .read("player.log")
+            .contains("--ytdl-raw-options-append=proxy=")
     );
+    assert_eq!(fixture.read("player.proxy.bypass").trim(), "*");
 }
 
 #[test]

@@ -205,11 +205,14 @@ def damaged_library_on_exit():
         config.write_text("{}")
         library = root / "library.json"
         library.write_text("{}")
+        program = root / "program"
+        program.write_text("#!/bin/sh\nprintf 'test-version\\n'\n")
+        program.chmod(0o755)
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
         before = termios.tcgetattr(slave)
         process = subprocess.Popen(["target/debug/clicloud", "--no-proxy", "--no-cache",
-                                    "--yt-dlp", "/bin/true", "--mpv", "/bin/true",
+                                    "--yt-dlp", str(program), "--mpv", str(program),
                                     "--config", str(config), "ui", "--library", str(library)],
                                    stdin=slave, stdout=slave, stderr=slave)
         output = bytearray()

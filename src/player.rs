@@ -154,7 +154,11 @@ pub fn from_url(command: &mut Command, extractor: Extractor, url: &str) {
         for name in PROXY_VARIABLES {
             command.env_remove(name);
         }
-        command.arg("--ytdl-raw-options-append=proxy=");
+        // mpv's hook treats empty raw-option values as flags, so `proxy=` would
+        // become a bare --proxy and consume another argument as the proxy address.
+        // Config is already ignored; bypass system proxies as well as the removed
+        // environment proxies without passing a value-taking flag to the hook.
+        command.env("no_proxy", "*").env("NO_PROXY", "*");
     } else if let Some(proxy) = https_proxy(|name| std::env::var(name).ok()) {
         // FFmpeg inside mpv only reads the lowercase http_proxy; without it the stream
         // would bypass the proxy through which yt-dlp resolved it.
