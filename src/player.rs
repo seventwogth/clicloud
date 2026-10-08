@@ -34,11 +34,57 @@ fn https_proxy(variable: impl Fn(&str) -> Option<String>) -> Option<String> {
     }
 }
 
+/// How mpv is to sound, as the settings say.
+#[derive(Clone, Copy, Default)]
+pub struct Sound<'a> {
+    /// Whether tracks are brought to one loudness.
+    pub normalize: bool,
+    /// The device to play on, by the name mpv knows it by; None leaves it to mpv.
+    pub device: Option<&'a str>,
+}
+
+// One loudness for every track, by the measure that broadcasters use.
+const LOUDNESS: &str = "--af=lavfi=[loudnorm=I=-16:TP=-1.5:LRA=11]";
+
 /// mpv with the options shared by `play` and the TUI.
-pub fn mpv(executable: &str) -> Command {
+pub fn mpv(executable: &str, sound: Sound) -> Command {
     let mut command = Command::new(executable);
     command.args(["--no-config", "--no-video", "--no-audio-display"]);
+    if sound.normalize {
+        command.arg(LOUDNESS);
+    }
+    if let Some(device) = sound.device {
+        command.arg(format!("--audio-device={device}"));
+    }
     command
+}
+
+/// The devices mpv can play on: the name it knows each by, and what to call it.
+pub fn devices(executable: &str) -> Vec<(String, String)> {
+    let listed = Command::new(executable)
+        .args(["--no-config", "--audio-device=help"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match listed {
+        Ok(output) => listing(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+// What `--audio-device=help` prints: a line for each device, `'name' (what it is)`.
+fn listing(text: &str) -> Vec<(String, String)> {
+    (text.lines())
+        .filter_map(|line| {
+            let (name, rest) = line.trim().strip_prefix('\'')?.split_once('\'')?;
+            let rest = rest.trim();
+            let described = (rest.strip_prefix('('))
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap_or(rest);
+            Some((name.to_owned(), described.to_owned()))
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
 }
 
 /// Lets mpv fetch `url` itself; must be the last arguments of `command`.
@@ -367,10 +413,11 @@ pub fn play(
     url: &str,
     track: Option<&Track>,
     cache: Option<&Cache>,
+    sound: Sound,
 ) -> Result<()> {
     soundcloud::validate_url(url)?;
     let signals = Signals::new()?;
-    let mut command = mpv(executable);
+    let mut command = mpv(executable, sound);
     if let Some(cache) = cache {
         if let Some(file) = cache.find(url) {
             if let Some(track) = track {
@@ -408,7 +455,7 @@ pub fn play(
         }
     }
     if extractor.proxy.is_some() {
-        return play_through_proxy(executable, extractor, url, &signals);
+        return play_through_proxy(executable, extractor, url, &signals, sound);
     }
     from_url(&mut command, extractor, url);
     let status = run(&mut command, &signals)?;
@@ -427,6 +474,7 @@ fn play_through_proxy(
     extractor: Extractor,
     url: &str,
     signals: &Signals,
+    sound: Sound,
 ) -> Result<()> {
     eprintln!(
         "{}",
@@ -437,7 +485,7 @@ fn play_through_proxy(
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| t!("Не удалось запустить yt-dlp: {}", error))?;
-    let mut command = mpv(executable);
+    let mut command = mpv(executable, sound);
     from_pipe(&mut command, source.stdout.take().expect("piped stdout"));
     let played = run(&mut command, signals);
     // Always reap the downloader, including early player exit, signals or failed spawn.
@@ -473,7 +521,40 @@ fn outcome(
 
 #[cfg(test)]
 mod tests {
-    use super::https_proxy;
+    use super::*;
+
+    #[test]
+    fn reads_the_devices_that_mpv_lists() {
+        let text = "List of detected audio devices:\n  'auto' (Autoselect device)\n  \
+            'pipewire/alsa_output.pci-0000_06_00.6' (Ryzen HD Audio (Pro))\n  'alsa' ()\n\nnoise\n";
+        assert_eq!(
+            listing(text),
+            [
+                ("auto".to_owned(), "Autoselect device".to_owned()),
+                (
+                    "pipewire/alsa_output.pci-0000_06_00.6".to_owned(),
+                    "Ryzen HD Audio (Pro)".to_owned()
+                ),
+                ("alsa".to_owned(), String::new()),
+            ]
+        );
+        assert!(listing("mpv: unknown option").is_empty());
+        // A program that cannot be started lists nothing.
+        assert!(devices("clicloud-no-such-program").is_empty());
+        let loud = mpv(
+            "mpv",
+            Sound {
+                normalize: true,
+                device: Some("alsa"),
+            },
+        );
+        let args: Vec<_> = loud
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[3..], [LOUDNESS, "--audio-device=alsa"]);
+        assert_eq!(mpv("mpv", Sound::default()).get_args().count(), 3);
+    }
 
     #[test]
     fn picks_the_http_proxy_that_yt_dlp_would_use_for_https() {

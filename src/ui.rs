@@ -124,10 +124,12 @@ enum Setting {
     SearchLimit,
     SeekStep,
     Volume,
+    Normalize,
+    Device,
     Likes,
 }
 
-const SETTINGS: [Setting; 11] = [
+const SETTINGS: [Setting; 13] = [
     Setting::Theme,
     Setting::Backdrop,
     Setting::Language,
@@ -138,6 +140,8 @@ const SETTINGS: [Setting; 11] = [
     Setting::SearchLimit,
     Setting::SeekStep,
     Setting::Volume,
+    Setting::Normalize,
+    Setting::Device,
     Setting::Likes,
 ];
 const SEEK_STEPS: [u16; 5] = [5, 10, 15, 30, 60];
@@ -155,6 +159,8 @@ impl Setting {
             Self::SearchLimit => t!("Результатов поиска"),
             Self::SeekStep => t!("Шаг перемотки"),
             Self::Volume => t!("Громкость при запуске"),
+            Self::Normalize => t!("Ровная громкость"),
+            Self::Device => t!("Аудиоустройство"),
             Self::Likes => t!("Лайки SoundCloud"),
         }
     }
@@ -196,6 +202,16 @@ impl Setting {
             Self::SearchLimit => t!("Left/Right - по 5, от 5 до 50 треков на один поиск."),
             Self::SeekStep => t!("Left/Right - 5, 10, 15, 30 или 60 секунд на одно нажатие."),
             Self::Volume => t!("Left/Right - по 5. Применяется при следующем запуске."),
+            Self::Normalize => {
+                t!(
+                    "Enter - включить или выключить: тихие и громкие треки\nприводятся к одной громкости. Действует со следующего трека."
+                )
+            }
+            Self::Device => {
+                t!(
+                    "Enter или Left/Right - следующее из устройств, что видит mpv.\nавто оставляет выбор за ним. Действует сразу."
+                )
+            }
             Self::Likes => {
                 t!(
                     "Enter - имя профиля или ссылка, ещё раз Enter - добавить его\nлайки в избранное. Лайки должны быть видны в профиле.\nПока список читается, Enter прерывает его."
@@ -297,6 +313,8 @@ struct Import {
 
 // A track being downloaded into the cache without being played.
 struct Fetch {
+    // Fetched because it plays next, not because it was asked for: nothing is said of it.
+    ahead: bool,
     // Whether what yt-dlp notes of the track is still to be looked for.
     unknown: bool,
     track: Track,
@@ -374,6 +392,13 @@ struct App {
     player: Option<Playback>,
     failures: u8,
     volume: f64,
+    // How fast tracks play, for as long as the interface runs.
+    speed: f64,
+    // The devices mpv can play on, once it was asked.
+    devices: Vec<(String, String)>,
+    // The track that was last fetched ahead of its turn: one that fails is not asked for
+    // again on every tick.
+    fetched_ahead: Option<String>,
     query: String,
     editing: bool,
     searching: bool,
@@ -445,6 +470,9 @@ impl App {
             current: None,
             player: None,
             failures: 0,
+            speed: 1.0,
+            devices: vec![],
+            fetched_ahead: None,
             query: String::new(),
             editing: false,
             searching: false,
@@ -711,6 +739,14 @@ impl App {
             Setting::SearchLimit => self.settings.search_limit.to_string(),
             Setting::SeekStep => t!("{} с", self.settings.seek_step),
             Setting::Volume => self.settings.volume.to_string(),
+            Setting::Normalize => switch(self.settings.normalize),
+            Setting::Device => match &self.settings.audio_device {
+                None => t!("авто").into(),
+                // Called what mpv calls it, once mpv was asked; by its name until then.
+                Some(device) => (self.devices.iter())
+                    .find(|(name, described)| name == device && !described.is_empty())
+                    .map_or_else(|| device.clone(), |(_, described)| described.clone()),
+            },
             Setting::Likes => match (&self.import, &self.imported) {
                 (Some(import), _) => {
                     t!("{}: получено {}", import.profile, import.tracks.len())
@@ -860,6 +896,30 @@ impl App {
             }
             Setting::Volume => {
                 self.settings.volume = step(u64::from(self.settings.volume), 5, 100) as u8;
+            }
+            Setting::Normalize => self.settings.normalize = !self.settings.normalize,
+            Setting::Device => {
+                // mpv is asked once what it can play on; its own choice is the first.
+                if self.devices.is_empty() {
+                    self.devices = player::devices(&self.mpv);
+                    self.devices.retain(|(name, _)| name != "auto");
+                }
+                if self.devices.is_empty() {
+                    self.message = t!("mpv не назвал ни одного устройства").into();
+                    return;
+                }
+                let count = self.devices.len() + 1;
+                let at = (self.settings.audio_device.as_ref())
+                    .and_then(|device| self.devices.iter().position(|(name, _)| name == device))
+                    .map_or(0, |at| at + 1);
+                let next = (at + count).saturating_add_signed(isize::from(delta)) % count;
+                self.settings.audio_device =
+                    next.checked_sub(1).map(|at| self.devices[at].0.clone());
+                // What plays now moves to the device at once.
+                let device = self.settings.audio_device.as_deref().unwrap_or("auto");
+                if let Some(player) = &mut self.player {
+                    let _ = player.send(json!(["set_property", "audio-device", device]));
+                }
             }
         }
         self.persist();
@@ -1254,12 +1314,23 @@ impl App {
     fn start(&mut self, track: Track) {
         self.player = None;
         self.last_error = None;
+        // Being fetched ahead of its turn, the track is fetched by its player instead:
+        // two downloads of it would write the same place.
+        if self
+            .fetch
+            .as_ref()
+            .is_some_and(|f| f.track.url == track.url)
+        {
+            self.fetch = None;
+        }
         match Playback::start(
             &self.mpv,
             self.extractor(),
             &track,
             self.cache.as_ref(),
+            self.settings.sound(),
             self.volume,
+            self.speed,
         ) {
             Ok(player) => {
                 self.message = match player.origin {
@@ -1312,6 +1383,28 @@ impl App {
             self.player = None;
             self.message = t!("Очередь закончилась").into();
         }
+    }
+    // The player went on to the next track by itself: the lists follow it there.
+    fn advanced(&mut self) {
+        let Some(track) = self.queue.pop_front().or_else(|| self.ahead.pop_front()) else {
+            return;
+        };
+        if let Some(current) = self.current.take() {
+            self.previous.push(current);
+            if self.previous.len() > 200 {
+                self.previous.remove(0);
+            }
+        }
+        // Played now, it is the last one to be evicted.
+        if let Some(cache) = &self.cache {
+            cache.find(&track.url);
+        }
+        self.failures = 0;
+        self.library.recent.retain(|t| t.url != track.url);
+        self.library.recent.insert(0, track.clone());
+        self.library.recent.truncate(30);
+        self.current = Some(track);
+        self.save();
     }
     // The current track played to its end.
     fn ended(&mut self) {
@@ -1379,6 +1472,44 @@ impl App {
         };
         self.fetch_next();
     }
+    /// Fetches the track that plays next into the cache while the current one plays, so
+    /// that it starts at once. It waits until the current one has all of its audio and
+    /// nothing else is being fetched: the connection is first for what is heard.
+    fn fetch_ahead(&mut self) {
+        let idle = self.fetch.is_none() && self.pending.is_empty();
+        let playing = (self.player.as_ref()).is_some_and(|p| p.loaded && !p.receiving());
+        let (Some(cache), true) = (&self.cache, idle && playing) else {
+            return;
+        };
+        let Some(next) = self.queue.front().or(self.ahead.front()) else {
+            return;
+        };
+        if !cache.accepts(&next.url)
+            || cache.contains(&next.url)
+            || self.fetched_ahead.as_deref() == Some(next.url.as_str())
+        {
+            return;
+        }
+        let next = next.clone();
+        self.fetched_ahead = Some(next.url.clone());
+        if let Ok(Some((download, log))) = self.fetch(&next) {
+            self.fetch = Some(Fetch {
+                ahead: true,
+                unknown: next.duration.is_none(),
+                track: next,
+                download,
+                log,
+            });
+        }
+    }
+    // Faster or slower by a tenth, between half and twice the speed of the recording.
+    fn pace(&mut self, tenths: f64) {
+        self.speed = ((self.speed * 10.0 + tenths).round() / 10.0).clamp(0.5, 2.0);
+        if let Some(player) = &mut self.player {
+            let _ = player.send(json!(["set_property", "speed", self.speed]));
+        }
+        self.message = t!("Скорость: x{}", format!("{:.1}", self.speed));
+    }
     fn fetch_next(&mut self) {
         while self.fetch.is_none()
             && let Some(track) = self.pending.pop_front()
@@ -1386,6 +1517,7 @@ impl App {
             match self.fetch(&track) {
                 Ok(fetch) => {
                     self.fetch = fetch.map(|(download, log)| Fetch {
+                        ahead: false,
                         unknown: track.duration.is_none(),
                         track,
                         download,
@@ -1693,7 +1825,9 @@ impl App {
             }
         {
             let name = format!("{} - {}", fetch.track.artist, fetch.track.title);
-            if saved {
+            if fetch.ahead {
+                // Its turn will tell whether it plays.
+            } else if saved {
                 self.message = t!("В кеше: {}", name);
             } else {
                 let mut report = t!("{}\nyt-dlp не смог загрузить трек в кеш.", name);
@@ -1707,6 +1841,7 @@ impl App {
             self.fetch = None;
             self.fetch_next();
         }
+        self.fetch_ahead();
         // An import from the command line writes the library while this one is open.
         if self.synced.elapsed() > Duration::from_secs(2) && self.sync() {
             self.list_stored();
@@ -1748,12 +1883,31 @@ impl App {
                 self.failures = 0;
             }
             self.volume = player.volume;
-            match result {
+            let (advanced, astray) = (player.advanced(), player.astray());
+            let outcome = match result {
+                Ok(over) => Ok(over),
+                Err(error) => Err((error.to_string(), player.details())),
+            };
+            if advanced {
+                self.advanced();
+            }
+            if astray && let Some(track) = self.current.clone() {
+                // It plays what was to follow before that was changed: start over.
+                return self.start(track);
+            }
+            // The same player goes on to the next track where that one is stored: a
+            // new player would leave a gap between the two.
+            let next = match (&self.cache, self.repeat() != Repeat::One) {
+                (Some(cache), true) => (self.queue.front().or(self.ahead.front()))
+                    .and_then(|track| cache.stored(&track.url)),
+                _ => None,
+            };
+            if let Some(player) = &mut self.player {
+                player.follow(next.as_deref());
+            }
+            match outcome {
                 Ok(true) => self.ended(),
-                Err(error) => {
-                    let details = player.details();
-                    self.failed(error.to_string(), details);
-                }
+                Err((error, details)) => self.failed(error, details),
                 _ => (),
             }
         }
@@ -2014,6 +2168,8 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     KeyCode::Char('[') => app.turn(-1),
                     KeyCode::Char('b') => app.back(),
                     KeyCode::Char('F') => app.favor_all(),
+                    KeyCode::Char('.') => app.pace(1.0),
+                    KeyCode::Char(',') => app.pace(-1.0),
                     KeyCode::Char('z') => app.action(Action::Shuffle),
                     KeyCode::Char('r') => app.action(Action::Repeat),
                     KeyCode::Char('+') | KeyCode::Char('=') => app.action(Action::Louder),
@@ -2170,18 +2326,30 @@ fn time(value: f64) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 // The played and the remaining part of the bar and the times after it.
-fn progress(position: f64, duration: f64, width: u16) -> (String, String, String) {
+// The bar of a track: what has played, what has arrived beyond that, the rest, and
+// the times after it.
+fn progress(
+    position: f64,
+    arrived: f64,
+    duration: f64,
+    width: u16,
+) -> (String, String, String, String) {
     let times = format!(" {} / {}", time(position), time(duration));
     let cells = usize::from(width).saturating_sub(times.len() + 2);
-    let filled = if duration > 0.0 {
-        ((position / duration).clamp(0.0, 1.0) * cells as f64) as usize
-    } else {
-        0
+    let part = |seconds: f64| {
+        if duration > 0.0 {
+            ((seconds / duration).clamp(0.0, 1.0) * cells as f64) as usize
+        } else {
+            0
+        }
     };
+    let filled = part(position);
+    let loaded = part(arrived).max(filled) - filled;
     let head = if filled > 0 { ">" } else { "" };
     (
         format!("{}{head}", "=".repeat(filled.saturating_sub(1))),
-        "-".repeat(cells - filled),
+        "~".repeat(loaded),
+        "-".repeat(cells - filled - loaded),
         times,
     )
 }
@@ -2808,12 +2976,15 @@ fn draw_upcoming(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
 fn draw_player(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     // The frame also tells how a list plays, with the keys that change it.
-    let title = format!(
+    let mut title = format!(
         "{}| z {} | r {} ",
         t!(" ПЛЕЕР "),
         app.order(),
         app.repeating()
     );
+    if app.speed != 1.0 {
+        title.push_str(&format!("| x{:.1} ", app.speed));
+    }
     frame.render_widget(block(&title, theme), area);
     let area = area.inner(Margin {
         horizontal: 2,
@@ -2857,13 +3028,18 @@ fn draw_player(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         ]),
         theme.text,
     );
-    let (played, left, times) = progress(position, duration, area.width);
+    // What has arrived of a track that is still coming shows ahead of what has played.
+    let arrived = (app.player.as_ref())
+        .filter(|player| player.origin != Origin::Cache)
+        .map_or(0.0, |player| player.buffered);
+    let (played, loaded, left, times) = progress(position, arrived, duration, area.width);
     label(
         frame,
         Rect::new(area.x, area.y + 2, area.width, 1),
         Line::from(vec![
             Span::styled("[", theme.muted),
             Span::styled(played, theme.bar),
+            Span::styled(loaded, theme.muted),
             Span::styled(left, theme.border),
             Span::styled("]", theme.muted),
             Span::styled(times, theme.text),
@@ -2928,7 +3104,10 @@ fn draw_help(frame: &mut Frame, theme: &Theme, size: Rect) {
         ("z / r", t!("Вперемешку / повтор: нет, список, трек")),
         ("m / u", t!("Похожие треки / автор   [ ]  Его разделы")),
         ("F / b", t!("Весь список в избранное / назад к списку")),
-        ("Left / Right", t!("Перемотка")),
+        (
+            "Left / Right",
+            t!("Перемотка        , .  Медленнее / быстрее"),
+        ),
         ("- / +", t!("Громкость    s  Стоп    q  Выход")),
         ("o", t!("Настройки и цветовые схемы")),
         ("e", t!("Подробности последней ошибки")),
@@ -3830,6 +4009,125 @@ esac"#,
     }
 
     #[test]
+    fn the_next_track_is_fetched_ahead_and_the_player_goes_on_to_it() {
+        let root = std::env::temp_dir().join(format!("clicloud-ahead-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let extractor = script("ahead-fetch", "printf audio");
+        let player = script("ahead-player", "exec sleep 30");
+        let library = root.with_extension("json");
+        let mut app = app(library.clone());
+        app.cache = Some(Cache::open(root.clone(), 0).unwrap());
+        app.yt_dlp = extractor.to_string_lossy().into_owned();
+        app.mpv = player.to_string_lossy().into_owned();
+        app.results = (1..=3).map(numbered).collect();
+        let stored = |app: &App, number: usize| {
+            (app.cache.as_ref().unwrap()).contains(&numbered(number).url)
+        };
+
+        // While the track that plays is still arriving, nothing else is fetched.
+        app.table.select(Some(0));
+        app.action(Action::Play);
+        app.fetch_ahead();
+        assert!(app.fetch.is_none(), "{}", app.message);
+        assert!(app.message.contains("Загрузка трека"), "{}", app.message);
+        for _ in 0..500 {
+            app.tick();
+            if stored(&app, 1) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stored(&app, 1) && !stored(&app, 2));
+        // All of it is there and it plays: the one after it is fetched, quietly.
+        app.player.as_mut().unwrap().loaded = true;
+        app.message = "playing".into();
+        app.fetch_ahead();
+        assert!(app.fetch.as_ref().is_some_and(|fetch| fetch.ahead));
+        assert_eq!(app.fetch.as_ref().unwrap().track.title, "Title 2");
+        for _ in 0..500 {
+            if app.fetch.is_none() {
+                break;
+            }
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stored(&app, 2) && !stored(&app, 3));
+        assert_eq!(app.message, "playing");
+
+        // The player went on to it by itself: the lists follow, and no player starts.
+        app.advanced();
+        assert_eq!(app.current.as_ref().unwrap().title, "Title 2");
+        assert_eq!(app.library.recent[0].title, "Title 2");
+        assert_eq!(app.previous.last().unwrap().title, "Title 1");
+        assert_eq!(app.ahead.len(), 1);
+        // A track that could not be fetched ahead is not asked for on every tick.
+        app.yt_dlp = "clicloud-no-such-program".into();
+        app.fetch_ahead();
+        app.fetch_ahead();
+        assert!(app.fetch.is_none());
+        assert_eq!(app.fetched_ahead.as_deref(), Some(numbered(3).url.as_str()));
+
+        // The speed is kept for the tracks that follow, between half and twice.
+        for _ in 0..15 {
+            app.pace(1.0);
+        }
+        assert_eq!((app.speed, app.message.as_str()), (2.0, "Скорость: x2.0"));
+        assert!(screen(&mut app, 80, 24).contains("| x2.0 "));
+        for _ in 0..20 {
+            app.pace(-1.0);
+        }
+        assert_eq!(app.speed, 0.5);
+        drop(app);
+        for file in [extractor, player, library] {
+            fs::remove_file(file).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mpv_is_told_how_to_sound_by_the_settings() {
+        let file = std::env::temp_dir().join(format!("clicloud-sound-{}.json", std::process::id()));
+        let player = script(
+            "sound-player",
+            "echo 'List of detected audio devices:'\necho \"  'auto' (Autoselect device)\"\necho \"  'pipewire' (Default (pipewire))\"\necho \"  'alsa/card' (Card)\"",
+        );
+        let mut app = app(PathBuf::new());
+        app.config = Some(file.clone());
+        let choose = |app: &mut App, setting: Setting| {
+            app.setting = SETTINGS.iter().position(|s| *s == setting).unwrap();
+        };
+        choose(&mut app, Setting::Normalize);
+        assert_eq!(app.value(Setting::Normalize), "выкл");
+        app.activate();
+        assert!(app.settings.normalize && app.settings.sound().normalize);
+
+        // mpv is asked once what it can play on; its own choice stands first.
+        choose(&mut app, Setting::Device);
+        assert_eq!(app.value(Setting::Device), "авто");
+        app.mpv = "clicloud-no-such-program".into();
+        app.activate();
+        assert_eq!(app.message, "mpv не назвал ни одного устройства");
+        app.mpv = player.to_string_lossy().into_owned();
+        app.activate();
+        assert_eq!(app.settings.audio_device.as_deref(), Some("pipewire"));
+        assert_eq!(app.value(Setting::Device), "Default (pipewire)");
+        app.adjust(1);
+        assert_eq!(app.settings.sound().device, Some("alsa/card"));
+        app.adjust(1);
+        assert_eq!(app.value(Setting::Device), "авто");
+        app.adjust(-1);
+        assert_eq!(app.value(Setting::Device), "Card");
+        let saved = config::load(Some(&file)).unwrap();
+        assert!(saved.normalize && saved.audio_device.as_deref() == Some("alsa/card"));
+        // A device that mpv does not list is still shown, by its name.
+        app.settings.audio_device = Some("jack".into());
+        assert_eq!(app.value(Setting::Device), "jack");
+        for path in [file, player] {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn a_list_plays_on_from_the_track_that_was_started() {
         let player = script("order-player", "exec sleep 30");
         let file = std::env::temp_dir().join(format!("clicloud-order-{}.json", std::process::id()));
@@ -4201,9 +4499,16 @@ esac"#,
     #[test]
     fn progress_bar_fills_its_width() {
         let bar = |position, duration, width| {
-            let (played, left, times) = progress(position, duration, width);
-            format!("[{played}{left}]{times}")
+            let (played, loaded, left, times) = progress(position, 0.0, duration, width);
+            format!("[{played}{loaded}{left}]{times}")
         };
+        // What has arrived stands between what has played and what is still to come.
+        let (played, loaded, left, _) = progress(30.0, 45.0, 60.0, 24);
+        assert_eq!(format!("{played}{loaded}{left}"), "====>~~---");
+        let (played, loaded, left, _) = progress(30.0, 10.0, 60.0, 24);
+        assert_eq!(format!("{played}{loaded}{left}"), "====>-----");
+        let (_, loaded, left, _) = progress(0.0, 600.0, 60.0, 24);
+        assert_eq!(format!("{loaded}{left}"), "~~~~~~~~~~");
         assert_eq!(bar(0.0, 0.0, 24), "[----------] 0:00 / 0:00");
         assert_eq!(bar(30.0, 60.0, 24), "[====>-----] 0:30 / 1:00");
         assert_eq!(bar(90.0, 60.0, 24), "[=========>] 1:30 / 1:00");

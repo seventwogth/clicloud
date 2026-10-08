@@ -67,7 +67,7 @@ with socket.socket(socket.AF_UNIX) as server:
                 log.write(json.dumps(command)+"\\n")
             if command[0] == "observe_property":
                 name = command[2]
-                data = {"time-pos":12,"duration":235,"pause":False,"volume":volume}[name]
+                data = {"time-pos":12,"duration":235,"pause":False,"volume":volume,"speed":1,"demuxer-cache-time":40,"path":"-"}[name]
             elif command[:2] == ["cycle","pause"]:
                 name, data = "pause", True
             elif command[:2] == ["add","volume"]:
@@ -152,7 +152,7 @@ if os.environ.get("MPV_LINGER"):
             read_until(stored.exists)
             assert stored.read_bytes() == b"mock-audio"
             os.write(master, b"n")
-            read_until(lambda: sum(c[0] == "observe_property" for c in log()) >= 8)
+            read_until(lambda: sum(c[0] == "observe_property" for c in log()) >= 14)
             assert (root / "mpv.args").read_text().split() == ["-", str(stored)]
             # The stored track is listed in the library and can be removed from the cache there.
             assert json.loads((cache / "tracks" / "test.night").read_text())["title"] == "Night radio"
@@ -164,7 +164,7 @@ if os.environ.get("MPV_LINGER"):
             read_until(lambda: json.loads(settings.read_text() or "{}").get("search_limit") == 15)
             # The last line of the settings brings the likes of a profile into the favorites:
             # the one that is a favorite already stays single, the playlist is left out.
-            os.write(master, b"jjj\r@someone\r")
+            os.write(master, b"jjjjj\r@someone\r")
             library = root / "library.json"
             read_until(lambda: len(json.loads(library.read_text())["favorites"]) == 2)
             assert json.loads(settings.read_text())["soundcloud_profile"] == "someone"
