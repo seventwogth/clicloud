@@ -347,9 +347,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "この画面には対話型の端末が必要です。スクリプトでは search か play --first を使ってください。",
     ),
     (
-        "Не удалось определить путь библиотеки; укажите ui --library PATH",
-        "The library path is unknown; pass ui --library PATH",
-        "ライブラリの場所が不明です。ui --library PATH を指定してください",
+        "Не удалось определить путь библиотеки; укажите {} --library PATH",
+        "The library path is unknown; pass {} --library PATH",
+        "ライブラリの場所が不明です。{} --library PATH を指定してください",
     ),
     (
         "\n  CLICLOUD\n\n  Увеличьте терминал до 80x24.\n  q - выход",
@@ -778,9 +778,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "yt-dlp ({}) を実行できません: {}  clicloud doctor で確認してください。",
     ),
     (
-        "Поиск yt-dlp завершился с {}:\n{}",
-        "The yt-dlp search ended with {}:\n{}",
-        "yt-dlp の検索が {} で終了しました:\n{}",
+        "yt-dlp завершился с {}:\n{}",
+        "yt-dlp ended with {}:\n{}",
+        "yt-dlp が {} で終了しました:\n{}",
     ),
     (
         "Некорректный ответ JSON от yt-dlp: {}",
@@ -843,6 +843,38 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Enter or Left/Right - the language of the interface and messages.\nThe command line help (--help) stays in Russian.",
         "Enter か Left/Right - 画面とメッセージの言語を切り替えます。\nコマンドラインのヘルプ (--help) はロシア語のままです。",
     ),
+    (
+        "Читаю лайки профиля {}…",
+        "Reading the likes of {}…",
+        "{} のいいねを読み込み中…",
+    ),
+    (
+        "Ожидается имя профиля SoundCloud или ссылка на него: name или soundcloud.com/name.",
+        "A SoundCloud profile name or a link to it is expected: name or soundcloud.com/name.",
+        "SoundCloud のプロフィール名かそのリンクを指定してください: name か soundcloud.com/name",
+    ),
+    (
+        "{} - раздел сайта, а не профиль. Имя профиля стоит в адресе его страницы: soundcloud.com/name.",
+        "{} is a section of the site, not a profile. The name of a profile is in the address of its page: soundcloud.com/name.",
+        "{} はサイトのセクションで、プロフィールではありません。プロフィール名はそのページのアドレスにあります: soundcloud.com/name",
+    ),
+    ("Получено: {}", "Received: {}", "取得済み: {}"),
+    (
+        "В профиле нет лайков.",
+        "The profile has no likes.",
+        "このプロフィールにいいねはありません。",
+    ),
+    (
+        "Было бы добавлено: {}, уже в избранном: {}, пропущено: {}",
+        "Would be added: {}, already among the favorites: {}, skipped: {}",
+        "追加予定: {}、お気に入りに登録済み: {}、スキップ: {}",
+    ),
+    (
+        "Добавлено в избранное: {}, уже было: {}, пропущено: {}",
+        "Added to the favorites: {}, already there: {}, skipped: {}",
+        "お気に入りに追加: {}、登録済み: {}、スキップ: {}",
+    ),
+    ("Библиотека: {}", "Library: {}", "ライブラリ: {}"),
 ];
 
 #[cfg(test)]
@@ -887,6 +919,7 @@ mod tests {
         let sources = [
             include_str!("cache.rs"),
             include_str!("config.rs"),
+            include_str!("library.rs"),
             include_str!("main.rs"),
             include_str!("playback.rs"),
             include_str!("player.rs"),

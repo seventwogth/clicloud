@@ -3,6 +3,7 @@ mod lang;
 
 mod cache;
 mod config;
+mod library;
 #[cfg(unix)]
 mod playback;
 mod player;
@@ -81,6 +82,17 @@ enum Action {
         /// Воспроизвести первый результат без выбора
         #[arg(long)]
         first: bool,
+    },
+    /// Добавить в избранное треки, отмеченные лайком в профиле SoundCloud
+    Import {
+        /// Имя профиля или ссылка на него: name, @name, soundcloud.com/name
+        profile: String,
+        /// Путь к JSON-библиотеке
+        #[arg(long)]
+        library: Option<std::path::PathBuf>,
+        /// Показать, что было бы добавлено, ничего не записывая
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Показать, сколько занимает кеш, или очистить его
     Cache {
@@ -322,6 +334,62 @@ fn run(cli: Cli) -> Result<()> {
                 t!("Пробел: пауза; ←/→: перемотка; 9/0: громкость; q: выход.")
             );
             player::play(&cli.mpv, extractor, &url, found.as_ref(), cache.as_ref())?;
+        }
+        Action::Import {
+            profile,
+            library,
+            dry_run,
+        } => {
+            // Checked before the network is asked: a bad name, a damaged library.
+            soundcloud::profile(&profile)?;
+            let path = library::path(library, "import")?;
+            let mut kept = library::load(&path)?;
+            let before = kept.favorites.len();
+            let counted = io::stderr().is_terminal();
+            let mut liked = Vec::new();
+            let listed = provider.likes(&profile, |track| {
+                liked.push(track);
+                if counted {
+                    eprint!("\r{}", t!("Получено: {}", liked.len()));
+                }
+            });
+            if counted && !liked.is_empty() {
+                eprintln!();
+            }
+            // A list that broke off is kept as far as it came: asking again adds the rest.
+            if liked.is_empty() {
+                listed?;
+                println!("{}", t!("В профиле нет лайков."));
+                return Ok(());
+            }
+            let merged = kept.merge(liked);
+            if dry_run {
+                print_tracks(&kept.favorites[before..]);
+                println!(
+                    "{}",
+                    t!(
+                        "Было бы добавлено: {}, уже в избранном: {}, пропущено: {}",
+                        merged.added,
+                        merged.known,
+                        merged.skipped
+                    )
+                );
+            } else {
+                if merged.added > 0 {
+                    library::save(&path, &kept)?;
+                }
+                println!(
+                    "{}\n{}",
+                    t!(
+                        "Добавлено в избранное: {}, уже было: {}, пропущено: {}",
+                        merged.added,
+                        merged.known,
+                        merged.skipped
+                    ),
+                    t!("Библиотека: {}", path.display())
+                );
+            }
+            listed?;
         }
         Action::Cache { clear } => {
             if let Some(cache) = cache.as_ref().filter(|_| clear) {
