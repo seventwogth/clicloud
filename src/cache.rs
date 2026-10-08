@@ -19,7 +19,7 @@ const TAG_CONTENT: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
 // An unfinished download this old was left behind by a killed process.
 const STALE: Duration = Duration::from_secs(24 * 60 * 60);
 // Profile pages and site sections: links that look like `artist/track` but are lists.
-const LISTS: [&str; 11] = [
+pub const LISTS: [&str; 11] = [
     "sets",
     "tracks",
     "albums",

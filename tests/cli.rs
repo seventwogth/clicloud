@@ -739,6 +739,61 @@ fn import_adds_the_likes_of_a_profile_to_the_favorites_once() {
 }
 
 #[test]
+fn links_are_opened_as_the_lists_they_lead_to() {
+    let fixture = Fixture::new();
+    let search = |link: &str| {
+        let output = fixture
+            .command()
+            .args(["search", link, "--limit", "7", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        fixture.read("search.log")
+    };
+    // A page of a profile tells of its tracks itself.
+    let args = search(" http://www.soundcloud.com/artist/tracks/?si=1 ");
+    assert!(args.contains("--flat-playlist\n") && args.contains("--playlist-end\n7\n"));
+    assert!(
+        args.ends_with("--\nhttps://soundcloud.com/artist/tracks\n"),
+        "{args}"
+    );
+    // A playlist does not, so each of its tracks is looked up, without its audio.
+    let args = search("https://soundcloud.com/artist/sets/album");
+    assert!(!args.contains("--flat-playlist"), "{args}");
+    assert!(
+        args.contains("--ignore-no-formats-error\n--extractor-args\nsoundcloud:formats=none\n")
+    );
+    assert!(
+        args.ends_with("--\nhttps://soundcloud.com/artist/sets/album\n"),
+        "{args}"
+    );
+    // Words are still searched for.
+    assert!(search("artist tracks").ends_with("--\nscsearch7:artist tracks\n"));
+
+    // `import` takes a list by its link, where it is not the likes of a profile.
+    let library = fixture.0.join("library.json");
+    let output = fixture
+        .command()
+        .env("SEARCH_RESPONSE", LIKES)
+        .args([
+            "import",
+            "https://soundcloud.com/artist/reposts",
+            "--library",
+        ])
+        .arg(&library)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Добавлено в избранное: 2"));
+    let args = fixture.read("search.log");
+    assert!(!args.contains("--playlist-end"), "{args}");
+    assert!(
+        args.ends_with("--\nhttps://soundcloud.com/artist/reposts\n"),
+        "{args}"
+    );
+}
+
+#[test]
 fn import_keeps_what_arrived_before_a_failure_and_reports_it() {
     let fixture = Fixture::new();
     let library = fixture.0.join("library.json");
@@ -760,7 +815,7 @@ fn import_keeps_what_arrived_before_a_failure_and_reports_it() {
     // A profile without likes is no failure, and no library is made for it.
     let output = import("0", "");
     assert!(output.status.success(), "{:?}", output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("нет лайков"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("нет треков"));
     assert!(!library.exists());
     // The list broke off: what came is kept, and the run still fails.
     let output = import("late", LIKES);

@@ -83,9 +83,9 @@ enum Action {
         #[arg(long)]
         first: bool,
     },
-    /// Добавить в избранное треки, отмеченные лайком в профиле SoundCloud
+    /// Добавить в избранное лайки профиля SoundCloud или треки списка по ссылке
     Import {
-        /// Имя профиля или ссылка на него: name, @name, soundcloud.com/name
+        /// Имя профиля (name, @name, soundcloud.com/name) или ссылка на плейлист, репосты, треки автора
         profile: String,
         /// Путь к JSON-библиотеке
         #[arg(long)]
@@ -272,7 +272,9 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Action::Search { query, limit, json } => {
-            let tracks = provider.search(&query, limit)?;
+            // A link to a playlist or to a page of a profile is opened, not searched for.
+            let mut tracks = Vec::new();
+            provider.ask(&query, limit.into(), |track| tracks.push(track))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&tracks)?);
             } else {
@@ -340,25 +342,36 @@ fn run(cli: Cli) -> Result<()> {
             library,
             dry_run,
         } => {
-            // Checked before the network is asked: a bad name, a damaged library.
-            soundcloud::profile(&profile)?;
+            // Checked before the network is asked: a bad name, a damaged library. A link
+            // to another list than the likes of a profile is taken as that list.
+            let list = match soundcloud::profile(&profile) {
+                Ok(_) => None,
+                Err(error) => match soundcloud::page(&profile) {
+                    Some((soundcloud::Page::Set | soundcloud::Page::Listing, link)) => Some(link),
+                    _ => return Err(error),
+                },
+            };
             let path = library::path(library, "import")?;
             library::load(&path)?;
             let counted = io::stderr().is_terminal();
             let mut liked = Vec::new();
-            let listed = provider.likes(&profile, |track| {
+            let mut count = |track| {
                 liked.push(track);
                 if counted {
                     eprint!("\r{}", t!("Получено: {}", liked.len()));
                 }
-            });
+            };
+            let listed = match &list {
+                Some(link) => provider.open(link, None, &mut count),
+                None => provider.likes(&profile, &mut count),
+            };
             if counted && !liked.is_empty() {
                 eprintln!();
             }
             // A list that broke off is kept as far as it came: asking again adds the rest.
             if liked.is_empty() {
                 listed?;
-                println!("{}", t!("В профиле нет лайков."));
+                println!("{}", t!("В списке нет треков."));
                 return Ok(());
             }
             // Read again: the list took its time, and the interface may have written since.
