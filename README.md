@@ -460,9 +460,9 @@ Schemes:
   the rest of the terminal; the background of the terminal, a transparent one
   included, is left alone. In other terminals their 16 colors are used.
 - `mono`: no color; bold, dim and reverse.
-- Ghostty themes: 45 are built in (Catppuccin, Dracula, Gruvbox, Nord,
-  TokyoNight, Rose Pine, Kanagawa, Everforest, Solarized and others), and where
-  Ghostty is installed all of its themes and your own from
+- Ghostty themes: 56 are built in (Black Metal, Catppuccin, Dracula, Gruvbox,
+  Nord, TokyoNight, Rose Pine, Kanagawa, Everforest, Solarized and others), and
+  where Ghostty is installed all of its themes and your own from
   `~/.config/ghostty/themes` are available.
 
 `Enter` on the line of the scheme opens a list: the scheme under the cursor is

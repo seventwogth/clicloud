@@ -14,12 +14,53 @@ pub const TERMINAL: &str = "terminal";
 pub const MONO: &str = "mono";
 
 // Copies of theme files that ship with Ghostty; see themes/README.md.
-const BUILT_IN: [(&str, &str); 45] = [
+const BUILT_IN: [(&str, &str); 56] = [
     ("Atom One Dark", include_str!("../themes/Atom One Dark")),
     ("Atom One Light", include_str!("../themes/Atom One Light")),
     ("Ayu", include_str!("../themes/Ayu")),
     ("Ayu Light", include_str!("../themes/Ayu Light")),
     ("Ayu Mirage", include_str!("../themes/Ayu Mirage")),
+    ("Black Metal", include_str!("../themes/Black Metal")),
+    (
+        "Black Metal (Bathory)",
+        include_str!("../themes/Black Metal (Bathory)"),
+    ),
+    (
+        "Black Metal (Burzum)",
+        include_str!("../themes/Black Metal (Burzum)"),
+    ),
+    (
+        "Black Metal (Dark Funeral)",
+        include_str!("../themes/Black Metal (Dark Funeral)"),
+    ),
+    (
+        "Black Metal (Gorgoroth)",
+        include_str!("../themes/Black Metal (Gorgoroth)"),
+    ),
+    (
+        "Black Metal (Immortal)",
+        include_str!("../themes/Black Metal (Immortal)"),
+    ),
+    (
+        "Black Metal (Khold)",
+        include_str!("../themes/Black Metal (Khold)"),
+    ),
+    (
+        "Black Metal (Marduk)",
+        include_str!("../themes/Black Metal (Marduk)"),
+    ),
+    (
+        "Black Metal (Mayhem)",
+        include_str!("../themes/Black Metal (Mayhem)"),
+    ),
+    (
+        "Black Metal (Nile)",
+        include_str!("../themes/Black Metal (Nile)"),
+    ),
+    (
+        "Black Metal (Venom)",
+        include_str!("../themes/Black Metal (Venom)"),
+    ),
     ("Carbonfox", include_str!("../themes/Carbonfox")),
     (
         "Catppuccin Frappe",

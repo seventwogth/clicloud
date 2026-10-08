@@ -446,9 +446,9 @@ clicloud import https://soundcloud.com/my-profile/sets/mix   # плейлист
   терминалом; фон терминала, включая прозрачный, остаётся нетронутым. В других
   терминалах используются их 16 цветов.
 - `mono` — без цвета: жирный, тусклый и инверсия.
-- темы Ghostty: 45 встроены (Catppuccin, Dracula, Gruvbox, Nord, TokyoNight,
-  Rose Pine, Kanagawa, Everforest, Solarized и другие), а если Ghostty
-  установлен, доступны все его темы и ваши собственные из
+- темы Ghostty: 56 встроены (Black Metal, Catppuccin, Dracula, Gruvbox, Nord,
+  TokyoNight, Rose Pine, Kanagawa, Everforest, Solarized и другие), а если
+  Ghostty установлен, доступны все его темы и ваши собственные из
   `~/.config/ghostty/themes`.
 
 `Enter` на строке схемы открывает список: схема под курсором сразу
