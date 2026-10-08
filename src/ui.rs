@@ -2813,7 +2813,6 @@ fn length(knows: bool, reported: f64, listed: f64) -> f64 {
     }
 }
 
-// The played and the remaining part of the bar and the times after it.
 // The bar of a track: what has played, what has arrived beyond that, the rest, and
 // the times after it.
 fn progress(
