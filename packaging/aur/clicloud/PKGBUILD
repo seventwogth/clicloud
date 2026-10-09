@@ -1,6 +1,6 @@
 # Maintainer: seventwogth <mxllywd at gmail dot com>
 pkgname=clicloud
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Terminal music player built on yt-dlp and mpv"
 arch=('x86_64' 'aarch64')
@@ -11,7 +11,7 @@ makedepends=('cargo')
 optdepends=('mpv-mpris: media keys and the player of the desktop panel'
             'tor: playing through Tor with --tor')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('97d2a0214d06e88e55d5efacc062cd5e74618b3a47a620a2f949bcd0bea17b7a')
+sha256sums=('00c21e6a1b8b2438c2076eacd721af158eb0096438a987139082f9ad7202ad56')
 
 prepare() {
   cd "$pkgname-$pkgver"
