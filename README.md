@@ -38,7 +38,7 @@ then read `clicloud` in place of `cargo run --`.
 Linux, into `~/.local/bin`:
 
 ```sh
-v=0.1.0
+v=0.1.1
 base=https://github.com/seventwogth/clicloud/releases/download/v$v
 curl -LO $base/clicloud-$v-x86_64-unknown-linux-gnu.tar.gz
 curl -LO $base/SHA256SUMS
@@ -51,7 +51,7 @@ clicloud doctor
 Windows, in PowerShell; the two sums it prints must be the same:
 
 ```powershell
-$v    = "0.1.0"
+$v    = "0.1.1"
 $zip  = "clicloud-$v-x86_64-pc-windows-msvc.zip"
 $base = "https://github.com/seventwogth/clicloud/releases/download/v$v"
 Invoke-WebRequest "$base/$zip" -OutFile $zip

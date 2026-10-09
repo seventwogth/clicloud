@@ -38,7 +38,7 @@ Rust нужен только для самостоятельной сборки,
 Linux, в `~/.local/bin`:
 
 ```sh
-v=0.1.0
+v=0.1.1
 base=https://github.com/seventwogth/clicloud/releases/download/v$v
 curl -LO $base/clicloud-$v-x86_64-unknown-linux-gnu.tar.gz
 curl -LO $base/SHA256SUMS
@@ -51,7 +51,7 @@ clicloud doctor
 Windows, в PowerShell; две суммы, которые он напечатает, должны совпасть:
 
 ```powershell
-$v    = "0.1.0"
+$v    = "0.1.1"
 $zip  = "clicloud-$v-x86_64-pc-windows-msvc.zip"
 $base = "https://github.com/seventwogth/clicloud/releases/download/v$v"
 Invoke-WebRequest "$base/$zip" -OutFile $zip
