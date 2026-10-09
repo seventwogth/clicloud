@@ -121,6 +121,16 @@ if os.environ.get("MPV_LINGER"):
         try:
             # The name is drawn, not spelled, on a screen this tall; the search box is always there.
             read_until(lambda: b"SEARCH" in output)
+            # A first start asks, in a window of its own, whether it may look for
+            # newer versions, and takes no key for anything else until it is
+            # answered. The answer is kept, so it is asked once and never again.
+            read_until(lambda: b"UPDATES" in output)
+            os.write(master, b"n")
+            settings = root / "config.json"
+            read_until(
+                lambda: settings.exists()
+                and json.loads(settings.read_text()).get("update_check") is False
+            )
             # Esc kills a hanging search; the next one must then run normally.
             search_pid = root / "search.pid"
             (root / "slow").touch()
@@ -202,7 +212,7 @@ def damaged_library_on_exit():
     with tempfile.TemporaryDirectory(prefix="cc-", dir="/tmp") as directory:
         root = Path(directory)
         config = root / "config.json"
-        config.write_text("{}")
+        config.write_text('{"update_check": false}')
         library = root / "library.json"
         library.write_text("{}")
         program = root / "program"
@@ -245,7 +255,7 @@ def hangup():
     # round on a terminal that is gone.
     with tempfile.TemporaryDirectory(prefix="cc-", dir="/tmp") as directory:
         root = Path(directory)
-        (root / "config.json").write_text('{"language":"ru"}')
+        (root / "config.json").write_text('{"language":"ru","update_check":false}')
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
         process = subprocess.Popen(["target/debug/clicloud", "--no-proxy", "--no-cache",

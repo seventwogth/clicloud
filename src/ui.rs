@@ -6084,6 +6084,12 @@ exit /b 1"#,
         ] {
             assert!(text.contains(part), "{part}\n{text}");
         }
+        // In English the window is titled UPDATES, which is what the PTY smoke test
+        // waits for before it answers; the two must not drift apart.
+        lang::set(Lang::English);
+        let english = screen(&mut app, 80, 24);
+        assert!(english.contains("UPDATES"), "{english}");
+        lang::set(Lang::Russian);
         // A no is kept, nothing is looked for, and the question does not come back.
         app.answer(false);
         assert_eq!(app.settings.update_check, Some(false));
