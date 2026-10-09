@@ -174,7 +174,9 @@ if os.environ.get("MPV_LINGER"):
             read_until(lambda: json.loads(settings.read_text() or "{}").get("search_limit") == 15)
             # The last line of the settings brings the likes of a profile into the favorites:
             # the one that is a favorite already stays single, the playlist is left out.
-            os.write(master, b"jjjjjjj\r@someone\r")
+            # Down stops at the last line, so more presses than there are lines land
+            # on it however many lines the settings grow to.
+            os.write(master, b"j" * 30 + b"\r@someone\r")
             library = root / "library.json"
             read_until(lambda: len(json.loads(library.read_text())["favorites"]) == 2)
             assert json.loads(settings.read_text())["soundcloud_profile"] == "someone"
