@@ -39,7 +39,8 @@ def main():
             shutil.copy2(file, stage / file)
         shutil.copy2(Path("docs/releases") / f"v{version}.md", stage / "RELEASE_NOTES.md")
         (stage / "SOURCE_COMMIT").write_text(
-            subprocess.check_output(["git", "rev-parse", "HEAD"], text=True), encoding="utf-8"
+            subprocess.check_output(["git", "rev-parse", "HEAD"], text=True),
+            encoding="utf-8", newline="\n",
         )
         if windows:
             with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
@@ -49,8 +50,11 @@ def main():
             with tarfile.open(archive, "w:gz") as output:
                 output.add(stage, arcname=name)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    # Written as it will be read. On Windows a plain write_text ends the line with
+    # CRLF, and the entry for the zip in the SHA256SUMS these are concatenated into
+    # then fails `sha256sum --check` on every other system.
     archive.with_name(archive.name + ".sha256").write_text(
-        f"{digest}  {archive.name}\n", encoding="ascii"
+        f"{digest}  {archive.name}\n", encoding="ascii", newline="\n"
     )
     print(archive)
 
