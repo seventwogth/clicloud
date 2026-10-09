@@ -1,6 +1,6 @@
 # Maintainer: seventwogth <mxllywd at gmail dot com>
 pkgname=clicloud-bin
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Terminal music player built on yt-dlp and mpv (binary release)"
 arch=('x86_64')
@@ -12,7 +12,7 @@ optdepends=('mpv-mpris: media keys and the player of the desktop panel'
 provides=('clicloud')
 conflicts=('clicloud')
 source=("$url/releases/download/v$pkgver/clicloud-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
-sha256sums=('23418663db767962587a43186384140ccff03674e63f322f444176e38c9bba5d')
+sha256sums=('9e56651f04dd36f7c121aa86de4ba6a19ab52f40d2cc9a34c5e4698f22a2bf84')
 
 package() {
   cd "clicloud-$pkgver-x86_64-unknown-linux-gnu"
