@@ -43,6 +43,10 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       - name: Build
+        # Only a binary built here may replace itself; one from a package manager
+        # is that manager's to update, and is built without this.
+        env:
+          CLICLOUD_RELEASE: '1'
         run: cargo +stable build --release --locked --target ${{ matrix.target }}
       - name: Package and check executable
         run: python scripts/package_release.py --target ${{ matrix.target }}

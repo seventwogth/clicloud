@@ -51,6 +51,13 @@ pub struct Settings {
     /// The profile whose likes the interface was last asked to bring in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub soundcloud_profile: Option<String>,
+    /// Whether clicloud asks GitHub for a newer release of itself. None until the
+    /// user has been asked, which the interface does once, at its first start: no
+    /// request leaves the machine before there is an answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_check: Option<bool>,
+    /// When the last look happened, in seconds since the epoch; 0 for never.
+    pub update_checked: u64,
 }
 
 impl Default for Settings {
@@ -76,6 +83,8 @@ impl Default for Settings {
             shuffle: false,
             repeat: "off".into(),
             soundcloud_profile: None,
+            update_check: None,
+            update_checked: 0,
         }
     }
 }

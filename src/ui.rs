@@ -12,6 +12,7 @@ use crate::{
     setup,
     soundcloud::{self, Details, Extractor, SoundCloud, Track},
     theme::{self, Theme},
+    update,
 };
 use crossterm::{
     event::{
@@ -129,10 +130,12 @@ enum Setting {
     Device,
     MediaKeys,
     Extractor,
+    Updates,
+    Version,
     Likes,
 }
 
-const SETTINGS: [Setting; 16] = [
+const SETTINGS: [Setting; 18] = [
     Setting::Theme,
     Setting::Backdrop,
     Setting::Cover,
@@ -148,6 +151,8 @@ const SETTINGS: [Setting; 16] = [
     Setting::Device,
     Setting::MediaKeys,
     Setting::Extractor,
+    Setting::Updates,
+    Setting::Version,
     Setting::Likes,
 ];
 const SEEK_STEPS: [u16; 5] = [5, 10, 15, 30, 60];
@@ -170,6 +175,8 @@ impl Setting {
             Self::Device => t!("Аудиоустройство"),
             Self::MediaKeys => t!("Медиаклавиши"),
             Self::Extractor => "yt-dlp",
+            Self::Updates => t!("Обновления"),
+            Self::Version => t!("Версия"),
             Self::Likes => t!("Лайки SoundCloud"),
         }
     }
@@ -234,6 +241,20 @@ impl Setting {
             Self::Extractor => {
                 t!(
                     "Enter - узнать версию; если yt-dlp скачан клиентом, взять свежий.\nПоставленный иначе обновляется тем же способом, что ставился."
+                )
+            }
+            Self::Updates => {
+                t!(
+                    "Enter - включить или выключить проверку новых версий клиента.
+Раз в сутки у GitHub спрашивается номер последнего релиза,
+через тот же прокси, что и всё остальное."
+                )
+            }
+            Self::Version => {
+                t!(
+                    "Enter - посмотреть, нет ли версии новее, а когда есть - взять её.
+Обновляется только клиент, поставленный из релиза; поставленный
+иначе обновляется тем же способом, что ставился."
                 )
             }
             Self::Likes => {
@@ -454,6 +475,14 @@ struct App {
     // look at the one there is.
     update: Option<mpsc::Receiver<std::result::Result<PathBuf, String>>>,
     updated: Option<String>,
+    // The one question asked before any request about ourselves leaves the machine.
+    asking: bool,
+    // A look for a release of our own, and the later one it may have found.
+    release: Option<mpsc::Receiver<std::result::Result<Option<update::Release>, String>>>,
+    newest: Option<update::Release>,
+    // Putting that release in our place, and what came of the attempt.
+    upgrade: Option<mpsc::Receiver<std::result::Result<String, String>>>,
+    upgraded: Option<String>,
     // The tracks that did not play when they were last tried in this run, by the names
     // of their files.
     broken: std::collections::HashSet<String>,
@@ -553,6 +582,11 @@ impl App {
             plugin,
             update: None,
             updated: None,
+            asking: false,
+            release: None,
+            newest: None,
+            upgrade: None,
+            upgraded: None,
             devices: vec![],
             fetched_ahead: None,
             query: String::new(),
@@ -881,6 +915,24 @@ impl App {
                 (None, Some(said)) => said.clone(),
                 (None, None) => self.yt_dlp.clone(),
             },
+            Setting::Updates => switch(self.settings.update_check == Some(true)),
+            Setting::Version => {
+                match (&self.upgrade, &self.upgraded, &self.release, &self.newest) {
+                    (Some(_), ..) => t!("Скачиваю и проверяю...").into(),
+                    (None, Some(said), ..) => said.clone(),
+                    (None, None, Some(_), _) => t!("Смотрю, нет ли новее...").into(),
+                    (None, None, None, Some(release)) if update::installable() => {
+                        t!("есть {}: Enter - обновить", release.version)
+                    }
+                    (None, None, None, Some(release)) => {
+                        t!(
+                            "есть {}: обновите тем же путём, каким ставили",
+                            release.version
+                        )
+                    }
+                    (None, None, None, None) => crate::VERSION.into(),
+                }
+            }
             Setting::Likes => match (&self.import, &self.imported) {
                 (Some(import), _) => {
                     t!("{}: получено {}", import.profile, import.tracks.len())
@@ -946,6 +998,20 @@ impl App {
                 self.input = Some(self.address.clone().unwrap_or_else(|| config::TOR.into()));
             }
             Setting::Extractor => self.update(),
+            Setting::Updates => {
+                let on = self.settings.update_check == Some(true);
+                self.settings.update_check = Some(!on);
+                self.persist();
+                self.upgraded = None;
+                // Turning it on is an answer in itself, so the first look happens now.
+                if !on {
+                    self.look();
+                }
+            }
+            // A look is asked for by hand here even where they are turned off: this
+            // keypress is the consent that a look of its own accord would lack.
+            Setting::Version if self.newest.is_some() && update::installable() => self.upgrade(),
+            Setting::Version => self.look(),
             Setting::Likes if self.import.is_some() => self.cancel_import(),
             Setting::Likes => {
                 self.input = Some(self.settings.soundcloud_profile.clone().unwrap_or_default());
@@ -1018,7 +1084,11 @@ impl App {
                 self.message = t!("Нажмите /, чтобы найти музыку. ? - все клавиши").into();
             }
             Setting::Proxy | Setting::Cache => return self.activate(),
-            Setting::ProxyAddress | Setting::Likes | Setting::Extractor => return,
+            Setting::ProxyAddress
+            | Setting::Likes
+            | Setting::Extractor
+            | Setting::Updates
+            | Setting::Version => return,
             Setting::CacheLimit => {
                 self.settings.cache_limit_mb = step(self.settings.cache_limit_mb, 256, 1024 * 1024);
                 if let Some(cache) = &mut self.cache {
@@ -1098,6 +1168,58 @@ impl App {
             let _ = sender.send(fetched);
         });
         self.update = Some(receiver);
+    }
+
+    /// The answer to the one question, kept so it is never asked twice.
+    fn answer(&mut self, yes: bool) {
+        self.asking = false;
+        self.settings.update_check = Some(yes);
+        self.persist();
+        if yes {
+            self.look();
+        }
+    }
+
+    /// Asks the releases of clicloud whether one of them is later than this build.
+    /// Nothing is downloaded here, and nothing is asked without the user's leave.
+    fn look(&mut self) {
+        if self.release.is_some() || self.upgrade.is_some() {
+            return;
+        }
+        self.upgraded = None;
+        let (sender, receiver) = mpsc::channel();
+        let proxy = self.proxy.clone();
+        let language = lang::current();
+        std::thread::spawn(move || {
+            // The errors of the look are worded in this thread.
+            lang::set(language);
+            let found = update::latest(proxy.as_deref())
+                .map(|release| update::newer(crate::VERSION, &release.version).then_some(release))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(found);
+        });
+        self.release = Some(receiver);
+        // Noted when the look starts, so a failing one is not retried all day.
+        self.settings.update_checked = update::now();
+        self.persist();
+    }
+
+    /// Puts the release that was found in the place of the running binary.
+    fn upgrade(&mut self) {
+        let Some(release) = self.newest.clone().filter(|_| self.upgrade.is_none()) else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let proxy = self.proxy.clone();
+        let language = lang::current();
+        std::thread::spawn(move || {
+            lang::set(language);
+            let done = update::install(proxy.as_deref(), &release)
+                .map(|()| release.version)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(done);
+        });
+        self.upgrade = Some(receiver);
     }
     // Enter on what was typed into the current line.
     fn submit(&mut self) {
@@ -2176,6 +2298,57 @@ impl App {
                 });
             }
         }
+        if let Some(receiver) = &self.release {
+            let found = match receiver.try_recv() {
+                Ok(found) => Some(found),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(t!("Проверка прервалась").into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(found) = found {
+                self.release = None;
+                match found {
+                    Ok(Some(release)) => {
+                        // Told here as well, so it is seen without opening settings.
+                        self.message = t!("Вышла версия {}: o - настройки", release.version);
+                        self.newest = Some(release);
+                    }
+                    Ok(None) => self.upgraded = Some(t!("{}, новее нет", crate::VERSION)),
+                    Err(error) => self.upgraded = Some(t!("Не вышло: {}", clean_lines(&error))),
+                }
+            }
+        }
+        if let Some(receiver) = &self.upgrade {
+            let done = match receiver.try_recv() {
+                Ok(done) => Some(done),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(t!("Загрузка прервалась").into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(done) = done {
+                self.upgrade = None;
+                self.upgraded = Some(match done {
+                    Ok(version) => {
+                        self.newest = None;
+                        self.message = t!("Обновлено до {}. Перезапустите клиент.", version);
+                        t!("обновлён: {}, нужен перезапуск", version)
+                    }
+                    Err(error) => t!("Не вышло: {}", clean_lines(&error)),
+                });
+            }
+        }
+        // The look of the day, once the user has allowed them and nothing is afoot.
+        if self.settings.update_check == Some(true)
+            && self.release.is_none()
+            && self.newest.is_none()
+            && self.upgrade.is_none()
+            && self.upgraded.is_none()
+            && update::now().saturating_sub(self.settings.update_checked) >= update::BETWEEN_LOOKS
+        {
+            self.look();
+        }
         // An import from the command line writes the library while this one is open.
         if self.synced.elapsed() > Duration::from_secs(2) && self.sync() {
             self.list_stored();
@@ -2384,6 +2557,8 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
     });
     let mut app = App::new(session, path, library);
     app.setup = Setup::needed(&app.yt_dlp, &app.mpv);
+    // Until this is answered the settings hold no answer, and no look is made.
+    app.asking = app.settings.update_check.is_none();
     app.warm();
     terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -2445,6 +2620,15 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     match key.code {
                         KeyCode::Enter if !busy => app.install(),
                         KeyCode::Esc | KeyCode::Char('q') if !busy => app.setup = None,
+                        _ => (),
+                    }
+                    continue;
+                }
+                if app.asking {
+                    match key.code {
+                        KeyCode::Char('y' | 'д') | KeyCode::Enter => app.answer(true),
+                        KeyCode::Char('n' | 'н') | KeyCode::Esc => app.answer(false),
+                        KeyCode::Char('q') => break,
                         _ => (),
                     }
                     continue;
@@ -2927,6 +3111,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.details {
         draw_details(frame, app, &theme, size);
+    }
+    if app.asking {
+        draw_question(frame, &theme, size);
     }
     if app.setup.is_some() {
         draw_setup(frame, app, &theme, size);
@@ -3910,6 +4097,54 @@ fn draw_setup(frame: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(modal(t!(" ПРОГРАММЫ | Esc - продолжить без них "), theme)),
+        area,
+    );
+}
+
+// The one question, asked at the first start and never again: a request about
+// ourselves is still a request, and on a client that goes through Tor by default it
+// is not ours to make unasked.
+fn draw_question(frame: &mut Frame, theme: &Theme, size: Rect) {
+    let lines = vec![
+        Line::raw(""),
+        Line::styled(
+            t!(" Проверять, не вышла ли новая версия clicloud?"),
+            theme.text,
+        ),
+        Line::raw(""),
+        Line::styled(
+            t!(" Раз в сутки клиент спросит у GitHub номер последнего релиза."),
+            theme.muted,
+        ),
+        Line::styled(
+            t!(" Запрос идёт через тот же прокси, что и всё остальное."),
+            theme.muted,
+        ),
+        Line::styled(
+            t!(" Само обновление не начнётся без отдельного согласия."),
+            theme.muted,
+        ),
+        Line::raw(""),
+        Line::styled(t!(" y - да,  n - нет"), theme.accent),
+        Line::styled(
+            t!(" Ответ меняется в настройках, строка «Обновления»."),
+            theme.muted,
+        ),
+        Line::raw(""),
+    ];
+    let width = size.width.clamp(24, 76);
+    let height = (lines.len() as u16 + 2).clamp(5, size.height);
+    let area = Rect::new(
+        (size.width - width) / 2,
+        (size.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(modal(t!(" ОБНОВЛЕНИЯ "), theme)),
         area,
     );
 }
@@ -5831,6 +6066,57 @@ exit /b 1"#,
         // multi-line gate keeps are kept.
         assert_eq!(clean("a\u{1b}[31mb"), "a[31mb");
         assert_eq!(clean_lines("a\nb\u{1f451}"), "a\nb");
+    }
+
+    #[test]
+    fn the_question_about_updates_is_asked_once_and_remembered() {
+        lang::set(Lang::Russian);
+        let mut app = app(PathBuf::new());
+        // Nothing is answered, so nothing has been asked of GitHub either.
+        assert_eq!(app.settings.update_check, None);
+        assert!(app.release.is_none() && app.newest.is_none());
+        app.asking = true;
+        let text = screen(&mut app, 80, 24);
+        for part in [
+            "Проверять, не вышла ли новая версия clicloud?",
+            "через тот же прокси",
+            "y - да,  n - нет",
+        ] {
+            assert!(text.contains(part), "{part}\n{text}");
+        }
+        // A no is kept, nothing is looked for, and the question does not come back.
+        app.answer(false);
+        assert_eq!(app.settings.update_check, Some(false));
+        assert!(!app.asking && app.release.is_none());
+        assert_eq!(app.settings.update_checked, 0);
+        let text = screen(&mut app, 80, 24);
+        assert!(!text.contains("Проверять, не вышла"), "{text}");
+    }
+
+    #[test]
+    fn the_rows_of_the_settings_tell_what_is_known_of_the_version() {
+        lang::set(Lang::Russian);
+        let mut app = app(PathBuf::new());
+        assert_eq!(app.value(Setting::Updates), "выкл");
+        app.settings.update_check = Some(true);
+        assert_eq!(app.value(Setting::Updates), "вкл");
+        // With nothing looked for, the row is simply the version of this build.
+        assert_eq!(app.value(Setting::Version), crate::VERSION);
+        app.upgraded = Some("0.1.0, новее нет".into());
+        assert_eq!(app.value(Setting::Version), "0.1.0, новее нет");
+        // A release that was found is named, and tests never may install one, so the
+        // row says to update the way the client was installed.
+        app.upgraded = None;
+        app.newest = Some(update::Release {
+            version: "9.9.9".into(),
+            asset: "clicloud-9.9.9-x86_64-pc-windows-msvc.zip".into(),
+            sum: "0".repeat(64),
+        });
+        assert!(!update::installable());
+        assert_eq!(
+            app.value(Setting::Version),
+            "есть 9.9.9: обновите тем же путём, каким ставили"
+        );
     }
 
     #[test]

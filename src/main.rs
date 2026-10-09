@@ -12,6 +12,7 @@ mod setup;
 mod soundcloud;
 mod theme;
 mod ui;
+mod update;
 
 use cache::Cache;
 use clap::{Parser, Subcommand};
@@ -20,6 +21,9 @@ use std::io::{self, IsTerminal, Write};
 use std::process::{Command, ExitCode};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// What this build calls itself, and what a release is compared against.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
 #[command(version, about = "Search and play music in the terminal")]
@@ -105,6 +109,8 @@ enum Action {
 }
 
 fn main() -> ExitCode {
+    // An update of a running Windows binary cannot remove the old one; this can.
+    update::tidy();
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

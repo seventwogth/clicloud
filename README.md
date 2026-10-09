@@ -441,6 +441,8 @@ would not do, is shown in the window itself.
 | Audio device | One of the devices mpv sees; `auto` leaves the choice to it | `audio_device` |
 | Media keys | Pause, stop and the tracks around from the keyboard and the panel of the desktop, by the plugin `mpv-mpris` | `media_keys` |
 | yt-dlp | Tells its version; a yt-dlp that the client fetched is replaced by the latest release on `Enter` | — |
+| Updates | Whether the client looks for a newer release of itself, once a day | `update_check` |
+| Version | The version of this build, and what the look found; `Enter` looks, or takes the release it found | — |
 | SoundCloud likes | Adds the likes of a profile to the favorites; remembers its name | `soundcloud_profile` |
 
 The flags `--tor`, `--proxy`, `--no-proxy`, `--cache-dir` and `--no-cache` set
@@ -471,6 +473,35 @@ A theme gives the palette only. The roles of the colors (titles, the selection,
 the track that plays, the marks) are assigned by the client, which moves the
 shades as far as it takes to read them, so light and dark themes alike stay
 legible.
+
+### Updates
+
+At its first start the client asks, in a window of its own, whether it may look
+for newer versions of itself, and remembers the answer; `y` and `n` answer it.
+Until it is answered nothing is asked of anyone: the look is the only thing the
+client does that is about itself rather than about music, and on a client that
+goes through Tor by default it is not made unasked. The answer is the Updates
+row of the settings afterwards.
+
+A look happens at most once a day. It is one request to the releases of the
+project for the file `SHA256SUMS`, which names the archives of the latest
+release: the name carries the version, and the sums guard the download that may
+follow. It goes through the same proxy as everything else, and nothing is
+downloaded by it. When a newer version is out the client says so in the line of
+messages and in the Version row.
+
+`Enter` on the Version row takes the release that was found. The archive is
+checked against the sum that was published for it before anything in it is
+unpacked, and the running binary is kept until the new one is in place, so a
+download that fails half way leaves the client as it was. The new version runs
+from the next start.
+
+Only a client installed from a release replaces itself. One from a package
+manager is that manager's to update, and a binary that overwrote itself behind
+its back would leave the package database describing a file that is no longer
+there; such a build says so in the Version row instead of offering the update.
+The same is true of a build made with `cargo build`, which is updated by
+building again.
 
 ### Media keys
 

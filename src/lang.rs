@@ -1107,6 +1107,132 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "on, but the plugin mpv-mpris is not found",
         "オン (mpv-mpris プラグインが見つかりません)",
     ),
+    ("Обновления", "Updates", "更新"),
+    ("Версия", "Version", "バージョン"),
+    (
+        "Enter - включить или выключить проверку новых версий клиента.
+Раз в сутки у GitHub спрашивается номер последнего релиза,
+через тот же прокси, что и всё остальное.",
+        "Enter - turn the look for new versions of the client on or off.
+Once a day GitHub is asked for the number of the latest release,
+through the same proxy as everything else.",
+        "Enter - クライアントの新しい版の確認を切り替えます。
+一日に一度、最新リリースの番号を GitHub に問い合わせます。
+接続は他と同じプロキシを通ります。",
+    ),
+    (
+        "Enter - посмотреть, нет ли версии новее, а когда есть - взять её.
+Обновляется только клиент, поставленный из релиза; поставленный
+иначе обновляется тем же способом, что ставился.",
+        "Enter - look for a later version, and take it when there is one.
+Only a client installed from a release updates itself; one installed
+otherwise is updated the same way it was installed.",
+        "Enter - 新しい版を探し、あれば取得します。
+リリースから入れたクライアントだけが自分を更新します。
+他の方法で入れたものは、入れた方法で更新してください。",
+    ),
+    (
+        "Смотрю, нет ли новее...",
+        "Looking for a later one...",
+        "新しい版を確認中...",
+    ),
+    (
+        "есть {}: Enter - обновить",
+        "{} is out: Enter - update",
+        "{} が公開: Enter - 更新",
+    ),
+    (
+        "есть {}: обновите тем же путём, каким ставили",
+        "{} is out: update it the way you installed it",
+        "{} が公開: 入れた方法で更新してください",
+    ),
+    (
+        "Проверка прервалась",
+        "The look was cut short",
+        "確認が中断されました",
+    ),
+    (
+        "Вышла версия {}: o - настройки",
+        "Version {} is out: o - settings",
+        "バージョン {} が公開: o - 設定",
+    ),
+    ("{}, новее нет", "{}, nothing newer", "{}、これが最新です"),
+    (
+        "Обновлено до {}. Перезапустите клиент.",
+        "Updated to {}. Restart the client.",
+        "{} に更新しました。クライアントを再起動してください。",
+    ),
+    (
+        "обновлён: {}, нужен перезапуск",
+        "updated: {}, a restart is needed",
+        "更新済み: {}、再起動が必要です",
+    ),
+    (
+        " Проверять, не вышла ли новая версия clicloud?",
+        " Look for new versions of clicloud?",
+        " clicloud の新しい版を確認しますか？",
+    ),
+    (
+        " Раз в сутки клиент спросит у GitHub номер последнего релиза.",
+        " Once a day the client asks GitHub for the latest release number.",
+        " 一日に一度、最新リリースの番号を GitHub に問い合わせます。",
+    ),
+    (
+        " Запрос идёт через тот же прокси, что и всё остальное.",
+        " The request goes through the same proxy as everything else.",
+        " 接続は他と同じプロキシを通ります。",
+    ),
+    (
+        " Само обновление не начнётся без отдельного согласия.",
+        " Nothing is downloaded without a separate yes.",
+        " 実際の更新は別途の同意なしには始まりません。",
+    ),
+    (
+        " y - да,  n - нет",
+        " y - yes,  n - no",
+        " y - はい,  n - いいえ",
+    ),
+    (
+        " Ответ меняется в настройках, строка «Обновления».",
+        " The answer can be changed in the settings, the Updates row.",
+        " 回答は設定の「更新」の行で変更できます。",
+    ),
+    (" ОБНОВЛЕНИЯ ", " UPDATES ", " 更新 "),
+    (
+        "Для этой платформы релизов нет.",
+        "There are no releases for this platform.",
+        "このプラットフォーム向けのリリースはありません。",
+    ),
+    (
+        "В релизе нет файла для {}",
+        "The release has no file for {}",
+        "リリースに {} 用のファイルがありません",
+    ),
+    (
+        "Этот клиент поставлен не из релиза; обновите его так же, как ставили.",
+        "This client did not come from a release; update it the way you installed it.",
+        "このクライアントはリリース由来ではありません。入れた方法で更新してください。",
+    ),
+    (
+        "Не удалось понять, где лежит clicloud.",
+        "Could not tell where clicloud is.",
+        "clicloud の場所を特定できませんでした。",
+    ),
+    (
+        "В архиве релиза нет файла {}",
+        "The release archive has no {}",
+        "リリースのアーカイブに {} がありません",
+    ),
+    (
+        "Не удалось запустить tar: {}",
+        "Could not start tar: {}",
+        "tar を起動できませんでした: {}",
+    ),
+    (
+        "tar завершился с {}: {}",
+        "tar exited with {}: {}",
+        "tar が {} で終了しました: {}",
+    ),
 ];
 
 #[cfg(test)]
@@ -1159,6 +1285,7 @@ mod tests {
             include_str!("setup.rs"),
             include_str!("soundcloud.rs"),
             include_str!("ui.rs"),
+            include_str!("update.rs"),
         ];
         let used: Vec<String> = sources.iter().flat_map(|source| texts(source)).collect();
         assert!(used.len() > 150, "{}", used.len());
