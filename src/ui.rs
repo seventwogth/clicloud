@@ -2472,6 +2472,24 @@ impl Drop for TerminalGuard {
 /// One of `TAGLINES`, drawn for as long as the interface runs. The standard library
 /// hands out no random numbers, but the hasher that hash maps seed from the system
 /// does, and one number per run is all this takes.
+/// The key as its place on the keyboard names it. A search typed in Russian leaves the
+/// Russian layout on, and the keys of the interface are Latin letters: the same key
+/// then sends the letter that stands on it there. Where a text is typed, the letter
+/// is taken as it came.
+fn latin(code: KeyCode) -> KeyCode {
+    const CYRILLIC: &str = "йцукенгшщзхъфывапролджэячсмитьбю";
+    const LATIN: &[u8] = b"qwertyuiop[]asdfghjkl;'zxcvbnm,.";
+    let KeyCode::Char(typed) = code else {
+        return code;
+    };
+    let small = typed.to_lowercase().next().unwrap_or(typed);
+    match CYRILLIC.chars().position(|letter| letter == small) {
+        Some(at) if typed.is_uppercase() => KeyCode::Char(LATIN[at].to_ascii_uppercase().into()),
+        Some(at) => KeyCode::Char(LATIN[at].into()),
+        None => code,
+    }
+}
+
 fn tagline() -> &'static str {
     use std::hash::{BuildHasher, Hasher, RandomState};
     let seed = RandomState::new().build_hasher().finish() as usize;
@@ -2612,12 +2630,15 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
         }
         match alive!(event::read()) {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                // Outside the places where a text is typed, a key is the one it is in
+                // the Latin layout, whatever layout is on.
+                let code = latin(key.code);
+                if key.modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
                     break;
                 }
                 if app.setup.is_some() {
                     let busy = app.setup.as_ref().is_some_and(Setup::busy);
-                    match key.code {
+                    match code {
                         KeyCode::Enter if !busy => app.install(),
                         KeyCode::Esc | KeyCode::Char('q') if !busy => app.setup = None,
                         _ => (),
@@ -2628,7 +2649,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     match key.code {
                         KeyCode::Char('y' | 'д') | KeyCode::Enter => app.answer(true),
                         KeyCode::Char('n' | 'н') | KeyCode::Esc => app.answer(false),
-                        KeyCode::Char('q') => break,
+                        KeyCode::Char('q' | 'й') => break,
                         _ => (),
                     }
                     continue;
@@ -2638,7 +2659,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     continue;
                 }
                 if app.details {
-                    match key.code {
+                    match code {
                         KeyCode::Down => app.detail_scroll = app.detail_scroll.saturating_add(1),
                         KeyCode::Up => app.detail_scroll = app.detail_scroll.saturating_sub(1),
                         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('e') => app.details = false,
@@ -2696,7 +2717,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     continue;
                 }
                 if app.picker.is_some() {
-                    match key.code {
+                    match code {
                         KeyCode::Down | KeyCode::Char('j') => app.pick(1),
                         KeyCode::Up | KeyCode::Char('k') => app.pick(-1),
                         KeyCode::PageDown => app.pick(10),
@@ -2729,7 +2750,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     continue;
                 }
                 if app.options {
-                    match key.code {
+                    match code {
                         KeyCode::Esc | KeyCode::Char('o') => app.options = false,
                         KeyCode::Char('q') => break,
                         KeyCode::Down | KeyCode::Char('j') => app.move_setting(1),
@@ -2741,7 +2762,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     }
                     continue;
                 }
-                match key.code {
+                match code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('?') => app.help = true,
                     KeyCode::Char('o') => {
@@ -3040,22 +3061,26 @@ fn draw(frame: &mut Frame, app: &mut App) {
         );
         return;
     }
+    // The first lines a screen has to spare go to the logo and the gap below it.
+    let logo = if app.logo {
+        (size.height - 24).min(2)
+    } else {
+        0
+    };
+    // The least screen has no line for a gap: the list under its heading, the buttons
+    // under the list and the three lines of the player stand close, and the list has
+    // the lines for its tracks. Once it shows ten of them, the next four lines of a
+    // taller screen are those gaps, in that order.
+    let gaps = (size.height - 24 - logo).saturating_sub(4).min(4);
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            // The first lines a screen has to spare go to the logo and the gap below it.
-            Constraint::Length(
-                2 + if app.logo {
-                    (size.height - 24).min(2)
-                } else {
-                    0
-                },
-            ),
+            Constraint::Length(2 + logo),
             // The tab of the track has the lines of the search for its picture.
             Constraint::Length(if app.track_open { 0 } else { 3 }),
             Constraint::Min(8),
-            Constraint::Length(7),
+            Constraint::Length(5 + gaps.saturating_sub(2)),
             Constraint::Length(2),
         ])
         .split(size);
@@ -3080,7 +3105,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         draw_search(frame, app, &theme, outer[1]);
         draw_navigation(frame, app, &theme, body[0]);
-        draw_tracks(frame, app, &theme, body[1]);
+        draw_tracks(frame, app, &theme, body[1], gaps);
         if let Some(area) = body.get(2) {
             draw_upcoming(frame, app, &theme, *area);
         }
@@ -3321,10 +3346,13 @@ fn draw_navigation(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) 
     }
 }
 
-fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+// `gaps` is how many of the empty lines the screen has room for: the first is the one
+// under the heading of the list, the second the one under the buttons.
+fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect, gaps: u16) {
+    let (heading, below) = (1 + gaps.min(1), 1 + u16::from(gaps >= 2));
     let center = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(2)])
+        .constraints([Constraint::Min(5), Constraint::Length(below)])
         .split(area);
     let (library, author);
     let title = match (app.view, app.profile()) {
@@ -3403,7 +3431,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         // Only the rows that show are made: a library may hold thousands of tracks,
         // and each row asks the disk whether its track is stored.
         let count = tracks.len();
-        let height = usize::from(center[0].height.saturating_sub(4)).max(1);
+        let height = usize::from(center[0].height.saturating_sub(2 + heading)).max(1);
         let chosen = app.table.selected().map(|chosen| chosen.min(count - 1));
         let at = chosen.unwrap_or(0);
         let offset = (app.table.offset())
@@ -3470,7 +3498,7 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         .header(
             Row::new(["#", t!("ТРЕК"), t!("ИСПОЛНИТЕЛЬ"), t!("ВРЕМЯ"), "*", "v"])
                 .style(theme.muted)
-                .bottom_margin(1),
+                .bottom_margin(heading - 1),
         )
         .block(block(title, theme).title_bottom(
             // Where in the list the selection is, which a long list does not show.
@@ -3483,11 +3511,11 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         *app.table.offset_mut() = offset;
         app.rows = Rect::new(
             center[0].x + 1,
-            center[0].y + 3,
+            center[0].y + 1 + heading,
             center[0].width.saturating_sub(2),
-            center[0].height.saturating_sub(4),
+            center[0].height.saturating_sub(2 + heading),
         );
-        2 + ((count - offset) as u16).min(app.rows.height)
+        heading + ((count - offset) as u16).min(app.rows.height)
     };
     draw_backdrop(
         frame.buffer_mut(),
@@ -3780,7 +3808,14 @@ fn draw_settings(frame: &mut Frame, app: &mut App, theme: &Theme, size: Rect) {
         height,
     );
     frame.render_widget(Clear, area);
-    let window = modal(t!(" НАСТРОЙКИ | Esc - закрыть "), theme);
+    // Which line of how many, as under a list: a short screen shows only some of them.
+    let window = modal(t!(" НАСТРОЙКИ | Esc - закрыть "), theme).title_bottom(
+        Line::styled(
+            format!(" {}/{} ", app.setting + 1, SETTINGS.len()),
+            theme.muted,
+        )
+        .right_aligned(),
+    );
     let inner = window.inner(area);
     frame.render_widget(window, area);
     let names = SETTINGS
@@ -3935,9 +3970,11 @@ fn draw_player(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         .filter(|player| player.origin != Origin::Cache)
         .map_or(0.0, |player| player.buffered);
     let (played, loaded, left, times) = progress(position, arrived, duration, area.width);
+    // Three lines, and a gap between them for each line the frame has beyond that.
+    let bar = area.y + if area.height >= 4 { 2 } else { 1 };
     label(
         frame,
-        Rect::new(area.x, area.y + 2, area.width, 1),
+        Rect::new(area.x, bar, area.width, 1),
         Line::from(vec![
             Span::styled("[", theme.muted),
             Span::styled(played, theme.bar),
@@ -3961,7 +3998,7 @@ fn draw_player(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             Constraint::Length(5),
         ])
         .spacing(1)
-        .split(Rect::new(area.x, area.y + 4, area.width, 1));
+        .split(Rect::new(area.x, area.bottom() - 1, area.width, 1));
     button(frame, app, controls[0], "|< p", Action::Previous, false);
     button(
         frame,
@@ -5330,20 +5367,20 @@ exit /b 1"#,
         app.navigate(isize::MIN);
         assert_eq!(app.scroll, 0);
 
-        // Under a scheme without colors the halves of a block are there or not: nine
-        // rows of eighteen cells at this size, the dark of the picture left empty.
+        // Under a scheme without colors the halves of a block are there or not: eleven
+        // rows of twenty-two cells at this size, the dark of the picture left empty.
         app.covers.insert(name.clone(), Some(halves()));
         let text = screen(&mut app, 80, 24);
         let rows: Vec<&str> = text.lines().filter(|line| line.contains('█')).collect();
-        assert_eq!(rows.len(), 9, "{text}");
+        assert_eq!(rows.len(), 11, "{text}");
         assert!(
-            rows[0].contains("|          █████████  Ночной эфир"),
+            rows[0].contains("|            ███████████  Ночной эфир"),
             "{text}"
         );
         app.settings.cover = "braille".into();
         let text = screen(&mut app, 80, 24);
         assert!(
-            text.contains("|          ⣿⣿⣿⣿⣿⣿⣿⣿⣿  ") && !text.contains('█'),
+            text.contains("|            ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿  ") && !text.contains('█'),
             "{text}"
         );
         // A screen with room to spare draws it larger.
@@ -5540,6 +5577,8 @@ exit /b 1"#,
         // The least screen has no room for every line.
         let text = screen(&mut app, 80, 24);
         assert!(text.contains(first) && !text.contains(last), "{text}");
+        // So the frame says which line of how many this is.
+        assert!(text.contains(" 1/18 "), "{text}");
         app.setting = SETTINGS.len() - 1;
         let text = screen(&mut app, 80, 24);
         assert!(
@@ -5547,7 +5586,10 @@ exit /b 1"#,
             "{text}"
         );
         assert_eq!(app.setting_first, SETTINGS.len() - 13);
-        assert!(text.contains("Up/Down - выбор"), "{text}");
+        assert!(
+            text.contains("Up/Down - выбор") && text.contains(" 18/18 "),
+            "{text}"
+        );
         // A taller one shows them all.
         let text = screen(&mut app, 80, 30);
         assert!(text.contains(first) && text.contains(last) && app.setting_first == 0);
@@ -5721,21 +5763,21 @@ exit /b 1"#,
             "{text}"
         );
         assert!(
-            text.contains("0008  Title 8") && !text.contains("Title 9 "),
+            text.contains("0010  Title 10") && !text.contains("Title 11 "),
             "{text}"
         );
         // The keys move by what the screen holds, and to the ends.
         let page = app.rows.height as isize;
-        assert_eq!(page, 8);
+        assert_eq!(page, 10);
         app.navigate(page);
         app.navigate(page);
         let text = screen(&mut app, 80, 30);
         assert!(
-            text.contains("> 0017  Title 17") && text.contains(" 17/1200 "),
+            text.contains("> 0021  Title 21") && text.contains(" 21/1200 "),
             "{text}"
         );
         assert!(
-            text.contains("0010  Title 10") && !text.contains("Title 9 "),
+            text.contains("0012  Title 12") && !text.contains("Title 11 "),
             "{text}"
         );
         app.navigate(isize::MAX);
@@ -5745,14 +5787,14 @@ exit /b 1"#,
             "{text}"
         );
         assert!(
-            text.contains("1193  Title 1193") && !text.contains("Title 1192"),
+            text.contains("1191  Title 1191") && !text.contains("Title 1190"),
             "{text}"
         );
         // Going up, the selection becomes the first row that shows.
         app.navigate(-10);
         let text = screen(&mut app, 80, 30);
         assert!(
-            text.contains("> 1190  Title 1190") && text.contains("1197  Title 1197"),
+            text.contains("> 1190  Title 1190") && text.contains("1199  Title 1199"),
             "{text}"
         );
         app.navigate(isize::MIN);
@@ -5783,6 +5825,56 @@ exit /b 1"#,
         // Another view has the box for the search again, and the filter waits.
         app.select_view(View::Search);
         assert!(screen(&mut app, 80, 24).contains(" / ПОИСК   Enter - найти "));
+    }
+
+    #[test]
+    fn the_least_screen_gives_its_gaps_to_the_list() {
+        lang::set(Lang::Russian);
+        let mut app = app(PathBuf::new());
+        app.results = (1..=40).map(numbered).collect();
+        app.logo = false;
+        let text = screen(&mut app, 80, 24);
+        assert!(
+            text.contains("> 01  Title 1 ")
+                && text.contains("06  Title 6")
+                && !text.contains("Title 7 "),
+            "{text}"
+        );
+        // The three lines of the player stand close, and nothing of them is lost.
+        for part in ["СТОП", "0:00 / 0:00", "s Стоп"] {
+            assert!(text.contains(part), "{part}\n{text}");
+        }
+        // An empty list has the room to say all it says.
+        app.results.clear();
+        let text = screen(&mut app, 80, 24);
+        assert!(text.contains("Enter - слушать, f - сохранить"), "{text}");
+        // A taller screen never shows fewer tracks, and ends with every gap in place.
+        app.results = (1..=40).map(numbered).collect();
+        let mut before = 0;
+        for height in 24..=40 {
+            screen(&mut app, 80, height);
+            assert!(app.rows.height >= before, "{height}");
+            before = app.rows.height;
+        }
+        let text = screen(&mut app, 80, 36);
+        let lines: Vec<&str> = text.lines().collect();
+        let heading = lines.iter().position(|line| line.contains("ИСПОЛНИТЕЛЬ"));
+        let heading = heading.expect("the heading of the list");
+        assert!(
+            !lines[heading + 1].contains("Title") && lines[heading + 2].contains("Title 1 "),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn keys_are_read_by_their_place_in_the_russian_layout() {
+        for (typed, key) in [('й', 'q'), ('а', 'f'), ('А', 'F'), ('ъ', ']'), ('ю', '.')] {
+            assert_eq!(latin(KeyCode::Char(typed)), KeyCode::Char(key));
+        }
+        // What is the same in both layouts, and what is no letter, stays as it came.
+        for code in [KeyCode::Char('q'), KeyCode::Char('3'), KeyCode::Enter] {
+            assert_eq!(latin(code), code);
+        }
     }
 
     #[test]

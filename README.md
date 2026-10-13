@@ -201,9 +201,13 @@ The cover is fetched once, while the tab of the track is open: its address
 comes with the rest that is known of the track, `curl` downloads a 300×300
 picture through the same proxy, and mpv turns it into pixels. After that it
 lies in the cache beside the audio, or in memory until you quit when there is
-no cache. At 80×24 the cover has 18×9 cells; it grows with the screen.
+no cache. At 80×24 the cover has 22×11 cells; it grows with the screen.
 
 Buttons are pressed with the mouse or with `Tab` / `Shift+Tab` and `Enter`.
+The keys below work in the Russian layout too: a key is read by its place on
+the keyboard, so `а` is `f` and `й` is `q`. Where a text is typed, a letter is
+the letter that came. `/` and `?` are other keys in that layout, `Shift+\` and
+`Shift+7`.
 
 | Key | What it does |
 |---|---|
