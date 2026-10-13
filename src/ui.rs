@@ -16,8 +16,8 @@ use crate::{
 };
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -217,7 +217,7 @@ impl Setting {
             }
             Self::CacheLimit => {
                 t!(
-                    "Left/Right - по 256 МБ, ноль снимает ограничение.\nЛишнее удаляется, начиная с давно не игравших треков."
+                    "Left/Right - по 256 МБ, Enter - снять или вернуть ограничение.\nЛишнее удаляется, начиная с давно не игравших треков."
                 )
             }
             Self::SearchLimit => t!("Left/Right - по 5, от 5 до 50 треков на один поиск."),
@@ -342,6 +342,8 @@ enum Action {
     Enqueue,
     Download,
     Evict,
+    // Out of the queue, which is another thing than out of the cache.
+    Dequeue,
     Previous,
     Pause,
     Next,
@@ -353,6 +355,13 @@ enum Action {
     // The two tabs of the main screen: the lists, and the track that plays.
     Lists,
     Track,
+}
+
+// A change of the favorites that can be taken back: the tracks that joined them, by
+// their links, or the one that left and the place it had.
+enum Undo {
+    Added(Vec<String>),
+    Removed(usize, Track),
 }
 
 // The likes of a profile on their way into the favorites.
@@ -491,8 +500,15 @@ struct App {
     // The track that was last fetched ahead of its turn: one that fails is not asked for
     // again on every tick.
     fetched_ahead: Option<String>,
+    // The changes of the favorites made in this run, the latest last.
+    undo: Vec<Undo>,
+    // How many tracks have been stored since the downloads last had nothing to do.
+    batch: usize,
     query: String,
     editing: bool,
+    // Where the next letter goes in the text that is being typed, counted in letters:
+    // the search, the filter or a line of the settings, one at a time.
+    cursor: usize,
     searching: bool,
     // Whether the list is already being filled by the search that runs.
     filling: bool,
@@ -589,8 +605,11 @@ impl App {
             upgraded: None,
             devices: vec![],
             fetched_ahead: None,
+            undo: vec![],
+            batch: 0,
             query: String::new(),
             editing: false,
+            cursor: usize::MAX,
             searching: false,
             filling: false,
             receiver: None,
@@ -735,12 +754,78 @@ impl App {
             self.message = t!("Кеш отключён").into();
             return;
         };
+        // One that waits to be stored, or is on its way, is let go instead. The track
+        // fetched ahead of its turn is left alone: it is about to be played.
+        let waiting = self.pending.len();
+        self.pending.retain(|waits| waits.url != track.url);
+        let coming =
+            (self.fetch.as_ref()).is_some_and(|fetch| !fetch.ahead && fetch.track.url == track.url);
+        if coming || self.pending.len() < waiting {
+            if coming {
+                self.fetch = None;
+                self.fetch_next();
+            }
+            self.message = t!(
+                "Загрузка в кеш отменена: {} - {}",
+                track.artist,
+                track.title
+            );
+            return;
+        }
         self.message = match cache.remove(&track.url) {
             Ok(true) => t!("Удалено из кеша: {} - {}", track.artist, track.title),
             Ok(false) => t!("Этого трека нет в кеше").into(),
             Err(error) => t!("Не удалось удалить из кеша: {}", error),
         };
         self.list_stored();
+    }
+    // Every track that waits to be stored is let go; what is stored already stays.
+    fn stop_storing(&mut self) {
+        let mut count = self.pending.len();
+        self.pending.clear();
+        if self.fetch.as_ref().is_some_and(|fetch| !fetch.ahead) {
+            self.fetch = None;
+            count += 1;
+        }
+        self.batch = 0;
+        self.message = match count {
+            0 => t!("В кеш ничего не загружается").into(),
+            count => t!("Загрузка в кеш остановлена, отменено треков: {}", count),
+        };
+    }
+    // Remembers a change of the favorites, so that it can be taken back.
+    fn note(&mut self, change: Undo) {
+        self.undo.push(change);
+        if self.undo.len() > 50 {
+            self.undo.remove(0);
+        }
+    }
+    // Takes back the latest change of the favorites that was made here.
+    fn undo(&mut self) {
+        let Some(change) = self.undo.pop() else {
+            self.message = t!("Возвращать нечего").into();
+            return;
+        };
+        match change {
+            Undo::Added(links) => {
+                let before = self.library.favorites.len();
+                (self.library.favorites).retain(|track| !links.contains(&track.url));
+                self.message = t!(
+                    "Убрано из избранного: {}",
+                    before - self.library.favorites.len()
+                );
+            }
+            Undo::Removed(index, track) => {
+                if !(self.library.favorites.iter()).any(|kept| kept.url == track.url) {
+                    let index = index.min(self.library.favorites.len());
+                    self.library.favorites.insert(index, track);
+                }
+                self.message = t!("Возвращено в избранное").into();
+            }
+        }
+        self.save();
+        self.list_stored();
+        self.navigate(0);
     }
     fn navigate(&mut self, delta: isize) {
         // The tab of the track has a text to move through, not a list.
@@ -883,7 +968,7 @@ impl App {
             }
             Setting::Proxy => switch(self.proxy.is_some()),
             _ if self.input.is_some() && SETTINGS[self.setting] == setting => {
-                format!("{}_", self.input.as_deref().unwrap_or_default())
+                caret(self.input.as_deref().unwrap_or_default(), self.cursor)
             }
             Setting::ProxyAddress => match &self.address {
                 Some(address) => address.clone(),
@@ -996,6 +1081,7 @@ impl App {
             }
             Setting::ProxyAddress => {
                 self.input = Some(self.address.clone().unwrap_or_else(|| config::TOR.into()));
+                self.cursor = usize::MAX;
             }
             Setting::Extractor => self.update(),
             Setting::Updates => {
@@ -1012,14 +1098,23 @@ impl App {
             // keypress is the consent that a look of its own accord would lack.
             Setting::Version if self.newest.is_some() && update::installable() => self.upgrade(),
             Setting::Version => self.look(),
+            // Enter lifts the limit, or sets the usual one where there is none.
+            Setting::CacheLimit => {
+                self.limit(match self.settings.cache_limit_mb {
+                    0 => Settings::default().cache_limit_mb,
+                    _ => 0,
+                });
+            }
             Setting::Likes if self.import.is_some() => self.cancel_import(),
             Setting::Likes => {
                 self.input = Some(self.settings.soundcloud_profile.clone().unwrap_or_default());
+                self.cursor = usize::MAX;
             }
             Setting::Cache => {
                 if self.cache.take().is_some() {
                     self.fetch = None;
                     self.pending.clear();
+                    self.batch = 0;
                 } else {
                     let limit = self.settings.cache_limit_mb.saturating_mul(1024 * 1024);
                     let opened = self
@@ -1083,17 +1178,18 @@ impl App {
                 // The line at the bottom still reads in the language it was written in.
                 self.message = t!("Нажмите /, чтобы найти музыку. ? - все клавиши").into();
             }
-            Setting::Proxy | Setting::Cache => return self.activate(),
-            Setting::ProxyAddress
-            | Setting::Likes
-            | Setting::Extractor
-            | Setting::Updates
-            | Setting::Version => return,
+            Setting::Proxy | Setting::Cache | Setting::Updates => return self.activate(),
+            Setting::ProxyAddress | Setting::Likes | Setting::Extractor | Setting::Version => {
+                return;
+            }
+            // Zero would lift the limit, the opposite of what stepping down asks for:
+            // the steps end at the least limit, and Enter is what lifts it.
             Setting::CacheLimit => {
-                self.settings.cache_limit_mb = step(self.settings.cache_limit_mb, 256, 1024 * 1024);
-                if let Some(cache) = &mut self.cache {
-                    cache.set_limit(self.settings.cache_limit_mb.saturating_mul(1024 * 1024));
+                let limit = self.settings.cache_limit_mb;
+                if limit > 0 {
+                    self.limit(step(limit, 256, 1024 * 1024).max(256));
                 }
+                return;
             }
             Setting::SearchLimit => {
                 self.settings.search_limit =
@@ -1139,6 +1235,14 @@ impl App {
                     let _ = player.send(json!(["set_property", "audio-device", device]));
                 }
             }
+        }
+        self.persist();
+    }
+    // The limit of the cache in megabytes, for the cache that is open and for the file.
+    fn limit(&mut self, megabytes: u64) {
+        self.settings.cache_limit_mb = megabytes;
+        if let Some(cache) = &mut self.cache {
+            cache.set_limit(megabytes.saturating_mul(1024 * 1024));
         }
         self.persist();
     }
@@ -1590,13 +1694,24 @@ impl App {
     // Every track of the list that is shown joins the favorites.
     fn favor_all(&mut self) {
         let tracks: Vec<Track> = self.tracks().into_iter().cloned().collect();
+        let before = self.library.favorites.len();
         let merged = self.library.merge(tracks);
-        self.message = t!(
-            "В избранное добавлено: {}, уже было: {}",
-            merged.added,
-            merged.known
-        );
+        self.message = if merged.added > 0 {
+            t!(
+                "В избранное добавлено: {}, уже было: {}. Ctrl+Z - вернуть",
+                merged.added,
+                merged.known
+            )
+        } else {
+            t!(
+                "В избранное добавлено: {}, уже было: {}",
+                merged.added,
+                merged.known
+            )
+        };
         if merged.added > 0 {
+            let added = self.library.favorites[before..].iter();
+            self.note(Undo::Added(added.map(|track| track.url.clone()).collect()));
             self.save();
             self.list_stored();
         }
@@ -1783,7 +1898,7 @@ impl App {
             (0, 0) => t!("Уже в кеше или загружается").into(),
             (0, _) => t!("В кеш сохраняются только отдельные треки").into(),
             _ => t!(
-                "Загрузка в кеш, осталось треков: {}",
+                "Загрузка в кеш, осталось треков: {}. X - остановить",
                 self.pending.len() + usize::from(self.fetch.is_some())
             ),
         };
@@ -2000,6 +2115,7 @@ impl App {
                 // The tab of the track has no place to type in.
                 self.track_open = false;
                 self.editing = true;
+                self.cursor = usize::MAX;
                 self.filtering = false;
                 self.focus = None;
             }
@@ -2071,11 +2187,13 @@ impl App {
                         .iter()
                         .position(|t| t.url == track.url)
                     {
-                        self.library.favorites.remove(index);
-                        self.message = t!("Трек удалён из библиотеки").into();
+                        let track = self.library.favorites.remove(index);
+                        self.note(Undo::Removed(index, track));
+                        self.message = t!("Убрано из избранного. Ctrl+Z - вернуть").into();
                     } else {
+                        self.note(Undo::Added(vec![track.url.clone()]));
                         self.library.favorites.push(track);
-                        self.message = t!("Трек добавлен в библиотеку").into();
+                        self.message = t!("Добавлено в избранное").into();
                     }
                     self.save();
                     // A stored track moves between the two parts of the library.
@@ -2095,6 +2213,10 @@ impl App {
                 }
             }
             Action::Evict => self.evict(),
+            Action::Dequeue => {
+                self.take_upcoming(self.table.selected().unwrap_or(0));
+                self.navigate(0);
+            }
             Action::Pause => {
                 if self.player.is_some() {
                     self.control(json!(["cycle", "pause"]));
@@ -2261,7 +2383,16 @@ impl App {
             if fetch.ahead {
                 // Its turn will tell whether it plays.
             } else if saved {
-                self.message = t!("В кеше: {}", name);
+                // A list that is being stored says so once, at its end: each track of
+                // it shows its mark as it arrives, and a line for each would take the
+                // place of what the keys have to say.
+                self.batch += 1;
+                if self.pending.is_empty() {
+                    self.message = match self.batch {
+                        1 => t!("В кеше: {}", name),
+                        count => t!("В кеш загружено треков: {}", count),
+                    };
+                }
             } else {
                 let mut report = t!("{}\nyt-dlp не смог загрузить трек в кеш.", name);
                 let details = playback::tail(&fetch.log);
@@ -2277,6 +2408,9 @@ impl App {
                 self.last_error = Some(report);
             }
             self.fetch = None;
+            if self.pending.is_empty() {
+                self.batch = 0;
+            }
             self.fetch_next();
         }
         self.fetch_ahead();
@@ -2490,6 +2624,43 @@ fn latin(code: KeyCode) -> KeyCode {
     }
 }
 
+/// A key pressed where a text is typed. `cursor` is the place of the next letter in
+/// the text, counted in letters; one past the end stands for the end.
+fn typed(text: &mut String, cursor: &mut usize, key: KeyEvent) {
+    let count = text.chars().count();
+    let at = (*cursor).min(count);
+    let byte = |text: &str, at: usize| (text.char_indices().nth(at)).map_or(text.len(), |c| c.0);
+    match key.code {
+        KeyCode::Left => *cursor = at.saturating_sub(1),
+        KeyCode::Right => *cursor = (at + 1).min(count),
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = count,
+        KeyCode::Backspace if at > 0 => {
+            text.remove(byte(text, at - 1));
+            *cursor = at - 1;
+        }
+        KeyCode::Delete if at < count => {
+            text.remove(byte(text, at));
+            *cursor = at;
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            text.clear();
+            *cursor = 0;
+        }
+        KeyCode::Char(c) if !c.is_control() && !pictured(c) && count < 200 => {
+            text.insert(byte(text, at), c);
+            *cursor = at + 1;
+        }
+        _ => (),
+    }
+}
+
+// The text that is being typed, with the mark of the cursor where the next letter goes.
+fn caret(text: &str, cursor: usize) -> String {
+    let at = (text.char_indices().nth(cursor)).map_or(text.len(), |c| c.0);
+    clean(&format!("{}_{}", &text[..at], &text[at..]))
+}
+
 fn tagline() -> &'static str {
     use std::hash::{BuildHasher, Hasher, RandomState};
     let seed = RandomState::new().build_hasher().finish() as usize;
@@ -2647,7 +2818,8 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                 }
                 if app.asking {
                     match key.code {
-                        KeyCode::Char('y' | 'д') | KeyCode::Enter => app.answer(true),
+                        // Enter is no answer here: a yes is given, not fallen into.
+                        KeyCode::Char('y' | 'д') => app.answer(true),
                         KeyCode::Char('n' | 'н') | KeyCode::Esc => app.answer(false),
                         KeyCode::Char('q' | 'й') => break,
                         _ => (),
@@ -2662,8 +2834,11 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     match code {
                         KeyCode::Down => app.detail_scroll = app.detail_scroll.saturating_add(1),
                         KeyCode::Up => app.detail_scroll = app.detail_scroll.saturating_sub(1),
-                        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('e') => app.details = false,
-                        KeyCode::Char('q') => break,
+                        // In a window `q` closes the window; it ends the run on the main
+                        // screen alone, where nothing else is there to close.
+                        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('e' | 'q') => {
+                            app.details = false
+                        }
                         _ => (),
                     }
                     continue;
@@ -2675,20 +2850,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                             app.filtering = false;
                         }
                         KeyCode::Enter => app.filtering = false,
-                        KeyCode::Backspace => {
-                            app.filter.pop();
-                        }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.filter.clear()
-                        }
-                        KeyCode::Char(c)
-                            if !c.is_control()
-                                && !pictured(c)
-                                && app.filter.chars().count() < 200 =>
-                        {
-                            app.filter.push(c)
-                        }
-                        _ => (),
+                        _ => typed(&mut app.filter, &mut app.cursor, key),
                     }
                     // The list under the words is another one after every letter.
                     app.table.select(Some(0));
@@ -2699,20 +2861,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     match key.code {
                         KeyCode::Esc => app.editing = false,
                         KeyCode::Enter => app.search(),
-                        KeyCode::Backspace => {
-                            app.query.pop();
-                        }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.query.clear()
-                        }
-                        KeyCode::Char(c)
-                            if !c.is_control()
-                                && !pictured(c)
-                                && app.query.chars().count() < 200 =>
-                        {
-                            app.query.push(c)
-                        }
-                        _ => (),
+                        _ => typed(&mut app.query, &mut app.cursor, key),
                     }
                     continue;
                 }
@@ -2734,25 +2883,13 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     match key.code {
                         KeyCode::Esc => app.input = None,
                         KeyCode::Enter => app.submit(),
-                        KeyCode::Backspace => {
-                            input.pop();
-                        }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            input.clear()
-                        }
-                        KeyCode::Char(c)
-                            if !c.is_control() && !pictured(c) && input.chars().count() < 200 =>
-                        {
-                            input.push(c)
-                        }
-                        _ => (),
+                        _ => typed(input, &mut app.cursor, key),
                     }
                     continue;
                 }
                 if app.options {
                     match code {
-                        KeyCode::Esc | KeyCode::Char('o') => app.options = false,
-                        KeyCode::Char('q') => break,
+                        KeyCode::Esc | KeyCode::Char('o' | 'q') => app.options = false,
                         KeyCode::Down | KeyCode::Char('j') => app.move_setting(1),
                         KeyCode::Up | KeyCode::Char('k') => app.move_setting(-1),
                         KeyCode::Left | KeyCode::Char('h') => app.adjust(-1),
@@ -2774,6 +2911,7 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.select_view(View::Library);
                         app.filtering = true;
+                        app.cursor = usize::MAX;
                         app.focus = None;
                     }
                     KeyCode::Char('e') => {
@@ -2844,11 +2982,16 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     KeyCode::Char('F') => app.favor_all(),
                     KeyCode::Char('.') => app.pace(1.0),
                     KeyCode::Char(',') => app.pace(-1.0),
+                    // Before the letter alone, which is another key.
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.undo()
+                    }
                     KeyCode::Char('z') => app.action(Action::Shuffle),
                     KeyCode::Char('r') => app.action(Action::Repeat),
                     KeyCode::Char('+') | KeyCode::Char('=') => app.action(Action::Louder),
                     KeyCode::Char('-') => app.action(Action::Quieter),
                     KeyCode::Char('x') => app.action(Action::Evict),
+                    KeyCode::Char('X') => app.stop_storing(),
                     KeyCode::Left => {
                         let step = -i32::from(app.settings.seek_step);
                         app.control(json!(["seek", step, "relative"]))
@@ -2856,9 +2999,11 @@ pub fn run(session: Session, library: Option<PathBuf>) -> Result<()> {
                     KeyCode::Right => {
                         app.control(json!(["seek", app.settings.seek_step, "relative"]))
                     }
-                    KeyCode::Delete if app.view == View::Queue => {
-                        app.take_upcoming(app.table.selected().unwrap_or(0));
-                        app.navigate(0);
+                    // Backspace too: not every keyboard has the other key.
+                    KeyCode::Delete | KeyCode::Backspace
+                        if app.view == View::Queue && !app.track_open =>
+                    {
+                        app.action(Action::Dequeue)
                     }
                     _ => (),
                 }
@@ -3119,10 +3264,18 @@ fn draw(frame: &mut Frame, app: &mut App) {
         clean(&app.message),
         theme.strong,
     );
+    // The keys that the screen in front has a use for.
+    let keys = if app.track_open {
+        t!(" t списки  f избранное  d в кеш  m похожие  u автор  ? помощь  q выход")
+    } else if app.view == View::Queue {
+        t!(" Enter играть  Del убрать  f избранное  o настройки  ? помощь  q выход")
+    } else {
+        t!(" / поиск  f избранное  a очередь  d в кеш  o настройки  ? помощь  q выход")
+    };
     label(
         frame,
         Rect::new(outer[4].x, outer[4].y + 1, outer[4].width, 1),
-        t!(" / поиск  f избранное  a очередь  d в кеш  o настройки  ? помощь  q выход"),
+        keys,
         theme.muted,
     );
     if app.options {
@@ -3244,20 +3397,14 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 fn draw_search(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     // While the library is narrowed, the box holds the words that narrow it.
     let narrowed = app.filtering || (app.view == View::Library && !app.filter.is_empty());
-    let query = if narrowed {
-        format!(
-            "{}{}",
-            clean(&app.filter),
-            if app.filtering { "_" } else { "" }
-        )
-    } else if app.query.is_empty() && !app.editing {
-        t!("Найти исполнителя, трек, новый звук...").into()
+    let text = if narrowed { &app.filter } else { &app.query };
+    let typing = app.editing || app.filtering;
+    let query = if typing {
+        caret(text, app.cursor)
+    } else if narrowed || !text.is_empty() {
+        clean(text)
     } else {
-        format!(
-            "{}{}",
-            clean(&app.query),
-            if app.editing { "_" } else { "" }
-        )
+        t!("Найти исполнителя, трек, новый звук...").into()
     };
     let search = Layout::default()
         .direction(Direction::Horizontal)
@@ -3272,9 +3419,12 @@ fn draw_search(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     } else {
         t!(" / ПОИСК   Enter - найти ").to_owned()
     };
-    let typing = app.editing || app.filtering;
+    // A text longer than the box moves left under it, so that the cursor stays in it.
+    let before: String = text.chars().take(app.cursor).collect();
+    let past = (cells(&clean(&before)) + 1).saturating_sub(usize::from(search[0].width) - 2);
     frame.render_widget(
         Paragraph::new(query)
+            .scroll((0, if typing { past as u16 } else { 0 }))
             .block(
                 block(&title, theme).border_style(if typing || app.focus == Some(0) {
                     theme.accent
@@ -3392,30 +3542,44 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect, gaps
     let selected = tracks.get(app.table.selected().unwrap_or(0)).copied();
     let evict =
         selected.is_some_and(|track| app.cache.as_ref().is_some_and(|c| c.contains(&track.url)));
+    // A search that ended and found nothing says so, in place of the invitation.
+    let nothing = (app.shown.as_ref())
+        .filter(|asked| !app.searching && app.searched.get(asked).is_some_and(Vec::is_empty));
     let taken = if tracks.is_empty() {
-        let message = match app.view {
+        let message: String = match app.view {
+            View::Search if nothing.is_some() => {
+                let asked = clean(&nothing.expect("a question").0);
+                let mut short: String = asked.chars().take(40).collect();
+                if short.len() < asked.len() {
+                    short.push_str("...");
+                }
+                t!(
+                    "\n\nПо запросу \"{}\" ничего не нашлось.\n\nПроверьте, как он написан, или спросите иначе.\n/ - новый поиск",
+                    short
+                )
+            }
             View::Search => {
                 t!(
                     "\n\nВаша следующая любимая песня - здесь.\n\nНажмите / и введите поисковый запрос.\nEnter - слушать, f - сохранить"
-                )
+                ).into()
             }
             View::Library if !app.filter.is_empty() => {
-                t!("\n\nПо этому фильтру ничего нет.\n\nEsc - сбросить фильтр.")
+                t!("\n\nПо этому фильтру ничего нет.\n\nEsc - сбросить фильтр.").into()
             }
             View::Library => {
                 t!(
                     "\n\nСоберите свою коллекцию.\n\nf - добавить трек в избранное.\nЗдесь же всё, что сохранено в кеш (d)\nи играет без сети."
-                )
+                ).into()
             }
             View::Queue => {
                 t!(
                     "\n\nМузыка без перерывов.\n\nНажмите a, чтобы добавить трек в очередь.\nСледующий трек запустится автоматически."
-                )
+                ).into()
             }
             View::Recent => {
                 t!(
                     "\n\nИстория прослушивания.\n\nЗдесь появятся последние включённые треки.\nEnter - включить снова."
-                )
+                ).into()
             }
         };
         frame.render_widget(
@@ -3534,14 +3698,26 @@ fn draw_tracks(frame: &mut Frame, app: &mut App, theme: &Theme, area: Rect, gaps
         Action::Favorite,
         false,
     );
-    button(
-        frame,
-        app,
-        buttons[2],
-        t!("+ В очередь"),
-        Action::Enqueue,
-        false,
-    );
+    if app.view == View::Queue {
+        // A track that waits there already is taken out of it, not put in again.
+        button(
+            frame,
+            app,
+            buttons[2],
+            t!("Del Убрать"),
+            Action::Dequeue,
+            false,
+        );
+    } else {
+        button(
+            frame,
+            app,
+            buttons[2],
+            t!("+ В очередь"),
+            Action::Enqueue,
+            false,
+        );
+    }
     if evict {
         button(
             frame,
@@ -4037,10 +4213,13 @@ fn draw_help(frame: &mut Frame, theme: &Theme, size: Rect) {
         ("PgUp PgDn", t!("Листать список   Home End  К краям списка")),
         ("Ctrl+F", t!("Фильтр библиотеки (Esc сбрасывает)")),
         ("Tab", t!("Выбрать кнопку   Enter  Нажать")),
-        ("f", t!("Добавить / удалить из избранного")),
+        (
+            "f / Ctrl+Z",
+            t!("В избранное или из него / вернуть как было"),
+        ),
         ("a", t!("Добавить в очередь   Del  Убрать из очереди")),
         ("d / D", t!("Загрузить в кеш трек / весь список")),
-        ("x", t!("Удалить трек из кеша")),
+        ("x / X", t!("Удалить из кеша / остановить загрузку в него")),
         ("Space", t!("Пауза / продолжить")),
         ("p / n", t!("Предыдущий / следующий трек")),
         ("z / r", t!("Вперемешку / повтор: нет, список, трек")),
@@ -4257,6 +4436,36 @@ mod tests {
         assert_eq!(stored.favorites[0].title, "Ночной эфир");
         app.action(Action::Favorite);
         assert!(library::load(&path).unwrap().favorites.is_empty());
+        assert_eq!(app.message, "Убрано из избранного. Ctrl+Z - вернуть");
+
+        // What was done to the favorites is taken back, the latest first: a track
+        // returns to the place it had, and a whole list that joined them leaves.
+        app.undo();
+        assert_eq!(library::load(&path).unwrap().favorites.len(), 1);
+        app.results = (1..=3).map(numbered).collect();
+        app.favor_all();
+        app.select_view(View::Library);
+        app.action(Action::Favorite);
+        app.action(Action::Favorite);
+        let titles = |kept: &Library| -> Vec<String> {
+            (kept.favorites.iter())
+                .map(|track| track.title.clone())
+                .collect()
+        };
+        assert_eq!(titles(&app.library), ["Title 2", "Title 3"]);
+        app.undo();
+        app.undo();
+        assert_eq!(
+            titles(&app.library),
+            ["Ночной эфир", "Title 1", "Title 2", "Title 3"]
+        );
+        app.undo();
+        assert_eq!(app.message, "Убрано из избранного: 3");
+        assert_eq!(titles(&library::load(&path).unwrap()), ["Ночной эфир"]);
+        app.undo();
+        assert!(app.library.favorites.is_empty());
+        app.undo();
+        assert_eq!(app.message, "Возвращать нечего");
         fs::write(&path, "broken json").unwrap();
         assert!(library::load(&path).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "broken json");
@@ -4489,6 +4698,35 @@ mod tests {
                     assert!(text.contains(part), "{at}: {part:?}\n{text}");
                 }
 
+                // The line of keys of the queue and of the tab of the track.
+                app.select_view(View::Queue);
+                let text = screen(&mut app, width, height);
+                for part in [
+                    t!("Del Убрать"),
+                    t!(" Enter играть  Del убрать  f избранное  o настройки  ? помощь  q выход"),
+                ] {
+                    assert!(text.contains(part), "{at}: {part:?}\n{text}");
+                }
+                app.track_open = true;
+                let keys =
+                    t!(" t списки  f избранное  d в кеш  m похожие  u автор  ? помощь  q выход");
+                let text = screen(&mut app, width, height);
+                assert!(text.contains(keys), "{at}: {keys:?}\n{text}");
+                app.select_view(View::Search);
+                // A search that found nothing says what was asked.
+                app.results.clear();
+                app.shown = Some(("no such sound".into(), 10));
+                app.searched.insert(("no such sound".into(), 10), vec![]);
+                let text = screen(&mut app, width, height);
+                for line in t!(
+                    "\n\nПо запросу \"{}\" ничего не нашлось.\n\nПроверьте, как он написан, или спросите иначе.\n/ - новый поиск",
+                    "no such sound"
+                )
+                .lines()
+                {
+                    assert!(text.contains(line), "{at}: {line:?}\n{text}");
+                }
+
                 app.options = true;
                 app.config = Some("/tmp/config.json".into());
                 for (index, setting) in SETTINGS.iter().enumerate() {
@@ -4517,6 +4755,8 @@ mod tests {
                     t!("Поиск (Enter отправляет, Esc отменяет)"),
                     t!("Добавить в очередь   Del  Убрать из очереди"),
                     t!("Загрузить в кеш трек / весь список"),
+                    t!("В избранное или из него / вернуть как было"),
+                    t!("Удалить из кеша / остановить загрузку в него"),
                     t!("Громкость    s  Стоп    q  Выход"),
                     t!("Настройки и цветовые схемы"),
                     t!(" Мышь работает. Любая клавиша закрывает справку."),
@@ -4572,11 +4812,25 @@ mod tests {
         choose(&mut app, Setting::CacheLimit);
         app.adjust(1);
         assert_eq!(app.value(Setting::CacheLimit), "1280 МБ");
+        // Stepping down ends at the least limit; it is Enter that lifts it, and brings
+        // the usual one back.
         (0..9).for_each(|_| app.adjust(-1));
+        assert_eq!(app.value(Setting::CacheLimit), "256 МБ");
+        app.activate();
+        app.activate();
+        assert_eq!(app.value(Setting::CacheLimit), "1024 МБ");
+        app.activate();
+        app.adjust(-1);
         assert_eq!(app.value(Setting::CacheLimit), "без ограничения");
         choose(&mut app, Setting::Volume);
         app.adjust(1);
         assert_eq!((app.settings.volume, app.volume), (75, 70.0));
+        // A switch is one for the arrows too, as the others are.
+        app.settings.update_check = Some(true);
+        app.settings.update_checked = update::now();
+        choose(&mut app, Setting::Updates);
+        app.adjust(1);
+        assert_eq!(app.settings.update_check, Some(false));
 
         // The drawing behind the list is changed in a circle, and taken away.
         let drawn = |app: &mut App| screen(app, 120, 35).contains("DOOOO");
@@ -5000,7 +5254,10 @@ exit /b 1"#,
 
         // `F` keeps all of the list; a playlist among tracks is not a favorite track.
         app.favor_all();
-        assert_eq!(app.message, "В избранное добавлено: 2, уже было: 0");
+        assert_eq!(
+            app.message,
+            "В избранное добавлено: 2, уже было: 0. Ctrl+Z - вернуть"
+        );
         assert_eq!(library::load(&path).unwrap().favorites.len(), 2);
         app.favor_all();
         assert_eq!(app.message, "В избранное добавлено: 0, уже было: 2");
@@ -5867,6 +6124,44 @@ exit /b 1"#,
     }
 
     #[test]
+    fn a_text_is_typed_and_mended_where_the_cursor_stands() {
+        let press = |text: &mut String, cursor: &mut usize, code| {
+            typed(text, cursor, KeyEvent::new(code, KeyModifiers::NONE))
+        };
+        // One past the end is the end: that is where a text is taken up.
+        let (mut text, mut cursor) = (String::from("нчь"), usize::MAX);
+        assert_eq!(caret(&text, cursor), "нчь_");
+        press(&mut text, &mut cursor, KeyCode::Left);
+        press(&mut text, &mut cursor, KeyCode::Left);
+        press(&mut text, &mut cursor, KeyCode::Char('о'));
+        assert_eq!((caret(&text, cursor).as_str(), cursor), ("но_чь", 2));
+        press(&mut text, &mut cursor, KeyCode::Home);
+        press(&mut text, &mut cursor, KeyCode::Backspace);
+        press(&mut text, &mut cursor, KeyCode::Delete);
+        assert_eq!(caret(&text, cursor), "_очь");
+        press(&mut text, &mut cursor, KeyCode::End);
+        press(&mut text, &mut cursor, KeyCode::Right);
+        press(&mut text, &mut cursor, KeyCode::Delete);
+        press(&mut text, &mut cursor, KeyCode::Backspace);
+        assert_eq!((caret(&text, cursor).as_str(), cursor), ("оч_", 2));
+        typed(
+            &mut text,
+            &mut cursor,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!((caret(&text, cursor).as_str(), cursor), ("_", 0));
+
+        // A text longer than its box moves under it, and the cursor stays in sight.
+        lang::set(Lang::Russian);
+        let mut app = app(PathBuf::new());
+        app.action(Action::Search);
+        app.query = format!("{}конец", "a".repeat(120));
+        assert!(screen(&mut app, 80, 24).contains("конец_"));
+        app.cursor = 0;
+        assert!(screen(&mut app, 80, 24).contains("|_aaaa"));
+    }
+
+    #[test]
     fn keys_are_read_by_their_place_in_the_russian_layout() {
         for (typed, key) in [('й', 'q'), ('а', 'f'), ('А', 'F'), ('ъ', ']'), ('ю', '.')] {
             assert_eq!(latin(KeyCode::Char(typed)), KeyCode::Char(key));
@@ -6624,7 +6919,37 @@ exit /b 0"#,
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(stored(&app, "one") && stored(&app, "two") && !stored(&app, "broken"));
-        assert_eq!(app.message, "В кеше: Test artist - Ночной эфир");
+        // A list says once how much of it was stored, when the last of it is.
+        assert_eq!(app.message, "В кеш загружено треков: 2");
+        assert_eq!(app.batch, 0);
+
+        // A track that waits is let go with `x`, and all of them with `X`; what is
+        // stored already stays.
+        app.results = vec![named("three"), named("four"), named("five")];
+        app.download(app.results.clone());
+        assert!(
+            app.message.ends_with("3. X - остановить"),
+            "{}",
+            app.message
+        );
+        app.table.select(Some(1));
+        app.evict();
+        assert_eq!(
+            app.message,
+            "Загрузка в кеш отменена: Test artist - Ночной эфир"
+        );
+        assert!(app.pending.len() == 1 && !app.fetching(&named("four").url));
+        app.stop_storing();
+        assert!(app.fetch.is_none() && app.pending.is_empty());
+        assert_eq!(
+            app.message,
+            "Загрузка в кеш остановлена, отменено треков: 2"
+        );
+        assert!(stored(&app, "one") && !stored(&app, "three"));
+        app.stop_storing();
+        assert_eq!(app.message, "В кеш ничего не загружается");
+        app.results = vec![named("one"), named("broken"), named("two"), named("sets")];
+        app.table.select(Some(0));
         let error = app.last_error.clone().unwrap();
         assert!(error.starts_with("Test artist - Ночной эфир\n") && error.ends_with("ERROR: gone"));
         assert_eq!(fs::read_dir(root.join("partial")).unwrap().count(), 0);
@@ -6669,6 +6994,16 @@ exit /b 0"#,
         assert_eq!(app.selected().unwrap().url, track().url);
         app.navigate(999);
         assert_eq!(app.table.selected(), Some(0));
+        // Here the third button takes a track out, and the line of keys says how.
+        let text = screen(&mut app, 80, 24);
+        assert!(
+            text.contains("Del Убрать") && !text.contains("+ В очередь"),
+            "{text}"
+        );
+        assert!(text.contains(" Enter играть  Del убрать "), "{text}");
+        app.action(Action::Dequeue);
+        assert!(app.queue.is_empty());
+        app.action(Action::Enqueue);
         app.queue.clear();
         app.navigate(-1);
         assert!(app.selected().is_none());

@@ -132,9 +132,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Enter - 曲をディスクに保存するかを切り替えます。\n保存済みの曲はそのまま残ります。",
     ),
     (
-        "Left/Right - по 256 МБ, ноль снимает ограничение.\nЛишнее удаляется, начиная с давно не игравших треков.",
-        "Left/Right - by 256 MB, zero lifts the limit.\nThe excess is removed, starting with tracks not played longest.",
-        "Left/Right - 256 MB ずつ、0 で上限なし。\n超えた分は長く再生していない曲から削除します。",
+        "Left/Right - по 256 МБ, Enter - снять или вернуть ограничение.\nЛишнее удаляется, начиная с давно не игравших треков.",
+        "Left/Right - by 256 MB, Enter - lift the limit or set it again.\nThe excess is removed, starting with tracks not played longest.",
+        "Left/Right - 256 MB ずつ、Enter - 上限を外す / 戻す。\n超えた分は長く再生していない曲から削除します。",
     ),
     (
         "Left/Right - по 5, от 5 до 50 треков на один поиск.",
@@ -286,9 +286,24 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "保存できるのは個別の曲だけです",
     ),
     (
-        "Загрузка в кеш, осталось треков: {}",
-        "Storing, tracks left: {}",
-        "保存中、残り {} 曲",
+        "Загрузка в кеш, осталось треков: {}. X - остановить",
+        "Storing, tracks left: {}. X - stop",
+        "保存中、残り {} 曲。X - 停止",
+    ),
+    (
+        "Загрузка в кеш отменена: {} - {}",
+        "Storing cancelled: {} - {}",
+        "保存を取り消しました: {} - {}",
+    ),
+    (
+        "В кеш ничего не загружается",
+        "Nothing is being stored",
+        "保存中の曲はありません",
+    ),
+    (
+        "Загрузка в кеш остановлена, отменено треков: {}",
+        "Storing stopped, tracks cancelled: {}",
+        "保存を停止しました。取り消し: {} 曲",
     ),
     (
         "Не удалось начать загрузку: {}",
@@ -301,14 +316,29 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "先に曲を選んで Enter を押してください",
     ),
     (
-        "Трек удалён из библиотеки",
-        "Removed from the library",
-        "ライブラリから削除しました",
+        "Убрано из избранного. Ctrl+Z - вернуть",
+        "Removed from the favorites. Ctrl+Z - bring back",
+        "お気に入りから削除しました。Ctrl+Z - 元に戻す",
     ),
     (
-        "Трек добавлен в библиотеку",
-        "Added to the library",
-        "ライブラリに追加しました",
+        "Добавлено в избранное",
+        "Added to the favorites",
+        "お気に入りに追加しました",
+    ),
+    (
+        "Возвращать нечего",
+        "Nothing to bring back",
+        "元に戻すものはありません",
+    ),
+    (
+        "Убрано из избранного: {}",
+        "Removed from the favorites: {}",
+        "お気に入りから削除: {}",
+    ),
+    (
+        "Возвращено в избранное",
+        "Back in the favorites",
+        "お気に入りに戻しました",
     ),
     (
         "Добавлено в конец очереди",
@@ -336,6 +366,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "検索が中断されました",
     ),
     ("В кеше: {}", "Stored: {}", "保存しました: {}"),
+    (
+        "В кеш загружено треков: {}",
+        "Tracks stored: {}",
+        "{} 曲を保存しました",
+    ),
     (
         "{}\nyt-dlp не смог загрузить трек в кеш.",
         "{}\nyt-dlp could not download the track into the cache.",
@@ -375,6 +410,16 @@ const TEXTS: &[(&str, &str, &str)] = &[
         " / поиск  f избранное  a очередь  d в кеш  o настройки  ? помощь  q выход",
         " / search  f favorite  a queue  d store  o settings  ? help  q quit",
         " / 検索  f お気に入り  a キュー  d 保存  o 設定  ? ヘルプ  q 終了",
+    ),
+    (
+        " t списки  f избранное  d в кеш  m похожие  u автор  ? помощь  q выход",
+        " t lists  f favorite  d store  m similar  u author  ? help  q quit",
+        " t 一覧  f お気に入り  d 保存  m 似た曲  u 作者  ? ヘルプ  q 終了",
+    ),
+    (
+        " Enter играть  Del убрать  f избранное  o настройки  ? помощь  q выход",
+        " Enter play  Del remove  f favorite  o settings  ? help  q quit",
+        " Enter 再生  Del 外す  f お気に入り  o 設定  ? ヘルプ  q 終了",
     ),
     (
         "Найти исполнителя, трек, новый звук...",
@@ -490,6 +535,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "\n\n次のお気に入りの一曲はここに。\n\n/ を押して検索語を入力してください。\nEnter - 再生、f - お気に入り",
     ),
     (
+        "\n\nПо запросу \"{}\" ничего не нашлось.\n\nПроверьте, как он написан, или спросите иначе.\n/ - новый поиск",
+        "\n\nNothing was found for \"{}\".\n\nCheck how it is spelled, or ask another way.\n/ - a new search",
+        "\n\n「{}」は見つかりませんでした。\n\n綴りを確かめるか、別の言葉で探してください。\n/ - 新しい検索",
+    ),
+    (
         "\n\nСоберите свою коллекцию.\n\nf - добавить трек в избранное.\nЗдесь же всё, что сохранено в кеш (d)\nи играет без сети.",
         "\n\nBuild your collection.\n\nf - add a track to the favorites.\nEverything stored in the cache (d)\nis here too and plays offline.",
         "\n\nコレクションを作りましょう。\n\nf - 曲をお気に入りに追加。\nキャッシュに保存した曲 (d) もここに並び、\nオフラインで再生できます。",
@@ -510,7 +560,8 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ("|> Играть", "|> Play", "|> 再生"),
     ("* Избранное", "* Favorite", "* お気に入り"),
     ("+ В очередь", "+ Queue", "+ キュー"),
-    ("x Из кеша", "x Remove", "x 削除"),
+    ("x Из кеша", "x Unstore", "x 保存解除"),
+    ("Del Убрать", "Del Remove", "Del 外す"),
     ("v В кеш", "v Store", "v 保存"),
     (
         " НАСТРОЙКИ | Esc - закрыть ",
@@ -570,9 +621,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "ボタンを選択     Enter  押す",
     ),
     (
-        "Добавить / удалить из избранного",
-        "Add to / remove from the favorites",
-        "お気に入りに追加 / 削除",
+        "В избранное или из него / вернуть как было",
+        "To or from the favorites / undo that",
+        "お気に入りの追加と削除 / 元に戻す",
     ),
     (
         "Добавить в очередь   Del  Убрать из очереди",
@@ -585,9 +636,9 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "曲 / 一覧すべてをキャッシュに保存",
     ),
     (
-        "Удалить трек из кеша",
-        "Remove the track from the cache",
-        "曲をキャッシュから削除",
+        "Удалить из кеша / остановить загрузку в него",
+        "Remove from the cache / stop storing",
+        "キャッシュから削除 / 保存を停止",
     ),
     ("Пауза / продолжить", "Pause / resume", "一時停止 / 再開"),
     (
@@ -802,6 +853,21 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "yt-dlp が {} で終了しました:\n{}",
     ),
     (
+        "Такой страницы на SoundCloud нет: проверьте ссылку или имя.",
+        "SoundCloud has no such page: check the link or the name.",
+        "SoundCloud にそのページはありません。リンクか名前を確かめてください。",
+    ),
+    (
+        "SoundCloud отказал в ответе. Чаще всего дело в адресе, с которого идёт запрос (выходной узел Tor, прокси): повторите позже или смените его. Если не помогает, обновите yt-dlp.",
+        "SoundCloud refused to answer. Most often it is the address the request comes from (a Tor exit node, a proxy): try again later or change it. If that does not help, update yt-dlp.",
+        "SoundCloud が応答を拒否しました。多くの場合、接続元のアドレス (Tor の出口ノード、プロキシ) が原因です。しばらくしてからやり直すか、変更してください。それでも直らなければ yt-dlp を更新してください。",
+    ),
+    (
+        "Нет связи с SoundCloud: проверьте сеть и прокси.",
+        "SoundCloud cannot be reached: check the network and the proxy.",
+        "SoundCloud に接続できません。ネットワークとプロキシを確かめてください。",
+    ),
+    (
         "Некорректный ответ JSON от yt-dlp: {}",
         "Invalid JSON response from yt-dlp: {}",
         "yt-dlp の JSON 応答が不正です: {}",
@@ -992,6 +1058,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "В избранное добавлено: {}, уже было: {}",
         "Added to the favorites: {}, already there: {}",
         "お気に入りに追加: {}、登録済み: {}",
+    ),
+    (
+        "В избранное добавлено: {}, уже было: {}. Ctrl+Z - вернуть",
+        "Added to the favorites: {}, already there: {}. Ctrl+Z - bring back",
+        "お気に入りに追加: {}、登録済み: {}。Ctrl+Z - 元に戻す",
     ),
     (
         " АВТОР {} | {} | [ ] - раздел ",

@@ -229,15 +229,17 @@ the letter that came. `/` and `?` are other keys in that layout, `Shift+\` and
 | `r` | Repeat: off, the whole list, one track |
 | `Space` | Pause / go on |
 | `f` | Add to the favorites or remove from them |
+| `Ctrl+Z` | Take back the last change of the favorites, `f` or `F`; again for the one before |
 | `a` | Add the selected track to the queue |
 | `d` / `D` | Store the selected track / every track of the list in the cache, without playing them |
-| `x` | Remove the selected track from the cache |
-| `Delete` | Take the selected track out of the queue |
+| `x` | Remove the selected track from the cache, or stop storing it while it waits |
+| `X` | Stop storing: every track that still waits is let go, what is stored stays |
+| `Delete`, `Backspace` | Take the selected track out of the queue |
 | `p` / `n` | The track before / the next one |
 | `←` / `→` | Seek by the step from the settings (10 seconds) |
 | `,` / `.` | Slower / faster by 0.1, from x0.5 to x2.0 |
 | `−` / `+` | Volume |
-| `s`, `q`, `?` | Stop, quit, help |
+| `s`, `q`, `?` | Stop, quit, help; in a window `q` closes the window |
 | `e` | The full text of the last error of a search or of playback; ↑↓ scroll, Esc closes |
 
 A search runs in the background, and the list fills as yt-dlp finds the tracks
@@ -437,7 +439,7 @@ would not do, is shown in the window itself.
 | Proxy | Switches the proxy on and off from the next search and track | `proxy_enabled` |
 | Proxy address | HTTP(S) or SOCKS5 with a port | `proxy` |
 | Track cache | Storing tracks on disk | `cache_enabled` |
-| Cache size | The limit in megabytes; 0 lifts it | `cache_limit_mb` |
+| Cache size | The limit in megabytes; `Enter` lifts it or sets it again, in the file 0 lifts it | `cache_limit_mb` |
 | Search results | From 5 to 50 tracks for a search in the interface, 10 by default | `search_limit` |
 | Seek step | 5, 10, 15, 30 or 60 seconds | `seek_step` |
 | Start volume | From 0 to 100 | `volume` |

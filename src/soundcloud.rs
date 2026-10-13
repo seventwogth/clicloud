@@ -354,14 +354,43 @@ impl<'a> SoundCloud<'a> {
             .join()
             .map_err(|_| std::io::Error::other("stderr reader failed"))?;
         if !status.success() {
-            return Err(t!(
-                "yt-dlp завершился с {}:\n{}",
-                status,
-                String::from_utf8_lossy(&errors).trim()
-            )
+            let said = String::from_utf8_lossy(&errors);
+            let report = t!("yt-dlp завершился с {}:\n{}", status, said.trim());
+            // What to do about it comes first; the words of yt-dlp follow in full.
+            return Err(match advice(&said) {
+                Some(advice) => format!("{advice}\n\n{report}"),
+                None => report,
+            }
             .into());
         }
         verdict(count, stray)
+    }
+}
+
+/// What an error of yt-dlp most often means for the one who listens: its own words
+/// say what failed, not what to do about it. None where they point nowhere certain.
+fn advice(error: &str) -> Option<&'static str> {
+    let says = |parts: &[&str]| parts.iter().any(|part| error.contains(part));
+    if says(&["HTTP Error 404"]) {
+        Some(t!(
+            "Такой страницы на SoundCloud нет: проверьте ссылку или имя."
+        ))
+    } else if says(&["HTTP Error 403", "HTTP Error 429"]) {
+        Some(t!(
+            "SoundCloud отказал в ответе. Чаще всего дело в адресе, с которого идёт запрос (выходной узел Tor, прокси): повторите позже или смените его. Если не помогает, обновите yt-dlp."
+        ))
+    } else if says(&[
+        "timed out",
+        "Connection refused",
+        "Network is unreachable",
+        "Name or service not known",
+        "Temporary failure in name resolution",
+        "getaddrinfo failed",
+        "Unable to connect to proxy",
+    ]) {
+        Some(t!("Нет связи с SoundCloud: проверьте сеть и прокси."))
+    } else {
+        None
     }
 }
 
@@ -691,6 +720,25 @@ mod tests {
             let error = profile(input).expect_err(input).to_string();
             assert!(error.contains("раздел сайта"), "{input}: {error}");
         }
+    }
+
+    #[test]
+    fn an_error_of_yt_dlp_is_told_with_what_to_do_about_it() {
+        crate::lang::set(crate::lang::Lang::Russian);
+        let refused =
+            "ERROR: [soundcloud] Unable to download JSON metadata: HTTP Error 403: Forbidden";
+        assert!(advice(refused).unwrap().contains("Tor"));
+        assert!(
+            advice("ERROR: HTTP Error 404: Not Found")
+                .unwrap()
+                .contains("ссылку")
+        );
+        assert!(
+            advice("ERROR: The read operation timed out")
+                .unwrap()
+                .contains("сеть")
+        );
+        assert_eq!(advice("ERROR: Unsupported URL: https://example.com"), None);
     }
 
     #[test]
